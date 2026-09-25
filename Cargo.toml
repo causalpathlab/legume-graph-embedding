@@ -1,0 +1,55 @@
+[package]
+name = "legume-graph-embedding"
+version = "0.8.4"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT"
+authors = ["Yongjin Park <ypp@stat.ubc.ca> <yongjin.park@ubc.ca>"]
+description = "Count-NCE bipartite graph embedding over (cell, feature) edges"
+repository = "https://github.com/causalpathlab/legume-graph-embedding"
+homepage = "https://github.com/causalpathlab/legume-graph-embedding"
+readme = "README.md"
+keywords = ["genomics", "single-cell", "embedding", "graph"]
+categories = ["science"]
+exclude = [
+    "**/.claude/**",
+    "**/.DS_Store",
+]
+
+[lib]
+name = "graph_embedding_util"
+path = "src/lib.rs"
+
+[features]
+default = []
+cuda = [
+    "legume-numeric/cuda",
+    "data-beans/cuda",
+]
+metal = [
+    "legume-numeric/metal",
+    "data-beans/metal",
+]
+
+[dependencies]
+data-beans = { version = "0.6.12", features = ["aux", "alg"] }
+legume-numeric = { version = "0.8.10", features = ["matrix", "param", "candle", "mcmc"] }
+enrichment = { version = "0.3.9", package = "legume-enrichment" }
+
+anyhow = "1.0"
+clap = { version = "4.5.20", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+indicatif = { version = "^0.18", features = ["rayon"] }
+log = "0.4"
+nalgebra = "0.34"
+rand = "0.10.1"
+rand_distr = "0.6"
+rayon = "1.10.0"
+rustc-hash = "2.1"
+statrs = { version = "0.18", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+data-beans = { version = "0.6.12", features = ["aux", "alg"] }
+nalgebra = "0.34"
