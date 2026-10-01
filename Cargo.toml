@@ -1,6 +1,6 @@
 [package]
 name = "legume-graph-embedding"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -24,15 +24,13 @@ path = "src/lib.rs"
 default = []
 cuda = [
     "legume-numeric/cuda",
-    "data-beans/cuda",
 ]
 metal = [
     "legume-numeric/metal",
-    "data-beans/metal",
 ]
 
 [dependencies]
-data-beans = { version = "0.6.12", features = ["aux", "alg"] }
+data-beans = { version = "0.6.21", features = ["aux", "alg"] }
 legume-numeric = { version = "0.8.12", features = ["matrix", "param", "candle", "mcmc"] }
 enrichment = { version = "0.3.9", package = "legume-enrichment" }
 
@@ -51,5 +49,5 @@ serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = "1.0"
-data-beans = { version = "0.6.12", features = ["aux", "alg"] }
+data-beans = { version = "0.6.21", features = ["aux", "alg"] }
 nalgebra = "0.34"
