@@ -33,7 +33,7 @@ metal = [
 
 [dependencies]
 data-beans = { version = "0.6.12", features = ["aux", "alg"] }
-legume-numeric = { version = "0.8.10", features = ["matrix", "param", "candle", "mcmc"] }
+legume-numeric = { version = "0.8.12", features = ["matrix", "param", "candle", "mcmc"] }
 enrichment = { version = "0.3.9", package = "legume-enrichment" }
 
 anyhow = "1.0"
