@@ -64,7 +64,7 @@ const MIN_TARGET_EFF: f64 = 20.0;
 /// over features of inverse-Simpson `1/Σ_c p²` — because that is what the
 /// bisection actually drives. (An earlier revision of this comment quoted median
 /// `exp(entropy)` instead, which is ~8× smaller here and made the constant look
-/// mis-set.) Measured on 12k BMMC (`H=16`), recall of the model's own top-100
+/// mis-set.) Measured on a 12k-cell dataset (`H=16`), recall of the model's own top-100
 /// cells against the gene-specific score `⟨e_f, e_c⟩`:
 ///
 /// | mean eff | 16 | 49 | 178 | 488 | 1045 |
@@ -250,7 +250,7 @@ pub fn feature_coembedding_fixed_t(
 /// Rescale each FEATURE's score column to unit SD over cells.
 ///
 /// Without this, one global `T` meets a score scale that varies with `‖e_f‖` —
-/// measured spread 38× between the median and the largest gene on 12k BMMC — so
+/// measured spread 38× between the median and the largest gene on a 12k-cell dataset — so
 /// the same `T` saturates the long genes onto a single cell while leaving the
 /// short ones nearly uniform over all cells. The result is bimodal rather than
 /// merely variable: at the calibrated `T`, 34% of genes sat on <10 cells and 22%
