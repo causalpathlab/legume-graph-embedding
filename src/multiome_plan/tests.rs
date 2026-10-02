@@ -46,7 +46,7 @@ fn axes(file: &str, rows: Vec<Box<str>>, cols: Vec<Box<str>>) -> FileAxes {
     }
 }
 
-/// The GSE139369 CITE-seq shape: four donor cohorts, each an
+/// A CITE-seq shape: four donor cohorts, each an
 /// RNA + ADT pair on identical barcodes, with whitelist noise between
 /// cohorts. Expect 4 groups × 2 modalities, named from the filenames.
 #[test]
