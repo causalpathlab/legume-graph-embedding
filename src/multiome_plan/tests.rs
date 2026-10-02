@@ -51,7 +51,7 @@ fn axes(file: &str, rows: Vec<Box<str>>, cols: Vec<Box<str>>) -> FileAxes {
 /// cohorts. Expect 4 groups × 2 modalities, named from the filenames.
 #[test]
 fn citeseq_cohorts_group_by_barcode_and_split_by_modality() {
-    let cohorts = ["BMMC_D1T1", "BMMC_D1T2", "PBMC_D4T1", "PBMC_D4T2"];
+    let cohorts = ["T1_D1S1", "T1_D1S2", "T2_D4S1", "T2_D4S2"];
     let mut input = Vec::new();
     for (k, c) in cohorts.iter().enumerate() {
         let cells = bc_noisy("SHARED", &format!("C{k}"), 6000, WHITELIST_NOISE);
@@ -79,8 +79,8 @@ fn citeseq_cohorts_group_by_barcode_and_split_by_modality() {
     // Four groups ⇒ barcodes must be namespaced by cohort, or the 12
     // whitelist collisions would merge cells across donors.
     let suffix = plan.barcode_suffix().expect("multi-group needs suffixes");
-    assert_eq!(suffix[0].as_deref(), Some("BMMC_D1T1"));
-    assert_eq!(suffix[7].as_deref(), Some("PBMC_D4T2"));
+    assert_eq!(suffix[0].as_deref(), Some("T1_D1S1"));
+    assert_eq!(suffix[7].as_deref(), Some("T2_D4S2"));
     assert_eq!(plan.n_bridge_cells, Some(4 * 6000));
 }
 
@@ -143,12 +143,12 @@ fn many_samples_one_modality_is_not_multiome() {
 fn disjoint_modalities_without_matched_cells_is_not_multiome() {
     let input = vec![
         axes(
-            "scRNA_BMMC_D1T1.zarr",
+            "scRNA_T1_D1S1.zarr",
             genes(20000),
             bc_noisy("SHARED", "R", 6000, 6),
         ),
         axes(
-            "scATAC_BMMC_D5T1.zarr",
+            "scATAC_T1_D5S1.zarr",
             peaks(37000),
             bc_noisy("SHARED", "A", 62000, 6),
         ),
