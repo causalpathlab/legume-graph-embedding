@@ -1,8 +1,8 @@
 use super::*;
 
-/// 10x barcode whitelist collision rate measured between unrelated
-/// GSE139369 backends: 6–21 shared barcodes out of ~6k. Anything the
-/// planner does must stay far above this floor.
+/// 10x barcode whitelist collisions between unrelated backends: a handful
+/// of shared barcodes out of thousands. Anything the planner does must stay
+/// far above this floor.
 const WHITELIST_NOISE: usize = 12;
 
 fn bc(prefix: &str, n: usize) -> Vec<Box<str>> {
@@ -136,8 +136,8 @@ fn many_samples_one_modality_is_not_multiome() {
     assert!(plan_from_axes(&input).unwrap().is_none());
 }
 
-/// Two modalities but no matched cells (GSE139369's scRNA vs scATAC: the
-/// assays were run on different donors). Without a bridge there is no
+/// Two modalities but no matched cells (scRNA and scATAC run on different
+/// donors). Without a bridge there is no
 /// evidence of a paired design, so fall back to today's behaviour.
 #[test]
 fn disjoint_modalities_without_matched_cells_is_not_multiome() {
