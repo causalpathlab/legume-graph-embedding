@@ -1,6 +1,6 @@
 [package]
 name = "legume-graph-embedding"
-version = "0.8.8"
+version = "0.8.9"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
