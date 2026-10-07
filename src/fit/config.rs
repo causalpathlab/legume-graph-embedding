@@ -274,6 +274,10 @@ pub struct FitConfig {
     /// Row structure of the feature axis. `None` = every row is its own gene
     /// ([`TrackSpec::base`], built inside [`fit`]) — what `senna bge` runs.
     pub tracks: Option<TrackSpec>,
+    /// A count track learned as a displacement of the base track (see
+    /// [`crate::fit::divergence`]): set by [`crate::fit::divergence::split_displaced`],
+    /// which already cut the axis to the base rows, so `tracks` is `None`.
+    pub displaced: Option<crate::fit::divergence::DisplacedTrackConfig>,
     /// Ridge on the per-track offsets (`Δ^t_m`, `u^t_g · V^t`), keeping the
     /// non-base tracks close to the base model. Inert at one track.
     pub offset_l2: f32,
@@ -440,6 +444,8 @@ pub struct FitOutput {
     pub module_labels: Vec<u32>,
     /// Phase-1 cis gates (θ, γ, `w`) when [`FitConfig::cis_gates`] was set.
     pub cis_gates: Option<crate::fit::hier::CisGateReadout>,
+    /// The displaced track's fit, when [`FitConfig::displaced`] was set.
+    pub displacement: Option<crate::fit::divergence::DisplacementOutput>,
 }
 
 #[cfg(test)]
