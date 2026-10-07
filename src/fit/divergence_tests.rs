@@ -15,14 +15,9 @@ fn frozen(rng: &mut StdRng) -> Frozen {
     }
 }
 
-/// `n_draws` reads among the support at position `pos` with biases `b`.
-fn draw(f: &Frozen, pos: &[f32], b: &[f32], n_draws: usize, rng: &mut StdRng) -> Vec<(u32, f32)> {
-    let w: Vec<f64> = (0..S)
-        .map(|g| {
-            let s: f32 = (0..H).map(|k| pos[k] * f.rho[g * H + k]).sum::<f32>() + b[g];
-            f64::from(s).exp()
-        })
-        .collect();
+/// `n_draws` reads among the genes with log weights `logw`.
+fn draw(logw: &[f32], n_draws: usize, rng: &mut StdRng) -> Vec<(u32, f32)> {
+    let w: Vec<f64> = logw.iter().map(|&x| f64::from(x).exp()).collect();
     let pick = WeightedIndex::new(&w).unwrap();
     let mut counts = vec![0f32; S];
     for _ in 0..n_draws {
@@ -36,11 +31,10 @@ fn draw(f: &Frozen, pos: &[f32], b: &[f32], n_draws: usize, rng: &mut StdRng) ->
         .collect()
 }
 
-/// Two groups of units, displaced `+v` and `−v`; the displaced track's biases
-/// shifted from the base's. Returns θ, the counts, the group of each unit.
+/// Two groups of units, displaced `+v` and `−v`; the displaced track's gene
+/// ratios shifted from the base's.
 struct World {
     frozen: Frozen,
-    theta: DMatrix<f32>,
     units: Vec<UnitCounts>,
     group: Vec<usize>,
     v: [f32; H],
@@ -57,31 +51,28 @@ fn world(
     let frozen = frozen(&mut rng);
     let n = Normal::new(0.0f32, 1.0).unwrap();
     let v = [0.9 * shift, -0.6 * shift, 0.4 * shift];
-    let b_disp: Vec<f32> = frozen
-        .b
-        .iter()
-        .map(|&b| b + 0.3 * n.sample(&mut rng))
-        .collect();
-    let mut theta = DMatrix::<f32>::zeros(n_units, H);
+    let delta: Vec<f32> = (0..S).map(|_| 0.3 * n.sample(&mut rng)).collect();
     let mut units = Vec::new();
     let mut group = Vec::new();
     for u in 0..n_units {
         let gr = u % 2;
         let sign = if gr == 0 { 1.0 } else { -1.0 };
         let th: Vec<f32> = (0..H).map(|_| 0.8 * n.sample(&mut rng)).collect();
-        let disp: Vec<f32> = (0..H).map(|k| th[k] + sign * v[k]).collect();
-        for k in 0..H {
-            theta[(u, k)] = th[k];
-        }
+        let d: Vec<f32> = (0..H).map(|k| sign * v[k]).collect();
+        let base: Vec<f32> = (0..S)
+            .map(|g| dot(&th, frozen.rho_row(g)) + frozen.b[g])
+            .collect();
+        let disp: Vec<f32> = (0..S)
+            .map(|g| base[g] + delta[g] + dot(&d, frozen.rho_row(g)))
+            .collect();
         units.push(UnitCounts {
-            base: draw(&frozen, &th, &frozen.b, base_reads, &mut rng),
-            displaced: draw(&frozen, &disp, &b_disp, displaced_reads, &mut rng),
+            base: draw(&base, base_reads, &mut rng),
+            displaced: draw(&disp, displaced_reads, &mut rng),
         });
         group.push(gr);
     }
     World {
         frozen,
-        theta,
         units,
         group,
         v,
@@ -107,55 +98,51 @@ fn group_means(d: &DMatrix<f32>, group: &[usize]) -> [[f32; H]; 2] {
 }
 
 fn cosine(a: &[f32; H], b: &[f32; H]) -> f32 {
-    let dot: f32 = (0..H).map(|k| a[k] * b[k]).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb).max(1e-12)
+    dot(a, b) / (dot(a, a).sqrt() * dot(b, b).sqrt()).max(1e-12)
 }
 
 fn norm(a: &[f32; H]) -> f32 {
-    a.iter().map(|x| x * x).sum::<f32>().sqrt()
+    dot(a, a).sqrt()
 }
 
-fn knobs(rule_a_prob: f64) -> DisplacedTrackConfig {
+fn knobs() -> DisplacedTrackConfig {
     let mut k = DisplacedTrackConfig::new(DisplacedAxis {
         base_backend_row: Vec::new(),
         displaced_backend_row: Vec::new(),
         track_name: "count/unspliced".into(),
     });
-    k.rule_a_prob = rule_a_prob;
     k.pb_epochs = 150;
     k.learning_rate = 0.05;
     k.l2_pb = 0.1;
     k
 }
 
-#[test]
-fn pseudobulk_displacements_are_recovered_by_either_rule_or_both() {
-    let w = world(60, 3000, 1500, 1.0, 7);
+/// The two groups' displacements, after centring, point along `±v`.
+fn assert_recovered(w: &World, fit: &mut PbFit, label: &str) {
+    center_units(fit, &w.frozen);
+    let means = group_means(&fit.d, &w.group);
     let neg_v = [-w.v[0], -w.v[1], -w.v[2]];
-    for p in [0.5, 1.0, 0.0] {
-        let fit =
-            fit_pseudobulks(&w.frozen, &w.theta, &w.units, &knobs(p), 1, &Device::Cpu).unwrap();
-        let means = group_means(&fit.d, &w.group);
-        assert!(
-            cosine(&means[0], &w.v) > 0.9,
-            "rule A prob {p}: {:?} vs {:?}",
-            means[0],
-            w.v
-        );
-        assert!(
-            cosine(&means[1], &neg_v) > 0.9,
-            "rule A prob {p}: {:?}",
-            means[1]
-        );
-    }
+    assert!(
+        cosine(&means[0], &w.v) > 0.9,
+        "{label}: {:?} vs {:?}",
+        means[0],
+        w.v
+    );
+    assert!(cosine(&means[1], &neg_v) > 0.9, "{label}: {:?}", means[1]);
+}
+
+#[test]
+fn pseudobulk_displacements_are_recovered() {
+    let w = world(60, 3000, 1500, 1.0, 7);
+    let mut fit = fit_pseudobulks(&w.frozen, &w.units, &knobs(), 1, &Device::Cpu).unwrap();
+    assert_recovered(&w, &mut fit, "pseudobulks");
 }
 
 #[test]
 fn no_displacement_gives_small_displacements() {
     let w = world(60, 3000, 1500, 0.0, 9);
-    let fit = fit_pseudobulks(&w.frozen, &w.theta, &w.units, &knobs(0.5), 1, &Device::Cpu).unwrap();
+    let mut fit = fit_pseudobulks(&w.frozen, &w.units, &knobs(), 1, &Device::Cpu).unwrap();
+    center_units(&mut fit, &w.frozen);
     let means = group_means(&fit.d, &w.group);
     let shifted = world(60, 3000, 1500, 1.0, 9);
     for m in &means {
@@ -164,7 +151,82 @@ fn no_displacement_gives_small_displacements() {
 }
 
 #[test]
-fn the_cell_encoder_follows_its_pseudobulk_and_predicts_held_out_cells() {
+fn the_steady_anchor_is_the_ratio_at_both_ends_of_a_genes_base_score() {
+    // One dimension, one gene; units ordered along it. The two lowest and two
+    // highest units (5% of 40 at each end) sit at log ratio 0.7; the rest at
+    // -1. The model expects ratio e^0 everywhere (κ = δ = 0), so the anchor is
+    // the ends' log ratio.
+    let n = 40;
+    let frozen = Frozen {
+        rho: vec![1.0],
+        b: vec![0.0],
+        h: 1,
+    };
+    let theta = DMatrix::from_fn(n, 1, |p, _| p as f32);
+    let units: Vec<UnitCounts> = (0..n)
+        .map(|p| {
+            let end = p < 2 || p >= n - 2;
+            let ratio: f32 = if end { 0.7f32.exp() } else { (-1f32).exp() };
+            UnitCounts {
+                base: vec![(0, 1000.0)],
+                displaced: vec![(0, 1000.0 * ratio)],
+            }
+        })
+        .collect();
+    let fit = PbFit {
+        d: DMatrix::zeros(n, 1),
+        kappa: vec![0.0; n],
+        delta: vec![0.0],
+    };
+    let anchor = steady_anchor(&frozen, &theta, &units, &fit, 0..n);
+    assert!((anchor[0] - 0.7).abs() < 1e-2, "{anchor:?}");
+}
+
+#[test]
+fn centering_moves_the_mean_displacement_into_the_gene_ratios_without_changing_a_score() {
+    let mut rng = StdRng::seed_from_u64(5);
+    let f = frozen(&mut rng);
+    let n = Normal::new(0.0f32, 1.0).unwrap();
+    let u = 7;
+    let mut fit = PbFit {
+        d: DMatrix::from_fn(u, H, |_, k| 2.0 + k as f32 + n.sample(&mut rng)),
+        kappa: (0..u).map(|_| n.sample(&mut rng)).collect(),
+        delta: (0..S).map(|_| n.sample(&mut rng)).collect(),
+    };
+    let score = |fit: &PbFit, u: usize, g: usize| -> f32 {
+        let d: Vec<f32> = fit.d.row(u).iter().copied().collect();
+        fit.kappa[u] + fit.delta[g] + dot(&d, f.rho_row(g))
+    };
+    let before: Vec<f32> = (0..u)
+        .flat_map(|p| (0..S).map(move |g| (p, g)))
+        .map(|(p, g)| score(&fit, p, g))
+        .collect();
+    center_units(&mut fit, &f);
+    for k in 0..H {
+        assert!(fit.d.column(k).sum().abs() < 1e-4, "d column {k}");
+    }
+    let after: Vec<f32> = (0..u)
+        .flat_map(|p| (0..S).map(move |g| (p, g)))
+        .map(|(p, g)| score(&fit, p, g))
+        .collect();
+    for (x, y) in before.iter().zip(&after) {
+        assert!((x - y).abs() < 1e-4, "{x} vs {y}");
+    }
+}
+
+#[test]
+fn the_cell_encoder_follows_its_pseudobulk() {
+    cell_encoder_follows_its_pseudobulk(&Device::Cpu);
+}
+
+/// The same on the GPU, whose matmul refuses strided operands the CPU takes.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_cell_encoder_runs_on_cuda() {
+    cell_encoder_follows_its_pseudobulk(&Device::new_cuda(0).expect("a CUDA device"));
+}
+
+fn cell_encoder_follows_its_pseudobulk(dev: &Device) {
     // Cells: sparse reads, each cell's target its group's true displacement.
     let w = world(400, 300, 120, 1.0, 11);
     let mut target = DMatrix::<f32>::zeros(w.units.len(), H);
@@ -174,27 +236,15 @@ fn the_cell_encoder_follows_its_pseudobulk_and_predicts_held_out_cells() {
             target[(u, k)] = sign * w.v[k];
         }
     }
-    let mut k = knobs(0.5);
+    let mut k = knobs();
     k.distill_epochs = 30;
     k.refine_epochs = 10;
-    let b_disp = w.frozen.b.clone();
-    let fit = fit_cells(
-        &w.frozen,
-        &w.theta,
-        &w.units,
-        &target,
-        &b_disp,
-        &k,
-        3,
-        &Device::Cpu,
-    )
-    .unwrap();
+    let delta = pooled_log_ratio(&w.units, S);
+    let fit = fit_cells(&w.frozen, &w.units, &target, &delta, &k, 3, dev).unwrap();
     let means = group_means(&fit.d, &w.group);
     let neg_v = [-w.v[0], -w.v[1], -w.v[2]];
     assert!(cosine(&means[0], &w.v) > 0.8, "{:?}", means[0]);
     assert!(cosine(&means[1], &neg_v) > 0.8, "{:?}", means[1]);
-    assert!(fit.held_out.n_cells > 0);
-    assert!(fit.held_out.gain_per_count > 0.0, "{:?}", fit.held_out);
 }
 
 #[test]

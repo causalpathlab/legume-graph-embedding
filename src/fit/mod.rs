@@ -23,7 +23,6 @@ pub use config::{
 };
 pub use divergence::{
     split_displaced, DisplacedAxis, DisplacedTrackConfig, DisplacementEncoder, DisplacementOutput,
-    HeldOutScore,
 };
 pub use hier::{CisCoupling, CisGateReadout, CisGates};
 pub use module_args::FeatureModuleArgs;
@@ -541,20 +540,19 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     }
 
     // A displaced track, against the finished base tables in the cells' frame.
+    // Skipped on an interrupted fit: the cells were never placed.
     let displacement = match &config.displaced {
-        Some(knobs) => {
+        Some(knobs) if !stop.load(std::sync::atomic::Ordering::Relaxed) => {
             anyhow::ensure!(
                 config.tracks.is_none(),
                 "a displaced track fits on the base axis: split it off first and pass no track spec"
             );
-            let theta = DMatrix::<f32>::from_tensor(&cell_model.e_cell)?;
             let e_feat = DMatrix::<f32>::from_tensor(&cell_model.e_feat)?;
             let b_feat: Vec<f32> = cell_model.b_feat.flatten_all()?.to_vec1()?;
             let tables: Vec<&DMatrix<f32>> = pb_embeddings.iter().map(|l| &l.e_pb).collect();
             Some(divergence::fit_displaced(
                 unified,
                 knobs,
-                &theta,
                 &e_feat,
                 &b_feat,
                 &tables,
@@ -563,7 +561,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
                 &config.device,
             )?)
         }
-        None => None,
+        _ => None,
     };
 
     Ok(FitOutput {
