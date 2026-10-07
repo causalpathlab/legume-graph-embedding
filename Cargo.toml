@@ -49,5 +49,6 @@ serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = "1.0"
+tempfile = "3"
 data-beans = { version = "0.8", features = ["aux", "alg"] }
 nalgebra = "0.34"

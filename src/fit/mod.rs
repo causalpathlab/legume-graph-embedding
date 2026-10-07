@@ -75,29 +75,36 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     // Shared upstream: projection → pseudobulks //
     ///////////////////////////////////////////////
     let n_features = unified.n_features();
-    let feature_to_backend = unified.feature_to_backend_row.clone();
     let pb = setup::build_pseudobulks(unified, &config)?;
     let setup::Pseudobulks {
         collapsed_levels,
         cell_to_pb_per_level,
         blobs: pb_blobs,
+        collapse_row_of_feature,
+        batch_names: collapse_batch_names,
+        masked: collapse_masked,
     } = pb;
+    // The emitted collapse is read back against the backend's own row names,
+    // which a collapse on the live rows alone no longer matches.
+    anyhow::ensure!(
+        !(collapse_masked && config.emit_finest_collapse),
+        "the finest collapse cannot be emitted when the fit reads only part of the backend's \
+         rows (a split-off displaced track)"
+    );
     // Per-batch gene fold for phase 2, from the finest collapse's `δ`. The count
     // backend numbers batches by sorted name; the unified data by first appearance
     // — matched by name inside.
     let batch_gene_fold: Option<BatchGeneFold> =
         match collapsed_levels.last().and_then(|c| c.delta.as_ref()) {
             Some(delta) => {
-                let collapse_batch_names =
-                    unified.count_backend().batch_names().ok_or_else(|| {
-                        anyhow::anyhow!("collapse fit a δ but the backend has no batch names")
-                    })?;
+                let collapse_batch_names = collapse_batch_names.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("collapse fit a δ but registered no batch names")
+                })?;
                 batch_fold::batch_gene_fold(batch_fold::FoldSource {
                     delta: delta.posterior_mean(),
-                    collapse_batch_names: &collapse_batch_names,
+                    collapse_batch_names,
                     unified_batch_names: &unified.batch_names,
-                    n_features,
-                    feature_to_backend: &feature_to_backend,
+                    collapse_row_of_feature: &collapse_row_of_feature,
                 })?
             }
             None => None,
@@ -130,7 +137,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
             Some(adj) => adj.posterior_mean(),
             None => finest.mu_observed.posterior_mean(),
         };
-        setup::gather_to_unified_axis(pb_full, n_features, &feature_to_backend)
+        setup::gather_to_unified_axis(pb_full, &collapse_row_of_feature)
     };
     let models::Heads {
         mut cell_model,
@@ -192,7 +199,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         let cell_to_pb = cell_to_pb_per_level.last().expect("at least one level");
         let (counts, sizes) = finest.observed_counts(cell_to_pb)?;
         Ok((
-            setup::gather_to_unified_axis(&counts, n_features, &feature_to_backend),
+            setup::gather_to_unified_axis(&counts, &collapse_row_of_feature),
             sizes,
         ))
     };
