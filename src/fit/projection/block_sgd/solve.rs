@@ -156,7 +156,7 @@ pub(super) fn solve_block(a: BlockArgs) -> anyhow::Result<BlockOut> {
 
         // AdamW with `weight_decay = 0` — the ridge is already in `g` above, and a
         // decoupled decay would double-count it. The decayed, bias-corrected step
-        // multiplier is [`adam_step_size`], shared with the per-track loop.
+        // multiplier is [`adam_step_size`].
         m = ((&m * BETA1)? + (&g * (1.0 - BETA1))?)?;
         v = ((&v * BETA2)? + (g.sqr()? * (1.0 - BETA2))?)?;
         let step_size = adam_step_size(dict.lr0, step, max_steps);
@@ -170,9 +170,6 @@ pub(super) fn solve_block(a: BlockArgs) -> anyhow::Result<BlockOut> {
         // loop already pays a device sync, so the update rides along for free, and
         // ~`MAX_STEPS/CHECK_EVERY` ticks per block is plenty of motion without
         // hammering the bar's lock and reformatting its message 400 times.
-        //
-        // This check is re-typed, not shared, in [`super::tracks`]'s per-track
-        // loop: a change here belongs there too.
         if steps.is_multiple_of(CHECK_EVERY) {
             emitted = a.progress.advance(bc, steps, emitted);
             a.progress.describe(steps);
@@ -203,8 +200,7 @@ pub(super) fn solve_block(a: BlockArgs) -> anyhow::Result<BlockOut> {
     // Two-sided here (unlike the training loop): the deviance takes `ln(n/μ)`, so a
     // rate that underflowed to 0 would report an infinite one.
     let s = s.clamp(-SCORE_CLAMP, SCORE_CLAMP)?;
-    // Poisson deviance over this block's observed edges — see [`poisson_deviance`],
-    // which the per-track loop reduces through as well.
+    // Poisson deviance over this block's observed edges — see [`poisson_deviance`].
     let deviance = if n_edges > 0 {
         poisson_deviance(&n_t, &s)?
     } else {

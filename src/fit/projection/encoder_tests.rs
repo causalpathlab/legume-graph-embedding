@@ -143,7 +143,7 @@ fn the_distillation_fits_a_planted_target_on_held_out_pseudobulks() {
         e_pb: &e_pb,
         groups: &groups,
     }];
-    let (encoder, report) = distill(dict, &mean, &levels, &folded, 3, &dev).unwrap();
+    let (encoder, report) = distill(dict.clone(), &mean, &levels, &folded, 3, &dev).unwrap();
     assert!(report.held_out_mse.is_finite());
     assert!(
         report.held_out_mse < 0.5 * report.held_out_target_var,
@@ -159,29 +159,7 @@ fn the_distillation_fits_a_planted_target_on_held_out_pseudobulks() {
 
     // The likelihood refinement starts from the distilled map and lowers the
     // cells' own per-count NLL — the objective it trains is the one reported.
-    // Forced by `refine`'s signature only: it now takes the fit's encoder SET
-    // and one dictionary per track, which on this one-track axis is this trunk
-    // and one dictionary. No assertion below changed.
-    let encs = CellEncoders::new(
-        vec![TrackEncoder {
-            track: 0,
-            name: "t0".into(),
-            rows: (0..D as u32).collect(),
-            encoder,
-        }],
-        D,
-    );
-    let dicts = vec![FrozenDict::new(&feat, &b, H, &dev).unwrap()];
-    let refined = refine(
-        &encs,
-        &dicts,
-        &[std::borrow::Cow::Borrowed(folded.as_slice())],
-        1.0,
-        3,
-        &dev,
-    )
-    .unwrap();
-    let encoder = &encs.iter()[0].encoder;
+    let refined = refine(&encoder, &dict, &folded, 1.0, 3, &dev).unwrap();
     assert_eq!(refined.n_cells, n_cells);
     assert!(refined.nll_per_count_before.is_finite() && refined.nll_per_count_after.is_finite());
     assert!(
@@ -249,13 +227,13 @@ fn the_distillation_fits_a_planted_target_on_held_out_pseudobulks() {
     }
 }
 
-////////////////////////////////////
-// The one-track fixture (parity) //
-////////////////////////////////////
+//////////////////////////////////
+// The phase-2 fixture (parity) //
+//////////////////////////////////
 
-/// Owned pieces of the one-track `project_cells` fixture, so the `(id, feats,
+/// Owned pieces of the `project_cells` fixture, so the `(id, feats,
 /// counts)` tuples can borrow them.
-struct OneTrackFixture {
+struct Phase2Fixture {
     feat: Vec<f32>,
     b_feat: Vec<f32>,
     edges: Vec<(Vec<u32>, Vec<f32>)>,
@@ -267,10 +245,10 @@ const FIX_PB: usize = 12;
 const FIX_PER_PB: usize = 4;
 const FIX_CELLS: usize = FIX_PB * FIX_PER_PB;
 
-/// A planted one-track fixture: `FIX_PB` pseudobulks of `FIX_PER_PB` cells each,
+/// A planted fixture: `FIX_PB` pseudobulks of `FIX_PER_PB` cells each,
 /// every cell dense over `D` features, and a pseudobulk table that is a fixed
 /// linear map of the members' mean composition.
-fn one_track_fixture() -> OneTrackFixture {
+fn phase2_fixture() -> Phase2Fixture {
     let mut edges = Vec::with_capacity(FIX_CELLS);
     let mut cell_to_pb = Vec::with_capacity(FIX_CELLS);
     for p in 0..FIX_PB {
@@ -307,7 +285,7 @@ fn one_track_fixture() -> OneTrackFixture {
             e_pb[(p, k)] = (0..D).map(|g| a[k * D + g] * row[g] / z).sum::<f32>();
         }
     }
-    OneTrackFixture {
+    Phase2Fixture {
         feat: (0..D * H)
             .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.2)
             .collect(),
@@ -318,8 +296,8 @@ fn one_track_fixture() -> OneTrackFixture {
     }
 }
 
-/// `project_cells` on the one-track fixture, returning `(θ, b_cell)`.
-fn one_track_project(fx: &OneTrackFixture) -> (Vec<f32>, Vec<f32>) {
+/// `project_cells` on the fixture, returning `(θ, b_cell)`.
+fn project_fixture(fx: &Phase2Fixture) -> (Vec<f32>, Vec<f32>) {
     let dev = Device::Cpu;
     let cells: Vec<(u32, &[u32], &[f32])> = fx
         .edges
@@ -345,15 +323,13 @@ fn one_track_project(fx: &OneTrackFixture) -> (Vec<f32>, Vec<f32>) {
         levels: &levels,
         seed: 20_260_914,
     };
-    let (out, encs) =
-        project_cells(&input, &cells, None, &spec, &TrackSpec::base(D), None).unwrap();
-    // One count track, so exactly one encoder — the file `senna bge` persists.
-    assert_eq!(encs.iter().len(), 1);
-    assert!(encs.single().is_some());
+    let (out, enc) = project_cells(&input, &cells, None, &spec, None).unwrap();
+    // The encoder `senna bge` persists reads the whole axis.
+    assert_eq!(enc.feature_mean().unwrap().len(), D);
     (out.theta, out.b_cell)
 }
 
-/// The parity guard for the one-track (`senna bge`) path.
+/// The parity guard for the `senna bge` phase-2 path.
 ///
 /// The numbers below were taken from `project_cells` on this same fixture —
 /// the encoder's placement with the intercept exact at it, no per-cell solve
@@ -363,10 +339,10 @@ fn one_track_project(fx: &OneTrackFixture) -> (Vec<f32>, Vec<f32>) {
 /// per-parameter squares in `GradStore`'s hash-map order, which differs between
 /// processes, so the clip factor — and through the refinement, the answer — can
 /// move run to run *within one build*. The six runs behind the snapshot agreed
-/// far inside the bar, and re-seeding track 0 off `spec.seed` moves θ[0] by
-/// well over it.
+/// far inside the bar, and re-seeding the distillation off `spec.seed` moves
+/// θ[0] by well over it.
 #[test]
-fn one_track_project_cells_matches_the_previous_output() {
+fn project_cells_matches_the_previous_output() {
     #[rustfmt::skip]
     const THETA: [f32; FIX_CELLS * H] = [
         0.203109, -0.107541, -0.157314, 0.058433, -0.086704, -0.152246,
@@ -405,7 +381,7 @@ fn one_track_project_cells_matches_the_previous_output() {
         0.166783, 0.244607, 0.314993, 0.318938, 0.154058, 0.316019,
         0.317954, 0.387527, 0.236552, 0.314083, 0.315606, 0.387527,
     ];
-    let (theta, b_cell) = one_track_project(&one_track_fixture());
+    let (theta, b_cell) = project_fixture(&phase2_fixture());
     assert_eq!(theta.len(), THETA.len());
     assert_eq!(b_cell.len(), B_CELL.len());
     for (i, (&got, &want)) in theta.iter().zip(&THETA).enumerate() {
@@ -419,524 +395,6 @@ fn one_track_project_cells_matches_the_previous_output() {
             (got - want).abs() < 5e-4,
             "b_cell[{i}] drifted from the pre-change output: {got} vs {want}"
         );
-    }
-}
-
-////////////////////////
-// Per-track plumbing //
-////////////////////////
-
-/// A count track over rows `0..6` and another over `6..12`, both naming the
-/// same six genes.
-fn two_track_spec() -> TrackSpec {
-    TrackSpec {
-        track_of_row: (0..D).map(|r| (r / 6) as u32).collect(),
-        gene_of_row: (0..D).map(|r| (r % 6) as u32).collect(),
-        tracks: vec![
-            crate::fit::config::TrackInfo {
-                name: "t0".into(),
-                is_count: true,
-            },
-            crate::fit::config::TrackInfo {
-                name: "m1/t1".into(),
-                is_count: true,
-            },
-        ],
-    }
-}
-
-/// Two count tracks over rows `0..4` / `4..8` and a NON-count track over
-/// `8..12`.
-fn three_track_spec() -> TrackSpec {
-    TrackSpec {
-        track_of_row: (0..D).map(|r| (r / 4) as u32).collect(),
-        gene_of_row: (0..D).map(|r| (r % 4) as u32).collect(),
-        tracks: vec![
-            crate::fit::config::TrackInfo {
-                name: "t0".into(),
-                is_count: true,
-            },
-            crate::fit::config::TrackInfo {
-                name: "t1".into(),
-                is_count: true,
-            },
-            crate::fit::config::TrackInfo {
-                name: "t2".into(),
-                is_count: false,
-            },
-        ],
-    }
-}
-
-fn dict_feat() -> (Vec<f32>, Vec<f32>) {
-    (
-        (0..D * H)
-            .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.1)
-            .collect(),
-        (0..D).map(|g| -((g + 1) as f32).ln() * 0.1).collect(),
-    )
-}
-
-#[test]
-fn for_rows_over_all_rows_equals_new() {
-    let dev = Device::Cpu;
-    let (feat, b) = dict_feat();
-    let all: Vec<u32> = (0..D as u32).collect();
-    let a = FrozenDict::new(&feat, &b, H, &dev).unwrap();
-    let c = FrozenDict::for_rows(&feat, &b, H, &all, &dev).unwrap();
-    assert_eq!(a.d(), D);
-    assert_eq!(c.d(), D);
-    assert_eq!(
-        a.e_hd.to_vec2::<f32>().unwrap(),
-        c.e_hd.to_vec2::<f32>().unwrap()
-    );
-    assert_eq!(
-        a.b_1d.to_vec2::<f32>().unwrap(),
-        c.b_1d.to_vec2::<f32>().unwrap()
-    );
-    // A subset takes exactly those rows, in the order given.
-    let some = FrozenDict::for_rows(&feat, &b, H, &[7, 2], &dev).unwrap();
-    assert_eq!(some.d(), 2);
-    let e = some.e_hd.to_vec2::<f32>().unwrap();
-    for (k, col) in e.iter().enumerate() {
-        assert_eq!(col[0], feat[7 * H + k]);
-        assert_eq!(col[1], feat[2 * H + k]);
-    }
-    assert_eq!(some.b_1d.to_vec2::<f32>().unwrap()[0], vec![b[7], b[2]]);
-}
-
-#[test]
-fn split_rows_by_track_relabels_to_local_ids_and_borrows_for_one_track() {
-    let r = rows(4);
-    // One track: the whole axis, borrowed — nothing is copied at T = 1.
-    let one = split_rows_by_track(&r, &TrackSpec::base(D));
-    assert_eq!(one.len(), 1);
-    assert!(matches!(one[0], std::borrow::Cow::Borrowed(_)));
-    for (a, b) in one[0].iter().zip(&r) {
-        assert_eq!(a.feats, b.feats);
-        assert_eq!(a.counts, b.counts);
-    }
-    // Two tracks: each row keeps its own track's edges, relabelled to `0..6`.
-    let spec = two_track_spec();
-    spec.validate(D).unwrap();
-    let two = split_rows_by_track(&r, &spec);
-    assert_eq!(two.len(), 2);
-    assert!(matches!(two[0], std::borrow::Cow::Owned(_)));
-    for (i, row) in r.iter().enumerate() {
-        for (t, track) in two.iter().enumerate() {
-            let want: Vec<(u32, f32)> = row
-                .feats
-                .iter()
-                .zip(&row.counts)
-                .filter(|(&f, _)| (f as usize) / 6 == t)
-                .map(|(&f, &c)| (f - 6 * t as u32, c))
-                .collect();
-            let got: Vec<(u32, f32)> = track[i]
-                .feats
-                .iter()
-                .zip(&track[i].counts)
-                .map(|(&f, &c)| (f, c))
-                .collect();
-            assert_eq!(got, want, "row {i}, track {t}");
-            assert!(got.iter().all(|&(f, _)| (f as usize) < 6));
-        }
-    }
-}
-
-/// An encoder whose head is a constant: the weight is zeroed and the bias
-/// planted, so its output is `bias` for any input. That makes the combine rule
-/// readable off the placements.
-fn planted_encoder(rows: &[u32], bias: &[f32], dev: &Device) -> CellEncoder {
-    let (feat, b) = dict_feat();
-    let dict = FrozenDict::for_rows(&feat, &b, H, rows, dev).unwrap();
-    let mean = vec![1f32; rows.len()];
-    let enc = CellEncoder::build(dict, &mean, dev).unwrap();
-    seed_trunk(&enc.varmap, 11).unwrap();
-    {
-        let vars = enc.varmap.data().lock().unwrap();
-        let w = vars.get("cell_enc.nn.enc.z.mean.weight").unwrap();
-        w.set(&w.as_tensor().zeros_like().unwrap()).unwrap();
-        let bs = vars.get("cell_enc.nn.enc.z.mean.bias").unwrap();
-        bs.set(&Tensor::from_slice(bias, H, dev).unwrap()).unwrap();
-    }
-    enc
-}
-
-fn planted_pair(dev: &Device) -> CellEncoders {
-    let spec = two_track_spec();
-    CellEncoders::new(
-        vec![
-            TrackEncoder {
-                track: 0,
-                name: spec.tracks[0].name.clone(),
-                rows: spec.rows_of_track(0),
-                encoder: planted_encoder(&spec.rows_of_track(0), &[1.0, 2.0, 3.0], dev),
-            },
-            TrackEncoder {
-                track: 1,
-                name: spec.tracks[1].name.clone(),
-                rows: spec.rows_of_track(1),
-                encoder: planted_encoder(&spec.rows_of_track(1), &[-1.0, 0.0, 5.0], dev),
-            },
-        ],
-        D,
-    )
-}
-
-/// Nodes: one with counts on both tracks, one on track 0 only, one on track 1
-/// only.
-fn combine_nodes() -> Vec<(Vec<u32>, Vec<f32>)> {
-    vec![
-        (vec![0, 1, 7, 8], vec![2.0, 3.0, 4.0, 5.0]),
-        (vec![0, 2], vec![6.0, 1.0]),
-        (vec![9, 10], vec![3.0, 2.0]),
-    ]
-}
-
-#[test]
-fn two_count_tracks_combine_by_mean_and_an_absent_track_falls_back() {
-    let dev = Device::Cpu;
-    let encs = planted_pair(&dev);
-    assert!(encs.single().is_none());
-    let owned = combine_nodes();
-    let nodes: Vec<(u32, &[u32], &[f32])> = owned
-        .iter()
-        .enumerate()
-        .map(|(i, (f, c))| (i as u32, f.as_slice(), c.as_slice()))
-        .collect();
-    let out = encs.encode_edges(&nodes).unwrap();
-    let want = [
-        [0.0f32, 1.0, 4.0], // both tracks: the mean of the two heads
-        [1.0, 2.0, 3.0],    // track 1 absent: track 0's head alone
-        [-1.0, 0.0, 5.0],   // track 0 absent: track 1's head alone
-    ];
-    for (n, row) in out.theta.chunks(H).enumerate() {
-        for k in 0..H {
-            assert!(
-                (row[k] - want[n][k]).abs() < 1e-5,
-                "node {n}, dim {k}: {} vs {}",
-                row[k],
-                want[n][k]
-            );
-        }
-    }
-    // The reported intercept is track 0's; the node with no track-0 counts sits
-    // at the score clamp's floor.
-    assert_eq!(out.b_node.len(), 3);
-    assert_eq!(out.b_node[2], -(crate::cell_projection::SCORE_CLAMP as f32));
-    assert!(out.b_node[0].is_finite() && out.b_node[1].is_finite());
-}
-
-#[test]
-fn shift_output_on_every_encoder_shifts_the_combined_placement_by_minus_shift() {
-    let dev = Device::Cpu;
-    let encs = planted_pair(&dev);
-    let owned = combine_nodes();
-    let nodes: Vec<(u32, &[u32], &[f32])> = owned
-        .iter()
-        .enumerate()
-        .map(|(i, (f, c))| (i as u32, f.as_slice(), c.as_slice()))
-        .collect();
-    let before = encs.encode_edges(&nodes).unwrap();
-    let shift = [0.5f32, -1.25, 2.0];
-    encs.shift_output(&shift).unwrap();
-    let after = encs.encode_edges(&nodes).unwrap();
-    for (n, (a, b)) in after
-        .theta
-        .chunks(H)
-        .zip(before.theta.chunks(H))
-        .enumerate()
-    {
-        for k in 0..H {
-            assert!(
-                (a[k] - (b[k] - shift[k])).abs() < 1e-5,
-                "node {n}, dim {k}: {} vs {}",
-                a[k],
-                b[k] - shift[k]
-            );
-        }
-    }
-}
-
-#[test]
-fn save_and_load_round_trip_per_track() {
-    let dev = Device::Cpu;
-    let spec = two_track_spec();
-    let encs = planted_pair(&dev);
-    let dir = std::env::temp_dir();
-    let paths: Vec<(u32, String)> = (0..2u32)
-        .map(|t| {
-            let p = dir
-                .join(format!(
-                    "cell_enc_track{t}_{}.safetensors",
-                    std::process::id()
-                ))
-                .to_string_lossy()
-                .to_string();
-            encs.iter()[t as usize].encoder.save(&p).unwrap();
-            (t, p)
-        })
-        .collect();
-    let (feat, b) = dict_feat();
-    let again = CellEncoders::load(&feat, &b, H, &spec, &paths, &dev).unwrap();
-    for (_, p) in &paths {
-        std::fs::remove_file(p).ok();
-    }
-    assert_eq!(again.iter().len(), 2);
-    assert_eq!(&*again.iter()[1].name, "m1/t1");
-    assert_eq!(again.iter()[1].rows, spec.rows_of_track(1));
-    let owned = combine_nodes();
-    let nodes: Vec<(u32, &[u32], &[f32])> = owned
-        .iter()
-        .enumerate()
-        .map(|(i, (f, c))| (i as u32, f.as_slice(), c.as_slice()))
-        .collect();
-    let a = encs.encode_edges(&nodes).unwrap();
-    let c = again.encode_edges(&nodes).unwrap();
-    for (x, y) in a.theta.iter().zip(&c.theta) {
-        assert!((x - y).abs() < 1e-6, "{x} vs {y}");
-    }
-    for (x, y) in a.b_node.iter().zip(&c.b_node) {
-        assert!((x - y).abs() < 1e-6, "{x} vs {y}");
-    }
-}
-
-#[test]
-fn refine_lowers_the_summed_nll_with_a_third_non_count_track_present() {
-    let dev = Device::Cpu;
-    let spec = three_track_spec();
-    spec.validate(D).unwrap();
-    let (feat, b) = dict_feat();
-    let folded = rows(64);
-    let by_track = split_rows_by_track(&folded, &spec);
-    assert_eq!(by_track.len(), 3);
-    let dicts: Vec<FrozenDict> = (0..3)
-        .map(|t| FrozenDict::for_rows(&feat, &b, H, &spec.rows_of_track(t), &dev).unwrap())
-        .collect();
-    let build = || {
-        CellEncoders::new(
-            spec.count_tracks()
-                .iter()
-                .map(|&t| TrackEncoder {
-                    track: t as u32,
-                    name: spec.tracks[t].name.clone(),
-                    rows: spec.rows_of_track(t),
-                    encoder: {
-                        let rows_t = spec.rows_of_track(t);
-                        let dict = FrozenDict::for_rows(&feat, &b, H, &rows_t, &dev).unwrap();
-                        let mean = gene_mean(&by_track[t], rows_t.len());
-                        let enc = CellEncoder::build(dict, &mean, &dev).unwrap();
-                        seed_trunk(&enc.varmap, 5).unwrap();
-                        enc
-                    },
-                })
-                .collect(),
-            D,
-        )
-    };
-    // `nll_per_count` divides by the counts of every track scored, so the
-    // comparisons below are on the NLL itself, reconstructed from the reported
-    // per-count value and the counts that went into it.
-    let counts_of = |bt: &[Cow<'_, [FoldedRow]>]| -> f64 {
-        bt.iter()
-            .flat_map(|t| t.iter())
-            .flat_map(|r| r.counts.iter())
-            .map(|&v| f64::from(v))
-            .sum()
-    };
-    let nll_of = |st: &RefineStats, bt: &[Cow<'_, [FoldedRow]>]| -> f64 {
-        f64::from(st.nll_per_count_before) * counts_of(bt)
-    };
-
-    // Two count tracks and one that only contributes its likelihood term.
-    let all = build();
-    assert_eq!(all.iter().len(), 2);
-    let three = refine(&all, &dicts, &by_track, 1.0, 9, &dev).unwrap();
-    assert_eq!(three.n_cells, 64);
-    assert!(
-        three.nll_per_count_after < three.nll_per_count_before,
-        "NLL/count {} → {}",
-        three.nll_per_count_before,
-        three.nll_per_count_after
-    );
-
-    // The same two count tracks alone.
-    let two = refine(&build(), &dicts[..2], &by_track[..2], 1.0, 9, &dev).unwrap();
-    let (n3, n2) = (nll_of(&three, &by_track), nll_of(&two, &by_track[..2]));
-    assert!(
-        n3 > n2 + 1.0,
-        "the third track added nothing to the summed NLL: {n3} vs {n2}"
-    );
-
-    // …and an ABSENT third track — present in the spec, no counts on it —
-    // contributes exactly zero, so it puts the NLL back where two tracks had it.
-    let empty: Vec<FoldedRow> = (0..64).map(|_| FoldedRow::new(vec![], vec![])).collect();
-    let absent = [by_track[0].clone(), by_track[1].clone(), Cow::Owned(empty)];
-    let none = refine(&build(), &dicts, &absent, 1.0, 9, &dev).unwrap();
-    let n0 = nll_of(&none, &absent);
-    assert!(
-        (n0 - n2).abs() < 1e-2,
-        "an absent track must contribute exactly 0: {n0} vs {n2}"
-    );
-}
-
-///////////////////////////////////////////////////
-// One COUNT track is not the same as one track  //
-///////////////////////////////////////////////////
-
-/// A count track over rows `0..6` and a NON-count track over `6..12`: one
-/// encoder, but the axis is wider than the track it reads.
-fn count_plus_non_count_spec() -> TrackSpec {
-    TrackSpec {
-        track_of_row: (0..D).map(|r| (r / 6) as u32).collect(),
-        gene_of_row: (0..D).map(|r| (r % 6) as u32).collect(),
-        tracks: vec![
-            crate::fit::config::TrackInfo {
-                name: "t0".into(),
-                is_count: true,
-            },
-            crate::fit::config::TrackInfo {
-                name: "t1".into(),
-                is_count: false,
-            },
-        ],
-    }
-}
-
-/// One encoder is NOT one track. With a non-count track present the single
-/// encoder reads only its own `D_0 < F` rows, so the warm start must go through
-/// the split rows: handing it the unsplit global rows indexes a `[n, D_0]`
-/// block at a global feature id and blows up.
-#[test]
-fn one_count_track_beside_a_non_count_track_does_not_take_the_one_track_shortcut() {
-    let dev = Device::Cpu;
-    let fx = one_track_fixture();
-    let spec = count_plus_non_count_spec();
-    spec.validate(D).unwrap();
-    let cells: Vec<(u32, &[u32], &[f32])> = fx
-        .edges
-        .iter()
-        .enumerate()
-        .map(|(i, (f, c))| (i as u32, f.as_slice(), c.as_slice()))
-        .collect();
-    let input = Phase2Input {
-        feat: &fx.feat,
-        b_feat: &fx.b_feat,
-        h: H,
-        n_cells: FIX_CELLS,
-        lambda: 1.0,
-        dev: &dev,
-        label: "Phase 2",
-        gauge_fix: true,
-    };
-    let levels = vec![DistillLevel {
-        e_pb: &fx.e_pb,
-        cell_to_pb: &fx.cell_to_pb,
-    }];
-    let distill_spec = DistillSpec {
-        levels: &levels,
-        seed: 20_260_914,
-    };
-    let (out, encs) = project_cells(&input, &cells, None, &distill_spec, &spec, None).unwrap();
-    // Exactly one encoder, on the count track's rows alone.
-    assert_eq!(encs.iter().len(), 1);
-    assert_eq!(encs.iter()[0].rows, spec.rows_of_track(0));
-    assert_eq!(out.theta.len(), FIX_CELLS * H);
-    assert!(out.theta.iter().all(|v| v.is_finite()));
-    assert!(out.b_cell.iter().all(|v| v.is_finite()));
-    // The non-count track gets its own intercept, exact at the cell's θ.
-    assert_eq!(out.other_intercepts.len(), 1);
-    assert_eq!(out.other_intercepts[0].len(), FIX_CELLS);
-}
-
-#[test]
-fn encode_edges_with_one_encoder_that_does_not_span_the_axis_reads_only_its_rows() {
-    let dev = Device::Cpu;
-    let spec = count_plus_non_count_spec();
-    let rows0 = spec.rows_of_track(0);
-    let encs = CellEncoders::new(
-        vec![TrackEncoder {
-            track: 0,
-            name: spec.tracks[0].name.clone(),
-            rows: rows0.clone(),
-            encoder: planted_encoder(&rows0, &[1.0, 2.0, 3.0], &dev),
-        }],
-        D,
-    );
-    assert!(encs.single().is_some());
-    let owned = combine_nodes();
-    let nodes: Vec<(u32, &[u32], &[f32])> = owned
-        .iter()
-        .enumerate()
-        .map(|(i, (f, c))| (i as u32, f.as_slice(), c.as_slice()))
-        .collect();
-    let out = encs.encode_edges(&nodes).unwrap();
-    assert_eq!(out.theta.len(), 3 * H);
-    // Nodes 0 and 1 have counts on the count track: the planted head.
-    for n in 0..2 {
-        for k in 0..H {
-            assert!(
-                (out.theta[n * H + k] - (k + 1) as f32).abs() < 1e-5,
-                "node {n}, dim {k}: {}",
-                out.theta[n * H + k]
-            );
-        }
-    }
-    // Node 2's counts are all on the non-count track, so nothing reads it: it
-    // stays at the origin and reports the score clamp's floor.
-    assert!(out.theta[2 * H..].iter().all(|v| v.abs() < 1e-6));
-    assert_eq!(out.b_node[2], -(crate::cell_projection::SCORE_CLAMP as f32));
-}
-
-#[test]
-fn load_refuses_a_path_list_that_is_not_exactly_the_count_tracks() {
-    let dev = Device::Cpu;
-    let spec = two_track_spec();
-    let encs = planted_pair(&dev);
-    let dir = std::env::temp_dir();
-    let paths: Vec<(u32, String)> = (0..2u32)
-        .map(|t| {
-            let p = dir
-                .join(format!(
-                    "cell_enc_load_guard_{t}_{}.safetensors",
-                    std::process::id()
-                ))
-                .to_string_lossy()
-                .to_string();
-            encs.iter()[t as usize].encoder.save(&p).unwrap();
-            (t, p)
-        })
-        .collect();
-    let (feat, b) = dict_feat();
-    // Both count tracks: fine.
-    CellEncoders::load(&feat, &b, H, &spec, &paths, &dev).unwrap();
-    // One path for a two-count-track axis would silently place by track 0 alone.
-    let err = CellEncoders::load(&feat, &b, H, &spec, &paths[..1], &dev)
-        .map(|_| ())
-        .unwrap_err();
-    assert!(
-        format!("{err}").contains("count track"),
-        "unhelpful message: {err}"
-    );
-    // A list that skips track 0 would report another track's intercept as its own.
-    let err = CellEncoders::load(&feat, &b, H, &spec, &paths[1..], &dev)
-        .map(|_| ())
-        .unwrap_err();
-    assert!(
-        format!("{err}").contains("count track"),
-        "unhelpful message: {err}"
-    );
-    // A duplicate is not a cover either.
-    let dup = vec![paths[0].clone(), paths[0].clone()];
-    let err = CellEncoders::load(&feat, &b, H, &spec, &dup, &dev)
-        .map(|_| ())
-        .unwrap_err();
-    assert!(
-        format!("{err}").contains("count track"),
-        "unhelpful message: {err}"
-    );
-    for (_, p) in &paths {
-        std::fs::remove_file(p).ok();
     }
 }
 
@@ -964,7 +422,7 @@ fn refine_step_answers_to_the_block_budget() {
 #[test]
 fn phase_2_on_a_collapsed_axis_is_exact_on_the_full_axis() {
     let dev = Device::Cpu;
-    let mut fx = one_track_fixture();
+    let mut fx = phase2_fixture();
     // Rows 6..9 and 9..12 are module-only: each module's rows share one row.
     let module_only: Vec<bool> = (0..D).map(|g| g >= 6).collect();
     let labels: Vec<u32> = (0..D as u32)
@@ -1007,15 +465,7 @@ fn phase_2_on_a_collapsed_axis_is_exact_on_the_full_axis() {
         levels: &levels,
         seed: 20_260_922,
     };
-    let (out, encs) = project_cells(
-        &input,
-        &cells,
-        None,
-        &spec,
-        &TrackSpec::base(D),
-        Some(&collapse),
-    )
-    .unwrap();
+    let (out, enc) = project_cells(&input, &cells, None, &spec, Some(&collapse)).unwrap();
     assert_eq!(out.theta.len(), FIX_CELLS * H);
     let tm = &out.gauge.theta_mean;
     let theta = |i: usize| -> Vec<f32> { (0..H).map(|k| out.theta[i * H + k] + tm[k]).collect() };
@@ -1039,7 +489,6 @@ fn phase_2_on_a_collapsed_axis_is_exact_on_the_full_axis() {
         );
     }
 
-    let enc = encs.single().expect("one count track, one encoder");
     let path = std::env::temp_dir().join(format!(
         "cell_enc_phase2_collapsed_{}.safetensors",
         std::process::id()

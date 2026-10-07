@@ -264,3 +264,61 @@ fn groups_sum_their_members_counts() {
     assert_eq!(out[0].displaced, vec![(1, 3.0), (3, 1.0)]);
     assert!(out[1].is_empty());
 }
+
+/// Five feature rows on backend rows `3, 5, 7, 9, 11`: three genes' base rows
+/// and two displaced rows, interleaved.
+fn split_fixture() -> UnifiedData {
+    let names: Vec<Box<str>> = ["GENE1", "GENE2", "GENE1_d", "GENE3", "GENE2_d"]
+        .iter()
+        .map(|&n| n.into())
+        .collect();
+    let counts = DMatrix::<f32>::from_fn(5, 2, |r, c| (r + c + 1) as f32);
+    UnifiedData::from_pseudobulks(&counts, names, vec![3, 5, 7, 9, 11]).unwrap()
+}
+
+#[test]
+fn split_displaced_maps_to_backend_rows_and_cuts_to_the_base_rows() {
+    let mut unified = split_fixture();
+    let axis = split_displaced(
+        &mut unified,
+        &[0, 1, 3],
+        &[Some(2), Some(4), None],
+        "count/displaced",
+    )
+    .unwrap();
+    assert_eq!(axis.base_backend_row, vec![3, 5, 9]);
+    assert_eq!(axis.displaced_backend_row, vec![7, 11, u32::MAX]);
+    assert_eq!(axis.support(), vec![0, 1], "GENE3 has no displaced row");
+    assert_eq!(&*axis.track_name, "count/displaced");
+    let names: Vec<&str> = unified.feature_names.iter().map(|n| &**n).collect();
+    assert_eq!(names, ["GENE1", "GENE2", "GENE3"]);
+    assert_eq!(unified.feature_to_backend_row, vec![3, 5, 9]);
+    assert_eq!(unified.n_features(), 3);
+}
+
+#[test]
+fn split_displaced_refuses_rows_it_cannot_place() {
+    let refuses = |base: &[usize], displaced: &[Option<usize>]| -> bool {
+        split_displaced(&mut split_fixture(), base, displaced, "count/displaced").is_err()
+    };
+    assert!(refuses(&[0, 1], &[Some(2)]), "lengths differ");
+    assert!(refuses(&[1, 0], &[None, None]), "base rows not ascending");
+    assert!(refuses(&[0, 0], &[None, None]), "a base row twice");
+    assert!(refuses(&[0, 5], &[None, None]), "base row out of range");
+    assert!(
+        refuses(&[0, 1], &[Some(5), None]),
+        "displaced row out of range"
+    );
+    assert!(
+        refuses(&[0, 1], &[Some(1), None]),
+        "displaced row is a base row"
+    );
+    assert!(
+        refuses(&[0, 1], &[Some(2), Some(2)]),
+        "two genes share a displaced row"
+    );
+    assert!(
+        !refuses(&[0, 1, 3], &[None, None, None]),
+        "no displaced row at all"
+    );
+}

@@ -3,8 +3,8 @@
 //! dictionary at the end.
 
 use super::cis_gates::CisMix;
-use super::params::{GroupIntercepts, HierParams, PresetGenes, PresetMode, PresetOffsets};
-use super::partition::{Partition, TrackSupport, UnitModules};
+use super::params::{GroupIntercepts, HierParams, PresetGenes};
+use super::partition::{Partition, UnitModules};
 use super::step::{
     apply, cis_align_loss, cis_dictionary_blend, cis_mix, cis_pool, cis_readout, step_loss,
     Optimizers, StepCtx, StepPlan, StepStats,
@@ -35,17 +35,6 @@ pub struct HierConfig {
     /// Decay on the unit rows `e_u` (pseudobulks and phase-1 cells).
     pub unit_weight_decay: f32,
     pub seed: u64,
-    /// Ridge on the non-base tracks' offset tables (see [`super::step`]), as a
-    /// PER-EPOCH weight: one step carries `1 / steps_per_epoch` of it (see
-    /// [`per_step_offset_l2`]), so over an epoch the penalty is exactly
-    /// `offset_l2 · (mean_m ‖Δ‖² + mean_g ‖δ‖²)` whatever `units_per_step` is.
-    /// Inert on a one-track axis, which has no offsets.
-    pub offset_l2: f32,
-    /// Rank of every non-base track's gene offset `u · V` (see
-    /// [`super::params::TrackOffset`]): its own number, never derived from
-    /// `h`; `1..=h` on a tracked axis, `h` being an unrestricted offset.
-    /// Inert on a one-track axis.
-    pub offset_rank: usize,
     /// Where the tables live and the steps run.
     pub device: Device,
     /// Per gene, `true` for a **module-only** feature: no residual, its row is
@@ -68,8 +57,8 @@ pub struct HierConfig {
 
 pub struct HierOutput {
     pub e_u: DMatrix<f32>,
-    /// `[n_features × H]`, one row per FEATURE ROW: the composed dictionary of
-    /// that row's `(track, gene)`.
+    /// `[n_features × H]`, one row per feature row (gene): the composed
+    /// dictionary.
     pub rho: DMatrix<f32>,
     /// `[n_features]`, likewise per feature row.
     pub b_feat: Vec<f32>,
@@ -86,7 +75,7 @@ pub struct HierOutput {
     pub group_intercepts: Option<DMatrix<f32>>,
 }
 
-/// A `(unit, track)`'s module draw: `q` restricted to the modules with a gene
+/// A unit's module draw: `q` restricted to the modules with a gene
 /// level, and the unit's share of counts on them.
 pub(crate) struct ModulePicker {
     pick: WeightedIndex<f64>,
@@ -96,12 +85,12 @@ pub(crate) struct ModulePicker {
     share: f32,
 }
 
-/// One module picker per `(unit, TRACK)`, indexed `u * T + t` — the layout
-/// [`UnitModules::idx`] already uses, so chunking `q` by `n_m` walks the pairs
-/// in that order. Built once: a unit's composition never changes during
-/// training. Modules flagged in `skip` (module-only: no gene level) are never
-/// drawn — a draw there would be dropped by the step. `None` for a (unit,
-/// track) with no counts off the skipped modules. `skip` may be empty.
+/// One module picker per unit, in unit order — the layout [`UnitModules::idx`]
+/// already uses, so chunking `q` by `n_m` walks the units. Built once: a unit's
+/// composition never changes during training. Modules flagged in `skip`
+/// (module-only: no gene level) are never drawn — a draw there would be
+/// dropped by the step. `None` for a unit with no counts off the skipped
+/// modules. `skip` may be empty.
 pub(crate) fn module_pickers(
     um: &UnitModules,
     n_m: usize,
@@ -125,15 +114,15 @@ pub(crate) fn module_pickers(
         .collect()
 }
 
-/// The ridge weight ONE step carries. [`HierConfig::offset_l2`] is a per-epoch
-/// weight and the ridge is exact on the full offset tables at every step, so a
-/// step takes `1 / steps_per_epoch` of it: an epoch's steps then sum to exactly
-/// the per-epoch figure, and `offset_l2` means the same thing at every batch
-/// size. Without the division, halving `units_per_step` would double the
-/// effective penalty and inflate every offset row's Adagrad accumulator twice
-/// as fast.
-pub(crate) fn per_step_offset_l2(offset_l2: f32, steps_per_epoch: usize) -> f32 {
-    offset_l2 / steps_per_epoch.max(1) as f32
+/// The ridge weight ONE step carries. A ridge weight (the LoRA residuals',
+/// [`super::params::HierLora::ridge`]) is per epoch and the ridge is exact on
+/// the full tables at every step, so a step takes `1 / steps_per_epoch` of it:
+/// an epoch's steps then sum to exactly the per-epoch figure, and the weight
+/// means the same thing at every batch size. Without the division, halving
+/// `units_per_step` would double the effective penalty and inflate every
+/// residual row's Adagrad accumulator twice as fast.
+pub(crate) fn per_step_ridge(ridge: f32, steps_per_epoch: usize) -> f32 {
+    ridge / steps_per_epoch.max(1) as f32
 }
 
 /// Draw `k` modules for each unit in `chunk` ∝ its composition `q_u·` over the
@@ -149,31 +138,26 @@ pub(crate) fn draw_plan(
     chunk: &[u32],
     pickers: &[Option<ModulePicker>],
     n_m: usize,
-    n_t: usize,
     k: usize,
     rng: &mut StdRng,
 ) -> StepPlan {
-    // Track OUTER, then the chunk's units: at `n_t == 1` that is the plain
-    // per-unit loop, so the RNG is consumed draw for draw as it was before
-    // tracks existed. Buckets are indexed `t * M + m`, so the kept groups come
-    // out ordered by `(track, module)` — module order at one track.
-    let mut by_module: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n_t * n_m];
+    // Buckets are indexed by module, so the kept groups come out in module
+    // order.
+    let mut by_module: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n_m];
     let inv_k = 1.0 / k.max(1) as f32;
     let mut counts: Vec<u32> = vec![0; n_m];
-    for t in 0..n_t {
-        for &u in chunk {
-            let Some(picker) = pickers[u as usize * n_t + t].as_ref() else {
-                continue;
-            };
-            counts.iter_mut().for_each(|c| *c = 0);
-            for _ in 0..k {
-                counts[picker.pick.sample(rng)] += 1;
-            }
-            let per_draw = picker.share * inv_k;
-            for (m, &c) in counts.iter().enumerate() {
-                if c > 0 {
-                    by_module[t * n_m + m].push((u, c as f32 * per_draw));
-                }
+    for &u in chunk {
+        let Some(picker) = pickers[u as usize].as_ref() else {
+            continue;
+        };
+        counts.iter_mut().for_each(|c| *c = 0);
+        for _ in 0..k {
+            counts[picker.pick.sample(rng)] += 1;
+        }
+        let per_draw = picker.share * inv_k;
+        for (m, &c) in counts.iter().enumerate() {
+            if c > 0 {
+                by_module[m].push((u, c as f32 * per_draw));
             }
         }
     }
@@ -183,7 +167,7 @@ pub(crate) fn draw_plan(
             .into_iter()
             .enumerate()
             .filter(|(_, us)| !us.is_empty())
-            .map(|(k, us)| (((k / n_m) as u32, (k % n_m) as u32), us))
+            .map(|(m, us)| (m as u32, us))
             .collect(),
     }
 }
@@ -289,27 +273,18 @@ pub fn train(
     h: usize,
     cfg: &HierConfig,
     preset: Option<&PresetGenes>,
-    preset_offsets: &[PresetOffsets],
     stop: &AtomicBool,
 ) -> anyhow::Result<HierOutput> {
     anyhow::ensure!(
-        labels.len() == units.tracks.n_genes(),
+        labels.len() == units.n_features,
         "one module label per gene"
     );
-    if units.n_tracks() > 1 {
-        crate::fit::config::validate_offset_rank(cfg.offset_rank, h)?;
-    }
     let part = Partition::from_labels(labels, cfg.n_modules);
     let um = UnitModules::new(units, &part);
-    // Each track's support through the partition: built once here, never per
-    // step. Inert on a one-track axis, where the base track covers every gene.
-    let sup = TrackSupport::new(&units.tracks, &part);
-    let (n_u, n_m, d) = (units.n_units(), part.n_modules(), units.tracks.n_genes());
+    let (n_u, n_m, d) = (units.n_units(), part.n_modules(), units.n_features);
     let module_only = ModuleOnly::new(units, labels, cfg)?;
-    let n_t = units.n_tracks();
     let n_features = units.n_features;
-    let mut params =
-        HierParams::new_tracked(n_u, n_m, d, n_t, h, cfg.offset_rank, cfg.seed, &cfg.device)?;
+    let mut params = HierParams::new(n_u, n_m, d, h, cfg.seed, &cfg.device)?;
     if let Some(f) = preset {
         let mut is_module_only = vec![false; part.module_of.len()];
         for &g in module_only.iter().flat_map(|mo| &mo.genes) {
@@ -337,29 +312,6 @@ pub fn train(
             ))
         );
     }
-    if !preset_offsets.is_empty() {
-        let mode = preset.map_or(PresetMode::Init, |f| f.mode);
-        params.preset_offsets(preset_offsets, mode)?;
-        info!(
-            "Phase 1 (hier) — track offsets given for {} gene rows on {} track(s), {}",
-            preset_offsets.iter().map(|p| p.ids.len()).sum::<usize>(),
-            preset_offsets.len(),
-            if matches!(mode, PresetMode::Freeze) {
-                "pinned verbatim"
-            } else {
-                "as the start of the offset"
-            }
-        );
-    }
-    if n_t > 1 {
-        info!(
-            "Phase 1 (hier) — {} non-base track(s), each gene offset a rank-{} residual on \
-             the base row (V at {}× the rate)",
-            n_t - 1,
-            cfg.offset_rank,
-            params.offset_lr_ratio
-        );
-    }
     if let Some(mo) = &module_only {
         mo.pin(&params)?;
         info!(
@@ -372,10 +324,6 @@ pub fn train(
     }
     if let Some(coupling) = &cfg.cis_gates {
         coupling.validate(n_features)?;
-        anyhow::ensure!(
-            n_t == 1,
-            "cis gates need a one-track (multiome) feature axis"
-        );
         let mut resolved = coupling.pairs.with_peak_modules(&part.module_of);
         if let Some(mo) = &module_only {
             let mut is_mo = vec![false; n_features];
@@ -424,7 +372,7 @@ pub fn train(
         params.group = GroupIntercepts::new(n_u, &cfg.module_group, &cfg.device)?;
         if let Some(gi) = &params.group {
             anyhow::ensure!(
-                preset.is_none() && preset_offsets.is_empty(),
+                preset.is_none(),
                 "per-unit group intercepts centre μ within each group, which a \
                  preset's given rows would not survive"
             );
@@ -441,7 +389,6 @@ pub fn train(
         units,
         um: &um,
         part: &part,
-        sup: &sup,
         skip_module: &skip,
     };
     let mut rng = StdRng::seed_from_u64(mix_seed(cfg.seed, 0x4849_4552));
@@ -449,14 +396,12 @@ pub fn train(
     let mut order: Vec<u32> = (0..n_u as u32).collect();
     let steps_per_epoch = n_u.div_ceil(cfg.units_per_step.max(1));
     let n_threads = step_threads(&cfg.device);
-    let offset_l2_step = per_step_offset_l2(cfg.offset_l2, steps_per_epoch);
     let lora_ridge_step = params
         .lora
         .as_ref()
-        .map_or(0.0, |l| per_step_offset_l2(l.ridge, steps_per_epoch));
+        .map_or(0.0, |l| per_step_ridge(l.ridge, steps_per_epoch));
     info!(
-        "Phase 1 (hier) — {n_u} units × {d} genes on {n_t} track(s) ({n_features} feature rows) \
-         in {n_m} modules, H={h}: {} epochs × {steps_per_epoch} steps of {} units, K={} \
+        "Phase 1 (hier) — {n_u} units × {d} genes in {n_m} modules, H={h}: {} epochs × {steps_per_epoch} steps of {} units, K={} \
          modules/unit, lr {}, device {}, {n_threads} host slice(s) per step{}",
         cfg.epochs,
         cfg.units_per_step,
@@ -497,12 +442,11 @@ pub fn train(
             };
             let cis_leaves = cis_graph.as_ref().map(CisMix::detached).transpose()?;
             let loss_of = |slice: &[u32], rng: &mut StdRng| {
-                let plan = draw_plan(slice, &pickers, n_m, n_t, cfg.modules_per_unit, rng);
+                let plan = draw_plan(slice, &pickers, n_m, cfg.modules_per_unit, rng);
                 step_loss(
                     &params,
                     &ctx,
                     &plan,
-                    offset_l2_step,
                     lora_ridge_step,
                     cis_leaves.as_ref().map(|l| &l.mix),
                 )
@@ -558,14 +502,10 @@ pub fn train(
     }
     bar.finish_and_clear();
 
-    // The composed dictionary, one row per FEATURE ROW (see `HierParams::compose`),
+    // The composed dictionary, one row per feature row (see `HierParams::compose`),
     // under a cis mixture with each cis gene's row as the gene level scored it,
     // so phase 2 projects against the fitted scores.
-    let (mut rho, mut b_feat) = params.compose(
-        &units.tracks.track_of_row,
-        &units.tracks.gene_of_row,
-        &part.module_of,
-    )?;
+    let (mut rho, mut b_feat) = params.compose(&part.module_of)?;
     if let Some(blend) = cis_dictionary_blend(&params)? {
         blend.apply(&mut rho, &mut b_feat);
     }
@@ -610,7 +550,7 @@ const TOTAL_FLOOR: f32 = 1e-6;
 
 impl ModuleOnly {
     /// `None` when [`HierConfig::module_only`] flags nothing. Refuses a module
-    /// that holds both kinds of feature, and a multi-track axis.
+    /// that holds both kinds of feature.
     fn new(units: &UnitTable, labels: &[u32], cfg: &HierConfig) -> anyhow::Result<Option<Self>> {
         let mo = &cfg.module_only;
         if !mo.iter().any(|&b| b) {
@@ -621,10 +561,6 @@ impl ModuleOnly {
             "module-only flags for {} features, labels for {}",
             mo.len(),
             labels.len()
-        );
-        anyhow::ensure!(
-            units.n_tracks() == 1,
-            "module-only features need a one-track feature axis"
         );
         let mut kind: Vec<Option<bool>> = vec![None; cfg.n_modules];
         for (g, (&m, &is_mo)) in labels.iter().zip(mo).enumerate() {

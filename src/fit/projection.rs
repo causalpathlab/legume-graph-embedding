@@ -14,7 +14,7 @@ mod encoder;
 
 pub(crate) use cells::project_cells_phase2;
 pub use collapse::RowCollapse;
-pub use encoder::{CellEncoder, CellEncoders, TrackEncoder};
+pub use encoder::CellEncoder;
 pub(crate) use encoder::{DistillLevel, DistillSpec};
 
 /// Ridge prior strength λ on `e_cell` in the phase-2 projection.

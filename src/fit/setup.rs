@@ -6,7 +6,7 @@
 //! cells into the collapse, and the collapse exists only to produce these blobs. None
 //! of it touches a model, a Var or an optimizer.
 
-use super::config::{FitConfig, TrackSpec};
+use super::config::FitConfig;
 use crate::data::UnifiedData;
 use data_beans::alg::collapse_data::{
     collapse_columns_multilevel_with_hierarchy, MultilevelParams,
@@ -35,9 +35,6 @@ pub(super) struct Pseudobulks {
 
 /// Project, collapse, and materialize the per-level pseudobulk views.
 ///
-/// `tracks` is the fit's already-validated feature-axis structure (`fit` builds and
-/// checks it before calling): the projection sketches on its base track's rows.
-///
 /// `sort_dim` controls how many bits of the binary-sketched projection are used to hash
 /// cells into the *finest* pb-sample partition, so `2^sort_dim` bounds the number of
 /// distinct codes at that level. It is exposed directly on [`FitConfig`] for parity with
@@ -45,13 +42,12 @@ pub(super) struct Pseudobulks {
 pub(super) fn build_pseudobulks(
     unified: &mut UnifiedData,
     config: &FitConfig,
-    tracks: &TrackSpec,
 ) -> anyhow::Result<Pseudobulks> {
     let n_features = unified.n_features();
     let feature_to_backend = unified.feature_to_backend_row.clone();
     let batch_labels: Vec<Box<str>> = unified.batch_labels();
 
-    let proj_out = project(unified, config, &batch_labels, tracks)?;
+    let proj_out = project(unified, config, &batch_labels)?;
 
     info!(
         "Multilevel collapse (sort_dim={}, {} levels requested)...",
@@ -118,18 +114,10 @@ pub(super) fn build_pseudobulks(
 
 /// The batch-corrected random projection the collapse hashes on, HVG-weighted when the
 /// caller supplied weights.
-///
-/// On a multi-track feature axis the sketch runs on the BASE track's rows alone: the
-/// other tracks are offsets from the base model, not independent measurements, and a
-/// sketch that stacked them would hash cells partly on the offsets' own scale. The
-/// collapse itself still runs on the FULL backend with this sketch, so refinement,
-/// `mu_adjusted` and `δ` cover every row. One track ⇒ no mask, no clone, the previous
-/// call.
 fn project(
     unified: &UnifiedData,
     config: &FitConfig,
     batch_labels: &[Box<str>],
-    tracks: &TrackSpec,
 ) -> anyhow::Result<data_beans::alg::random_projection::RandColProjOut> {
     info!(
         "Batch-corrected projection (proj_dim={}, {} batches)...",
@@ -166,67 +154,14 @@ fn project(
         }
     };
 
-    let keep = base_track_row_mask(tracks, &unified.feature_to_backend_row, backend.num_rows());
-    let Some(keep) = keep else {
-        return project_backend(
-            backend,
-            config.proj_dim,
-            config.block_size,
-            batch_arg,
-            backend_w.as_deref(),
-            config.seed,
-        );
-    };
-    info!(
-        "Multi-track feature axis: sketching on the base track's {} of {} backend rows",
-        keep.iter().filter(|&&k| k).count(),
-        keep.len()
-    );
-    let mut view = backend.clone_for_collapse();
-    view.mask_rows(&keep)?;
-    // `mask_rows` RENUMBERS the kept rows compactly, so the weight vector has to be
-    // subset the same way — a full-axis vector would misalign every row.
-    let view_w = backend_w.map(|w| subset_kept(&w, &keep));
     project_backend(
-        &view,
+        backend,
         config.proj_dim,
         config.block_size,
         batch_arg,
-        view_w.as_deref(),
+        backend_w.as_deref(),
         config.seed,
     )
-}
-
-/// Which backend rows the sketch reads: the base track's, or `None` when the feature
-/// axis is a single track and there is nothing to mask.
-fn base_track_row_mask(
-    tracks: &TrackSpec,
-    feature_to_backend: &[usize],
-    backend_rows: usize,
-) -> Option<Vec<bool>> {
-    if tracks.n_tracks() <= 1 {
-        return None;
-    }
-    let mut keep = vec![false; backend_rows];
-    for (feature, &t) in tracks.track_of_row.iter().enumerate() {
-        if t == 0 {
-            if let Some(&brow) = feature_to_backend.get(feature) {
-                keep[brow] = true;
-            }
-        }
-    }
-    Some(keep)
-}
-
-/// `values` restricted to the `keep`ed positions, in the same order — the order
-/// [`SparseIoVec::mask_rows`] renumbers them into.
-fn subset_kept(values: &[f32], keep: &[bool]) -> Vec<f32> {
-    values
-        .iter()
-        .zip(keep)
-        .filter(|&(_, &k)| k)
-        .map(|(&v, _)| v)
-        .collect()
 }
 
 /// One random projection over `backend`, weighted when `row_weights` is given (length =
@@ -270,7 +205,3 @@ pub(super) fn gather_to_unified_axis(
     }
     out
 }
-
-#[cfg(test)]
-#[path = "setup_tests.rs"]
-mod setup_tests;

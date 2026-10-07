@@ -37,7 +37,6 @@
 //!    pseudobulk's.
 
 use crate::data::UnifiedData;
-use crate::fit::config::TrackSpec;
 use crate::progress::new_progress_bar;
 use anyhow::Context;
 use legume_numeric::candle::candle_core::{DType, Device, Tensor, Var};
@@ -134,61 +133,69 @@ impl DisplacedTrackConfig {
     }
 }
 
-/// Cut `unified` down to the base track's rows and say where track
-/// `displaced`'s counts are. Call before building the fit's other per-feature
-/// inputs (they then index the base axis), and fit with no track spec.
+/// Cut `unified` down to the base track's rows and say where the displaced
+/// track's counts are. Call before building the fit's other per-feature inputs
+/// (they then index the base axis).
 ///
-/// Requires two tracks, the base and `displaced`, both count tracks. A gene
-/// with no base row is left out. The live axis is the base rows in ascending
-/// row order; its names are the base rows' names.
+/// Gene `i` is `base_rows[i]` on the current feature axis, and
+/// `displaced_rows[i]` its displaced-track row, `None` for a gene the displaced
+/// track has no row for. `base_rows` must be strictly ascending: the live axis
+/// is the base rows in that order, and [`UnifiedData::subset_features`] takes a
+/// selection as wide as the axis to be the axis itself. No displaced row may be
+/// a base row or another gene's displaced row. The rows are mapped to backend
+/// rows before the cut; the live axis's names are the base rows' names.
 pub fn split_displaced(
     unified: &mut UnifiedData,
-    tracks: &TrackSpec,
-    displaced: usize,
+    base_rows: &[usize],
+    displaced_rows: &[Option<usize>],
+    track_name: &str,
 ) -> anyhow::Result<DisplacedAxis> {
-    tracks.validate(unified.n_features())?;
+    let n_features = unified.n_features();
     anyhow::ensure!(
-        tracks.n_tracks() == 2 && displaced == 1,
-        "a displaced track needs exactly the base track and one other (got {} tracks, displaced {displaced})",
-        tracks.n_tracks()
+        base_rows.len() == displaced_rows.len(),
+        "{} base rows but {} displaced-row entries: one of each per gene",
+        base_rows.len(),
+        displaced_rows.len()
     );
     anyhow::ensure!(
-        tracks.tracks[displaced].is_count,
-        "the displaced track `{}` is not a count track",
-        tracks.tracks[displaced].name
+        base_rows.windows(2).all(|w| w[0] < w[1]),
+        "the base rows must be strictly ascending"
     );
-    let n_genes = tracks.n_genes();
-    let base_rows = tracks.rows_of_track(0);
-    // A gene with no base row has no place in the base space; its displaced
-    // row is left out.
-    if base_rows.len() < n_genes {
-        log::info!(
-            "{} of {n_genes} genes have no `{}` row and are left out of the displaced track",
-            n_genes - base_rows.len(),
-            tracks.tracks[0].name
+    if let Some(&last) = base_rows.last() {
+        anyhow::ensure!(
+            last < n_features,
+            "base row {last} is past the {n_features}-row feature axis"
         );
     }
-    let backend = &unified.feature_to_backend_row;
-    // gene → backend row of its displaced row.
-    let mut displaced_of_gene = vec![u32::MAX; n_genes];
-    for row in tracks.rows_of_track(displaced) {
-        let g = tracks.gene_of_row[row as usize] as usize;
-        displaced_of_gene[g] = backend[row as usize] as u32;
+    // Every row is used at most once: a base row by its gene, a displaced row
+    // by one gene and never as a base row.
+    let mut used = vec![false; n_features];
+    for &row in base_rows {
+        used[row] = true;
     }
-    let base_backend_row: Vec<u32> = base_rows
+    for (g, row) in displaced_rows.iter().enumerate() {
+        let Some(row) = *row else { continue };
+        anyhow::ensure!(
+            row < n_features,
+            "gene {g}'s displaced row {row} is past the {n_features}-row feature axis"
+        );
+        anyhow::ensure!(
+            !used[row],
+            "gene {g}'s displaced row {row} is already a base row or another gene's displaced row"
+        );
+        used[row] = true;
+    }
+    let backend = &unified.feature_to_backend_row;
+    let base_backend_row: Vec<u32> = base_rows.iter().map(|&row| backend[row] as u32).collect();
+    let displaced_backend_row: Vec<u32> = displaced_rows
         .iter()
-        .map(|&row| backend[row as usize] as u32)
+        .map(|row| row.map_or(u32::MAX, |r| backend[r] as u32))
         .collect();
-    let displaced_backend_row: Vec<u32> = base_rows
-        .iter()
-        .map(|&row| displaced_of_gene[tracks.gene_of_row[row as usize] as usize])
-        .collect();
-    let keep: Vec<usize> = base_rows.iter().map(|&r| r as usize).collect();
-    unified.subset_features(&keep);
+    unified.subset_features(base_rows);
     Ok(DisplacedAxis {
         base_backend_row,
         displaced_backend_row,
-        track_name: tracks.tracks[displaced].name.clone(),
+        track_name: track_name.into(),
     })
 }
 

@@ -11,8 +11,8 @@
 //! Newton solve.
 //!
 //! It solves one shared partition over the whole axis. A fit with an encoder
-//! does not come here for its cells: the encoder places them and each track's
-//! intercept is exact at that placement ([`super::encoder`]).
+//! does not come here for its cells: the encoder places them and the intercept
+//! is exact at that placement ([`super::encoder`]).
 //!
 //! # The objective
 //!
@@ -99,7 +99,6 @@
 //! the same dictionary.
 
 use super::CellBatchFold;
-use crate::cell_projection::SCORE_CLAMP;
 use crate::progress::new_progress_bar;
 use legume_numeric::candle::candle_core::Device;
 use log::info;
@@ -144,18 +143,11 @@ const TARGET_DELTA_S: f64 = 0.05;
 /// a block's steps so it settles instead of dithering around the optimum.
 const LR_FLOOR_FRAC: f64 = 0.05;
 
-/// Adam's moment decays and its denominator floor, shared by every block loop in
-/// this module ([`solve`] and [`tracks`]).
+/// Adam's moment decays and its denominator floor, for the block loop in
+/// [`solve`].
 ///
-/// They live here rather than as literals inside each loop for one reason: the
-/// one-track and per-track solves must not drift apart, and no test can catch
-/// that drift — a one-track axis never enters [`tracks`], so a changed `β₂` in
-/// one loop and not the other would pass the whole suite. The loop *bodies* stay
-/// separate on purpose (sharing them would put a branch on the one-track path);
-/// the numbers they are parameterised by do not.
-///
-/// AdamW with `weight_decay = 0` at both call sites — the ridge is already in the
-/// closed-form gradient, and a decoupled decay would double-count it.
+/// AdamW with `weight_decay = 0` — the ridge is already in the closed-form
+/// gradient, and a decoupled decay would double-count it.
 const BETA1: f64 = 0.9;
 const BETA2: f64 = 0.999;
 const EPS: f64 = 1e-8;
@@ -265,13 +257,8 @@ pub(crate) struct Phase2Out {
     /// origin — which, after centring, *is* the population mean, i.e. the right
     /// "no information" position rather than an arbitrary corner of the space.
     pub theta: Vec<f32>,
-    /// Fitted per-cell intercept, `[n_cells]` — the base track's on a multi-track
-    /// feature axis.
+    /// Fitted per-cell intercept, `[n_cells]`.
     pub b_cell: Vec<f32>,
-    /// Tracks `1..T`, one fitted `[n_cells]` intercept each; **empty** on a
-    /// one-track axis. A cell with no counts on the track sits at the score-clamp
-    /// floor, which is what the solver reports for a track it skipped.
-    pub other_intercepts: Vec<Vec<f32>>,
     /// The mean that was removed. The caller **must** fold this into `b_feat`
     /// or the model is changed rather than re-gauged.
     pub gauge: GaugeShift,
@@ -440,25 +427,9 @@ pub(crate) fn finish(
         b_cell[cell as usize] = pass.intercept[i];
     }
 
-    // The non-base tracks' intercepts, on the same axis. A cell the pass never
-    // saw has no counts on any track, which is exactly the case the solver
-    // reports at the score-clamp floor — so that, not zero, is the fill.
-    let other_intercepts: Vec<Vec<f32>> = pass
-        .other_intercepts
-        .iter()
-        .map(|track| {
-            let mut global = vec![-SCORE_CLAMP as f32; input.n_cells];
-            for (i, &(cell, _, _)) in cells.iter().enumerate() {
-                global[cell as usize] = track[i];
-            }
-            global
-        })
-        .collect();
-
     Phase2Out {
         theta,
         b_cell,
-        other_intercepts,
         gauge: GaugeShift { theta_mean },
     }
 }

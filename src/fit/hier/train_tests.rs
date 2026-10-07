@@ -1,9 +1,8 @@
 use super::*;
 use crate::data::Triplet;
-use crate::fit::config::{TrackInfo, TrackSpec};
 use crate::fit::hier::units::UnitTable;
 use crate::fit::projection::RowCollapse;
-use crate::{LoraSpec, PresetMode, PresetOffsets};
+use crate::{LoraSpec, PresetMode};
 use std::sync::atomic::AtomicBool;
 
 fn t(cell: u32, feature: u32, count: f32) -> Triplet {
@@ -25,8 +24,6 @@ fn cfg() -> HierConfig {
         weight_decay: 0.0,
         unit_weight_decay: 0.0,
         seed: 3,
-        offset_l2: 0.0,
-        offset_rank: 2,
         device: Device::Cpu,
         module_only: Vec::new(),
         cis_gates: None,
@@ -42,17 +39,8 @@ fn run(
     h: usize,
     cfg: &HierConfig,
     preset: Option<&PresetGenes>,
-    offsets: &[PresetOffsets],
 ) -> anyhow::Result<HierOutput> {
-    train(
-        units,
-        labels,
-        h,
-        cfg,
-        preset,
-        offsets,
-        &AtomicBool::new(false),
-    )
+    train(units, labels, h, cfg, preset, &AtomicBool::new(false))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -136,56 +124,12 @@ fn planted_units() -> (UnitTable, Vec<u32>) {
     (units, labels)
 }
 
-/// The planted programs on two tracks of the same 20 genes, with the programs
-/// SWAPPED on track 1, so every gene's track-1 row sits a planted shift away
-/// from its track-0 row. Returns the units, the module labels and `n_g`.
-fn planted_two_track_units() -> (UnitTable, Vec<u32>, u32) {
-    let (n_g, n_u) = (20u32, 20u32);
-    let mut trip = Vec::new();
-    for u in 0..n_u {
-        let own = if u < 10 { 0..10u32 } else { 10..20u32 };
-        let other = if u < 10 { 10..20u32 } else { 0..10u32 };
-        for g in own.clone() {
-            trip.push(t(u, g, 20.0 + (g % 3) as f32));
-        }
-        for g in other {
-            trip.push(t(u, g, 1.0));
-            trip.push(t(u, g + n_g, 20.0 + (g % 3) as f32));
-        }
-        for g in own {
-            trip.push(t(u, g + n_g, 1.0));
-        }
-    }
-    let n_features = 2 * n_g as usize;
-    let track = |name: &str| TrackInfo {
-        name: name.into(),
-        is_count: true,
-    };
-    let tracks = TrackSpec {
-        track_of_row: (0..n_features)
-            .map(|r| (r >= n_g as usize) as u32)
-            .collect(),
-        gene_of_row: (0..n_features).map(|r| (r % n_g as usize) as u32).collect(),
-        tracks: vec![track("t0"), track("t1")],
-    };
-    let units = UnitTable::from_pseudobulks_and_cells_tracked(
-        &[&trip],
-        &[n_u as usize],
-        &[],
-        None,
-        n_features,
-        tracks,
-    );
-    let labels: Vec<u32> = (0..n_g).map(|g| u32::from(g >= 10)).collect();
-    (units, labels, n_g)
-}
-
 /// Training separates the two unit groups and puts each gene's row on its
 /// program's side.
 #[test]
 fn planted_programs_separate_units_and_genes() {
     let (units, labels) = planted_units();
-    let out = run(&units, &labels, 4, &cfg(), None, &[]).unwrap();
+    let out = run(&units, &labels, 4, &cfg(), None).unwrap();
     assert_eq!(out.rho.nrows(), 20);
     let e = |u| row(&out.e_u, u);
     assert!(cosine(&e(0), &e(1)) > cosine(&e(0), &e(15)) + 0.3);
@@ -214,125 +158,60 @@ fn the_stop_flag_ends_training_early_with_finite_output() {
         ..cfg()
     };
     let stop = AtomicBool::new(true);
-    let out = train(&units, &[0, 0], 2, &cfg, None, &[], &stop).unwrap();
+    let out = train(&units, &[0, 0], 2, &cfg, None, &stop).unwrap();
     assert!(out.rho.iter().all(|v| v.is_finite()));
 }
 
-/// A unit with a non-zero composition on a track gets pair weights that sum to
-/// 1 across every module it lands in ON THAT TRACK; a (unit, track) with an
-/// all-zero composition is dropped from the plan entirely.
+/// A unit with a non-zero composition gets pair weights that sum to 1 across
+/// every module it lands in; a unit with an all-zero composition is dropped
+/// from the plan entirely.
 #[test]
 fn draw_plan_weights_sum_to_one_per_unit() {
-    let (n_m, n_t) = (3usize, 2usize);
-    // (unit 0, track 0): [0.5, 0.5, 0.0]; (unit 0, track 1): [0.0, 0.0, 1.0];
-    // (unit 1, track 0): all-zero (nothing counted there); (unit 1, track 1): [0.25, 0.75, 0.0]
+    let n_m = 3usize;
+    // unit 0: [0.5, 0.5, 0.0]; unit 1: all-zero (nothing counted);
+    // unit 2: [0.25, 0.0, 0.75]
     let um = UnitModules {
-        n_tracks: n_t,
         n_modules: n_m,
         q: vec![
             0.5, 0.5, 0.0, //
-            0.0, 0.0, 1.0, //
             0.0, 0.0, 0.0, //
-            0.25, 0.75, 0.0,
+            0.25, 0.0, 0.75,
         ],
-        n_um: vec![0.0; 2 * n_t * n_m],
-        by_module: vec![Vec::new(), Vec::new()],
+        n_um: vec![0.0; 3 * n_m],
+        by_module: vec![Vec::new(), Vec::new(), Vec::new()],
     };
     let mut rng = StdRng::seed_from_u64(7);
     let pickers = module_pickers(&um, n_m, &[]);
-    assert_eq!(pickers.len(), 2 * n_t);
-    let plan = draw_plan(&[0, 1], &pickers, n_m, n_t, 10, &mut rng);
-    let mut sum_by_unit_track = std::collections::HashMap::new();
-    for ((t, _), pairs) in &plan.pairs_by_module {
+    assert_eq!(pickers.len(), 3);
+    let plan = draw_plan(&[0, 1, 2], &pickers, n_m, 10, &mut rng);
+    let mut sum_by_unit = std::collections::HashMap::new();
+    for (_, pairs) in &plan.pairs_by_module {
         for &(u, w) in pairs {
-            *sum_by_unit_track.entry((u, *t)).or_insert(0.0f32) += w;
+            *sum_by_unit.entry(u).or_insert(0.0f32) += w;
         }
     }
-    for key in [(0u32, 0u32), (0, 1), (1, 1)] {
-        let got = sum_by_unit_track.get(&key).copied().unwrap_or(0.0);
-        assert!((got - 1.0).abs() < 1e-6, "{key:?} summed to {got}");
+    for u in [0u32, 2] {
+        let got = sum_by_unit.get(&u).copied().unwrap_or(0.0);
+        assert!((got - 1.0).abs() < 1e-6, "unit {u} summed to {got}");
     }
-    assert!(!sum_by_unit_track.contains_key(&(1, 0)));
-}
-
-/// The base track spec is what the untracked constructor builds, so the same
-/// fixture trained through either one must come out identical: every table,
-/// exactly, not merely close.
-#[test]
-fn single_track_output_is_identical_through_both_constructors() {
-    let trip = vec![
-        t(0, 0, 5.0),
-        t(0, 1, 2.0),
-        t(0, 3, 1.0),
-        t(1, 1, 4.0),
-        t(1, 2, 3.0),
-        t(2, 0, 1.0),
-        t(2, 3, 6.0),
-    ];
-    let cfg = HierConfig {
-        epochs: 25,
-        units_per_step: 2,
-        seed: 17,
-        ..cfg()
-    };
-    let labels = vec![0u32, 0, 1, 1];
-    let plain = UnitTable::from_pseudobulks_and_cells(&[&trip], &[3], &[], None, 4);
-    let tracked = UnitTable::from_pseudobulks_and_cells_tracked(
-        &[&trip],
-        &[3],
-        &[],
-        None,
-        4,
-        TrackSpec::base(4),
+    assert!(!sum_by_unit.contains_key(&1));
+    assert!(
+        plan.pairs_by_module.windows(2).all(|w| w[0].0 < w[1].0),
+        "pairs come out in module order"
     );
-    let a = run(&plain, &labels, 3, &cfg, None, &[]).unwrap();
-    let b = run(&tracked, &labels, 3, &cfg, None, &[]).unwrap();
-    assert_eq!(a.e_u, b.e_u);
-    assert_eq!(a.rho, b.rho);
-    assert_eq!(a.b_feat, b.b_feat);
 }
 
-/// On the swapped second track a gene's track-1 row sits on the other unit
-/// group's side: the move from its track-0 row points along the planted
-/// contrast between the two unit groups' embeddings.
-#[test]
-fn planted_two_track_programs() {
-    let (units, labels, n_g) = planted_two_track_units();
-    let cfg = HierConfig {
-        offset_l2: 0.01,
-        ..cfg()
-    };
-    let out = run(&units, &labels, 4, &cfg, None, &[]).unwrap();
-    assert_eq!(out.rho.nrows(), 2 * n_g as usize);
-    assert_eq!(out.b_feat.len(), 2 * n_g as usize);
-
-    let group_mean = |lo: usize, hi: usize| -> Vec<f32> {
-        (0..4)
-            .map(|k| (lo..hi).map(|u| out.e_u[(u, k)]).sum::<f32>() / (hi - lo) as f32)
-            .collect()
-    };
-    let (a, b) = (group_mean(0, 10), group_mean(10, 20));
-    let planted: Vec<f32> = b.iter().zip(&a).map(|(x, y)| x - y).collect();
-    for gene in [0usize, 3, 7] {
-        let shift: Vec<f32> = (0..4)
-            .map(|k| out.rho[(gene + n_g as usize, k)] - out.rho[(gene, k)])
-            .collect();
-        let c = cosine(&shift, &planted);
-        assert!(c > 0.5, "gene {gene}: track-1 shift cosine {c}");
-    }
-}
-
-/// `HierConfig::offset_l2` is a per-EPOCH weight. A step carries `1/S` of it, so
-/// the ridge pulls equally hard over an epoch whatever the batch size; without
-/// this, halving `units_per_step` would silently double the penalty and inflate
-/// every offset row's Adagrad accumulator twice as fast.
+/// A ridge weight is per EPOCH. A step carries `1/S` of it, so the ridge pulls
+/// equally hard over an epoch whatever the batch size; without this, halving
+/// `units_per_step` would silently double the penalty and inflate every
+/// residual row's Adagrad accumulator twice as fast.
 #[test]
 fn the_ridge_weight_is_spread_over_the_epochs_steps() {
-    assert_eq!(per_step_offset_l2(0.8, 1), 0.8);
-    assert_eq!(per_step_offset_l2(0.8, 4), 0.2);
+    assert_eq!(per_step_ridge(0.8, 1), 0.8);
+    assert_eq!(per_step_ridge(0.8, 4), 0.2);
     // A degenerate epoch (no unit, so no step) must not divide by zero.
-    assert_eq!(per_step_offset_l2(0.8, 0), 0.8);
-    assert_eq!(per_step_offset_l2(0.0, 7), 0.0);
+    assert_eq!(per_step_ridge(0.8, 0), 0.8);
+    assert_eq!(per_step_ridge(0.0, 7), 0.0);
 }
 
 /// Frozen genes come out of training with EXACTLY the rows they went in with;
@@ -349,7 +228,7 @@ fn frozen_gene_rows_survive_training_verbatim_while_free_rows_and_biases_move() 
         ..cfg()
     };
     let frozen = preset(&ids, &rows, PresetMode::Freeze);
-    let out = run(&units, &labels, h, &cfg, Some(&frozen), &[]).unwrap();
+    let out = run(&units, &labels, h, &cfg, Some(&frozen)).unwrap();
     assert_rows_pinned(&out, &ids, &rows, h);
     assert!(
         left_its_init(&out, &units, &cfg, h, 1),
@@ -381,7 +260,7 @@ fn a_fully_frozen_dictionary_still_trains_the_unit_side() {
         ..cfg()
     };
     let frozen = preset(&ids, &rows, PresetMode::Freeze);
-    let out = run(&units, &labels, h, &cfg, Some(&frozen), &[]).unwrap();
+    let out = run(&units, &labels, h, &cfg, Some(&frozen)).unwrap();
     assert_rows_pinned(&out, &ids, &rows, h);
     assert!(out.e_u[(0, 0)] > out.e_u[(0, 1)]);
     assert!(out.e_u[(15, 1)] > out.e_u[(15, 0)]);
@@ -392,9 +271,9 @@ fn frozen_genes_must_be_in_range_and_match_h() {
     let (units, labels) = planted_units();
     let cfg = HierConfig { epochs: 1, ..cfg() };
     let bad_gene = preset(&[20], &[0.0; 4], PresetMode::Freeze);
-    assert!(run(&units, &labels, 4, &cfg, Some(&bad_gene), &[]).is_err());
+    assert!(run(&units, &labels, 4, &cfg, Some(&bad_gene)).is_err());
     let bad_h = preset(&[0], &[0.0; 3], PresetMode::Freeze);
-    assert!(run(&units, &labels, 4, &cfg, Some(&bad_h), &[]).is_err());
+    assert!(run(&units, &labels, 4, &cfg, Some(&bad_h)).is_err());
 }
 
 /// Under `Init` the given rows are only the starting point: training starts
@@ -407,14 +286,14 @@ fn unfrozen_preset_rows_start_where_given_and_then_train() {
     let rows: Vec<f32> = (0..20 * h).map(|i| 0.01 * i as f32 - 0.4).collect();
     let init = preset(&ids, &rows, PresetMode::Init);
     let cfg0 = HierConfig { epochs: 0, ..cfg() };
-    let start = run(&units, &labels, h, &cfg0, Some(&init), &[]).unwrap();
+    let start = run(&units, &labels, h, &cfg0, Some(&init)).unwrap();
     for g in 0..20 {
         for k in 0..h {
             assert!((start.rho[(g, k)] - rows[g * h + k]).abs() < 1e-6);
         }
     }
     let cfg = HierConfig { epochs: 50, ..cfg0 };
-    let out = run(&units, &labels, h, &cfg, Some(&init), &[]).unwrap();
+    let out = run(&units, &labels, h, &cfg, Some(&init)).unwrap();
     let moved = (0..20)
         .filter(|&g| (0..h).any(|k| (out.rho[(g, k)] - rows[g * h + k]).abs() > 1e-4))
         .count();
@@ -447,7 +326,7 @@ fn lora_preset_rows_move_only_inside_a_shared_rank_r_residual() {
             }),
         )
     };
-    let out = run(&units, &labels, h, &cfg, Some(&lora(rank, 4.0)), &[]).unwrap();
+    let out = run(&units, &labels, h, &cfg, Some(&lora(rank, 4.0))).unwrap();
     let resid = DMatrix::<f32>::from_fn(ids.len(), h, |i, k| {
         out.rho[(ids[i] as usize, k)] - rows[i * h + k]
     });
@@ -465,100 +344,7 @@ fn lora_preset_rows_move_only_inside_a_shared_rank_r_residual() {
     assert!(ids.iter().any(|&g| out.b_feat[g as usize].abs() > 1e-6));
     assert!(out.final_loss_per_unit.is_finite());
 
-    assert!(run(&units, &labels, h, &cfg, Some(&lora(h, 1.0)), &[]).is_err());
-}
-
-/// The track offsets' rank is its own number, never H: outside `1..=H` on a
-/// tracked axis the trainer refuses and names both; at one track it is inert.
-#[test]
-fn the_offset_rank_is_checked_against_h_on_a_tracked_axis() {
-    let (units, labels, _) = planted_two_track_units();
-    let cfg = |offset_rank| HierConfig {
-        epochs: 1,
-        offset_l2: 0.01,
-        offset_rank,
-        ..cfg()
-    };
-    for rank in [0usize, 5] {
-        let e = match run(&units, &labels, 4, &cfg(rank), None, &[]) {
-            Ok(_) => panic!("rank {rank} outside 1..=H was accepted"),
-            Err(e) => e.to_string(),
-        };
-        assert!(e.contains("rank") && e.contains("H=4"), "{e}");
-    }
-    assert!(
-        run(&units, &labels, 4, &cfg(4), None, &[]).is_ok(),
-        "rank H is legal"
-    );
-    let (one, labels1) = planted_units();
-    assert!(
-        run(&one, &labels1, 4, &cfg(9), None, &[]).is_ok(),
-        "one track: no offset, no rank to check"
-    );
-}
-
-/// A preset on a two-track axis: the pinned base rows come out verbatim, a
-/// given offset base on track 1 comes out as `row + δ₀` verbatim under
-/// freeze, the other genes' track-1 rows still move off their base rows, and
-/// under lora the given offset is a start rather than a pin.
-#[test]
-fn a_preset_on_a_two_track_axis_pins_the_base_rows_and_a_given_offset() {
-    let (units, labels, n_g) = planted_two_track_units();
-    let h = 4;
-    let ids: Vec<u32> = (0..n_g).filter(|g| g % 2 == 0).collect();
-    let rows = given_rows(&ids, h);
-    let frozen = preset(&ids, &rows, PresetMode::Freeze);
-    let off_ids = vec![0u32, 4];
-    let off_rows = vec![0.3f32, -0.1, 0.2, 0.0, -0.2, 0.1, 0.4, -0.3];
-    let offsets = vec![PresetOffsets {
-        track: 1,
-        ids: off_ids.clone(),
-        rows: off_rows.clone(),
-    }];
-    let cfg = HierConfig {
-        epochs: 50,
-        offset_l2: 0.01,
-        ..cfg()
-    };
-    let out = run(&units, &labels, h, &cfg, Some(&frozen), &offsets).unwrap();
-    let n_g = n_g as usize;
-    assert_rows_pinned(&out, &ids, &rows, h);
-    for (i, &g) in off_ids.iter().enumerate() {
-        let j = ids.iter().position(|&x| x == g).unwrap();
-        for k in 0..h {
-            let want = rows[j * h + k] + off_rows[i * h + k];
-            let got = out.rho[(g as usize + n_g, k)];
-            assert!(
-                (got - want).abs() < 1e-6,
-                "gene {g} on track 1: {got} vs given {want}"
-            );
-        }
-    }
-    assert!(
-        (0..h).any(|k| (out.rho[(1 + n_g, k)] - out.rho[(1, k)]).abs() > 1e-4),
-        "a free gene's track-1 row moves off its base row"
-    );
-    assert!(out.final_loss_per_unit.is_finite());
-
-    let lora = PresetGenes {
-        mode: PresetMode::Lora(LoraSpec {
-            rank: 1,
-            lr_ratio: 4.0,
-            ridge: 0.0,
-        }),
-        ..frozen
-    };
-    let out = run(&units, &labels, h, &cfg, Some(&lora), &offsets).unwrap();
-    assert!(
-        off_ids.iter().enumerate().any(|(i, &g)| {
-            (0..h).any(|k| {
-                (out.rho[(g as usize + n_g, k)] - out.rho[(g as usize, k)] - off_rows[i * h + k])
-                    .abs()
-                    > 1e-4
-            })
-        }),
-        "under lora the given offset moves on from δ₀"
-    );
+    assert!(run(&units, &labels, h, &cfg, Some(&lora(h, 1.0))).is_err());
 }
 
 /// Two planted programs over a residual block (features 0..10) and a
@@ -637,7 +423,7 @@ fn a_module_only_modules_biases_are_log_shares_even_when_unobserved() {
 #[test]
 fn a_module_only_feature_is_its_module_row_plus_its_count_share() {
     let (units, labels, mo) = module_only_fixture();
-    let out = run(&units, &labels, 4, &module_only_cfg(mo), None, &[]).unwrap();
+    let out = run(&units, &labels, 4, &module_only_cfg(mo), None).unwrap();
     // Every module-only feature carries exactly its module's row.
     for f in 11..20 {
         assert_eq!(row(&out.rho, 10), row(&out.rho, f), "feature {f}");
@@ -675,7 +461,7 @@ fn a_pinning_preset_leaves_modules_without_given_members_free_to_train() {
     let rows = given_rows(&ids, h);
     let cfg = module_only_cfg(mo);
     let frozen = preset(&ids, &rows, PresetMode::Freeze);
-    let out = run(&units, &labels, h, &cfg, Some(&frozen), &[]).unwrap();
+    let out = run(&units, &labels, h, &cfg, Some(&frozen)).unwrap();
     assert_rows_pinned(&out, &ids, &rows, h);
     let init = HierParams::new(units.n_units(), 4, 30, h, cfg.seed, &Device::Cpu).unwrap();
     let mu0 = to_host(init.mu.as_tensor()).unwrap();
@@ -701,7 +487,7 @@ fn a_pinned_module_only_feature_is_written_as_its_modules_given_mean() {
     let ids: Vec<u32> = (0..30).collect();
     let rows = given_rows(&ids, h);
     let frozen = preset(&ids, &rows, PresetMode::Freeze);
-    let out = run(&units, &labels, h, &module_only_cfg(mo), Some(&frozen), &[]).unwrap();
+    let out = run(&units, &labels, h, &module_only_cfg(mo), Some(&frozen)).unwrap();
     assert_rows_pinned(&out, &ids[..10], &rows, h);
     for members in [10..20usize, 20..30] {
         let n = members.len() as f32;
@@ -722,7 +508,7 @@ fn a_pinned_module_only_feature_is_written_as_its_modules_given_mean() {
 fn a_module_mixing_module_only_and_residual_features_is_refused() {
     let (units, mut labels, mo) = module_only_fixture();
     labels[12] = 0; // a module-only feature in a residual module
-    let err = run(&units, &labels, 4, &module_only_cfg(mo), None, &[])
+    let err = run(&units, &labels, 4, &module_only_cfg(mo), None)
         .err()
         .expect("a mixed module must be refused");
     assert!(err.to_string().contains("module-only"), "{err}");
@@ -734,7 +520,7 @@ fn a_module_mixing_module_only_and_residual_features_is_refused() {
 #[test]
 fn a_threaded_step_sums_the_slices_losses_and_gradients() {
     use crate::fit::hier::params::HierParams;
-    use crate::fit::hier::partition::{Partition, TrackSupport, UnitModules};
+    use crate::fit::hier::partition::{Partition, UnitModules};
     use crate::fit::hier::step::{step_loss, StepCtx};
     use legume_numeric::candle::convert::to_host;
     use rand::Rng;
@@ -742,7 +528,6 @@ fn a_threaded_step_sums_the_slices_losses_and_gradients() {
     let (units, labels) = planted_units();
     let part = Partition::from_labels(&labels, 2);
     let um = UnitModules::new(&units, &part);
-    let sup = TrackSupport::new(&units.tracks, &part);
     let pickers = module_pickers(&um, 2, &[]);
     let params = HierParams::new(units.n_units(), 2, 20, 4, 5, &Device::Cpu).unwrap();
     let skip = Vec::new();
@@ -750,13 +535,12 @@ fn a_threaded_step_sums_the_slices_losses_and_gradients() {
         units: &units,
         um: &um,
         part: &part,
-        sup: &sup,
         skip_module: &skip,
     };
     let chunk: Vec<u32> = (0..12).collect();
     let loss_of = |slice: &[u32], rng: &mut StdRng| -> anyhow::Result<(StepStats, Tensor)> {
-        let plan = draw_plan(slice, &pickers, 2, 1, 2, rng);
-        step_loss(&params, &ctx, &plan, 0.0, 0.0, None)
+        let plan = draw_plan(slice, &pickers, 2, 2, rng);
+        step_loss(&params, &ctx, &plan, 0.0, None)
     };
     let mut rng = StdRng::seed_from_u64(11);
     let (stats, grads) = step_grads(&chunk, 3, &mut rng, &loss_of).unwrap();
@@ -789,13 +573,12 @@ fn a_threaded_step_sums_the_slices_losses_and_gradients() {
 #[test]
 fn a_step_over_fewer_units_than_threads_runs_on_one_slice() {
     use crate::fit::hier::params::HierParams;
-    use crate::fit::hier::partition::{Partition, TrackSupport, UnitModules};
+    use crate::fit::hier::partition::{Partition, UnitModules};
     use crate::fit::hier::step::{step_loss, StepCtx};
 
     let (units, labels) = planted_units();
     let part = Partition::from_labels(&labels, 2);
     let um = UnitModules::new(&units, &part);
-    let sup = TrackSupport::new(&units.tracks, &part);
     let pickers = module_pickers(&um, 2, &[]);
     let params = HierParams::new(units.n_units(), 2, 20, 4, 5, &Device::Cpu).unwrap();
     let skip = Vec::new();
@@ -803,12 +586,11 @@ fn a_step_over_fewer_units_than_threads_runs_on_one_slice() {
         units: &units,
         um: &um,
         part: &part,
-        sup: &sup,
         skip_module: &skip,
     };
     let loss_of = |slice: &[u32], rng: &mut StdRng| -> anyhow::Result<(StepStats, Tensor)> {
-        let plan = draw_plan(slice, &pickers, 2, 1, 2, rng);
-        step_loss(&params, &ctx, &plan, 0.0, 0.0, None)
+        let plan = draw_plan(slice, &pickers, 2, 2, rng);
+        step_loss(&params, &ctx, &plan, 0.0, None)
     };
     let mut rng = StdRng::seed_from_u64(3);
     let (stats, grads) = step_grads(&[0, 1], 8, &mut rng, &loss_of).unwrap();
@@ -855,7 +637,6 @@ fn fit_with_mixed_gates(align_weight: f32, mix: f32, epochs: usize) -> HierOutpu
             ..cfg()
         },
         None,
-        &[],
     )
     .unwrap()
 }
@@ -927,7 +708,6 @@ fn at_zero_weight_the_gates_leave_the_fit_alone() {
             ..cfg()
         },
         None,
-        &[],
     )
     .unwrap();
     let gated = fit_with_gates(0.0, 20);
@@ -935,11 +715,10 @@ fn at_zero_weight_the_gates_leave_the_fit_alone() {
     assert!(diff < 1e-5, "the dictionary moved by {diff}");
 }
 
-/// One unit on one track whose composition puts most of its counts on a
+/// One unit whose composition puts most of its counts on a
 /// module-only module (module 0).
 fn skewed_unit_modules() -> UnitModules {
     UnitModules {
-        n_tracks: 1,
         n_modules: 3,
         q: vec![0.6, 0.3, 0.1],
         n_um: vec![0.0; 3],
@@ -956,9 +735,9 @@ fn module_draws_skip_module_only_modules() {
     let skip = [true, false, false];
     let pickers = module_pickers(&um, 3, &skip);
     let mut rng = StdRng::seed_from_u64(5);
-    let plan = draw_plan(&[0], &pickers, 3, 1, 8, &mut rng);
+    let plan = draw_plan(&[0], &pickers, 3, 8, &mut rng);
     let mut total = 0.0f32;
-    for ((_, m), pairs) in &plan.pairs_by_module {
+    for (m, pairs) in &plan.pairs_by_module {
         assert_ne!(*m, 0, "a draw landed on the module-only module");
         total += pairs.iter().map(|p| p.1).sum::<f32>();
     }
@@ -981,8 +760,8 @@ fn residual_module_draws_are_unbiased() {
     let n = 20_000;
     let mut got = 0.0f64;
     for _ in 0..n {
-        let plan = draw_plan(&[0], &pickers, 3, 1, 4, &mut rng);
-        for ((_, m), pairs) in &plan.pairs_by_module {
+        let plan = draw_plan(&[0], &pickers, 3, 4, &mut rng);
+        for (m, pairs) in &plan.pairs_by_module {
             got += pairs
                 .iter()
                 .map(|p| f64::from(p.1) * f[*m as usize])
@@ -1080,7 +859,6 @@ fn a_group_intercept_tracks_each_units_modality_ratio() {
             ..cfg()
         },
         None,
-        &[],
     )
     .unwrap();
     let beta = out.group_intercepts.expect("group intercepts");
@@ -1106,7 +884,6 @@ fn a_group_intercept_takes_the_modality_ratio_out_of_the_unit_embedding() {
                 ..cfg()
             },
             None,
-            &[],
         )
         .unwrap()
     };

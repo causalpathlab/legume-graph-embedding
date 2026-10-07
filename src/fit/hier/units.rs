@@ -1,23 +1,18 @@
 use crate::data::Triplet;
-use crate::fit::config::TrackSpec;
 use crate::fit::projection::CellBatchFold;
 
-/// Every unit's feature rows and counts, plus its exposure per TRACK.
+/// Every unit's feature rows and counts, plus its exposure.
 ///
-/// Invariants: `feats[u]` is ascending and matches `counts[u]` in length;
-/// `total` and `weight` are `[n_units × n_tracks]` row-major, indexed by
-/// [`UnitTable::total_of`] / [`UnitTable::weight_of`]; `tracks` describes the
-/// same `n_features`-row axis every entry of `feats` indexes.
+/// Invariants: `feats[u]` is ascending, indexes the `n_features`-row axis and
+/// matches `counts[u]` in length; `total` and `weight` hold one entry per unit.
 pub struct UnitTable {
     pub n_features: usize,
-    /// row → (track, gene) for the axis `feats` indexes.
-    pub tracks: TrackSpec,
     pub feats: Vec<Vec<u32>>,
     pub counts: Vec<Vec<f32>>,
-    /// `[n_units × n_tracks]` row-major.
+    /// Per unit, its total count.
     pub total: Vec<f32>,
-    /// `[n_units × n_tracks]` row-major: `sqrt(total)` normalized to mean 1
-    /// over ALL units within its track (all zero when that mean is zero).
+    /// Per unit, `sqrt(total)` normalized to mean 1 over ALL units (all zero
+    /// when that mean is zero).
     pub weight: Vec<f32>,
     pub level: Vec<u8>,
     pub source_index: Vec<u32>,
@@ -30,57 +25,17 @@ impl UnitTable {
         self.feats.len()
     }
 
-    pub fn n_tracks(&self) -> usize {
-        self.tracks.n_tracks()
-    }
-
-    /// Unit `u`'s total count on track `t`.
-    pub fn total_of(&self, u: usize, t: usize) -> f32 {
-        self.total[u * self.n_tracks() + t]
-    }
-
-    /// Unit `u`'s loss weight on track `t`; `0` when it has no counts there.
-    pub fn weight_of(&self, u: usize, t: usize) -> f32 {
-        self.weight[u * self.n_tracks() + t]
-    }
-
-    /// The plain gene axis: [`Self::from_pseudobulks_and_cells_tracked`] with
-    /// [`TrackSpec::base`]. `fit` always builds a spec (base or not) and calls
-    /// the tracked constructor, so inside this crate this is the tests' handle
-    /// on the untracked path — the parity guard that the two agree.
-    ///
     /// Pseudobulk levels first (coarsest → finest, each level's pb index
     /// order), then cells. Every pseudobulk index in `0..n_pb_per_level[l]`
     /// gets a row at level `l`, even if it never appears in that level's edge
     /// list (empty row). Counts ≤ 0 are dropped; cell counts are divided by
     /// their batch's fold when one is given.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_pseudobulks_and_cells(
         pb_blobs: &[&[Triplet]],
         n_pb_per_level: &[usize],
         cells: &[(u32, &[u32], &[f32])],
         fold: Option<CellBatchFold<'_>>,
         n_features: usize,
-    ) -> Self {
-        Self::from_pseudobulks_and_cells_tracked(
-            pb_blobs,
-            n_pb_per_level,
-            cells,
-            fold,
-            n_features,
-            TrackSpec::base(n_features),
-        )
-    }
-
-    /// [`Self::from_pseudobulks_and_cells`] on an axis whose rows are tracks of
-    /// genes: totals and weights are accumulated per track.
-    pub(crate) fn from_pseudobulks_and_cells_tracked(
-        pb_blobs: &[&[Triplet]],
-        n_pb_per_level: &[usize],
-        cells: &[(u32, &[u32], &[f32])],
-        fold: Option<CellBatchFold<'_>>,
-        n_features: usize,
-        tracks: TrackSpec,
     ) -> Self {
         assert_eq!(
             pb_blobs.len(),
@@ -128,42 +83,36 @@ impl UnitTable {
             source_index.push(cell);
         }
 
-        // Exposure per (unit, track): a unit's counts split by the track its
-        // rows belong to. One track reproduces the plain per-unit total.
-        let (n_u, n_t) = (feats.len(), tracks.n_tracks());
-        let mut total = vec![0f32; n_u * n_t];
+        // Exposure per unit: its total count.
+        let n_u = feats.len();
+        let mut total = vec![0f32; n_u];
         for (u, (f, c)) in feats.iter().zip(&counts).enumerate() {
             for (j, (&row, &x)) in f.iter().zip(c).enumerate() {
-                let Some(&t) = tracks.track_of_row.get(row as usize) else {
-                    panic!(
-                        "unit {u} ({} level {}, source {}) entry {j}/{}: feature row {row} \
-                         (bits as f32 {}) is past the {n_features}-row axis",
-                        if u < n_pb_units { "pseudobulk" } else { "cell" },
-                        level[u],
-                        source_index[u],
-                        f.len(),
-                        f32::from_bits(row),
-                    );
-                };
-                total[u * n_t + t as usize] += x;
+                assert!(
+                    (row as usize) < n_features,
+                    "unit {u} ({} level {}, source {}) entry {j}/{}: feature row {row} \
+                     (bits as f32 {}) is past the {n_features}-row axis",
+                    if u < n_pb_units { "pseudobulk" } else { "cell" },
+                    level[u],
+                    source_index[u],
+                    f.len(),
+                    f32::from_bits(row),
+                );
+                total[u] += x;
             }
         }
-        // `weight[u, t] = sqrt(total[u, t]) / mean_u sqrt(total[u, t])`, the mean
-        // taken over ALL units (a unit with nothing on track `t` still counts in
-        // the denominator, and gets weight 0).
+        // `weight[u] = sqrt(total[u]) / mean_u sqrt(total[u])`, the mean taken
+        // over ALL units (a unit with no counts still counts in the
+        // denominator, and gets weight 0).
         let raw: Vec<f32> = total.iter().map(|t| t.sqrt()).collect();
-        let mut weight = vec![0f32; n_u * n_t];
-        for t in 0..n_t {
-            let mean = (0..n_u).map(|u| raw[u * n_t + t]).sum::<f32>() / n_u.max(1) as f32;
-            if mean > 0.0 {
-                for u in 0..n_u {
-                    weight[u * n_t + t] = raw[u * n_t + t] / mean;
-                }
-            }
-        }
+        let mean = raw.iter().sum::<f32>() / n_u.max(1) as f32;
+        let weight: Vec<f32> = if mean > 0.0 {
+            raw.iter().map(|&r| r / mean).collect()
+        } else {
+            vec![0f32; n_u]
+        };
         Self {
             n_features,
-            tracks,
             feats,
             counts,
             total,

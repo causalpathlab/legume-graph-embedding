@@ -56,7 +56,7 @@ use rustc_hash::FxHashMap;
 /// gates all close pools nothing instead of `0/0`.
 const GATE_TOTAL_FLOOR: f64 = 1e-12;
 
-/// Parallel cis pairs on the unified feature axis (one-track multiome).
+/// Parallel cis pairs on the unified feature axis (multiome).
 #[derive(Clone, Debug, Default)]
 pub struct CisGates {
     /// RNA feature index per pair.

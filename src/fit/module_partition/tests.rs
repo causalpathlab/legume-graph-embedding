@@ -1,5 +1,5 @@
 use super::*;
-use crate::fit::config::{ParentModulesOwned, TrackInfo, TrackSpec};
+use crate::fit::config::ParentModulesOwned;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Poisson};
@@ -52,55 +52,6 @@ fn parent_warm_start_carries_matched_rows_and_initializes_the_rest() {
     for m in 0..2 {
         assert!((logits[(3, m)] - avg[m]).abs() < 1e-6);
     }
-}
-
-/// The partition groups GENES, so a multi-track feature axis has to be
-/// reduced to the base track's rows first, re-keyed by gene id.
-#[test]
-fn base_track_profile_is_the_identity_on_a_one_track_axis() {
-    let p = DMatrix::<f32>::from_fn(6, 4, |i, j| (i * 4 + j) as f32);
-    let got = base_track_profile(&p, &TrackSpec::base(p.nrows()));
-    assert_eq!(got, p);
-}
-
-#[test]
-fn base_track_profile_keeps_only_the_base_rows_re_keyed_by_gene() {
-    // 5 feature rows over 3 genes: rows 0..2 are the base track (genes 1, 0 —
-    // deliberately NOT in gene order), rows 2..5 are a second track.
-    let profile = DMatrix::<f32>::from_row_slice(
-        5,
-        2,
-        &[
-            10.0, 11.0, //
-            20.0, 21.0, //
-            30.0, 31.0, //
-            40.0, 41.0, //
-            50.0, 51.0,
-        ],
-    );
-    let tracks = TrackSpec {
-        track_of_row: vec![0, 0, 1, 1, 1],
-        gene_of_row: vec![1, 0, 0, 1, 2],
-        tracks: vec![
-            TrackInfo {
-                name: "t0".into(),
-                is_count: true,
-            },
-            TrackInfo {
-                name: "t1".into(),
-                is_count: true,
-            },
-        ],
-    };
-    let got = base_track_profile(&profile, &tracks);
-    assert_eq!(got.nrows(), 3);
-    assert_eq!(got.ncols(), 2);
-    assert_eq!(got.row(0), profile.row(1)); // gene 0 sits on base row 1
-    assert_eq!(got.row(1), profile.row(0)); // gene 1 on base row 0
-    assert!(
-        got.row(2).iter().all(|&x| x == 0.0),
-        "gene 2 has no base row"
-    );
 }
 
 #[test]
@@ -246,17 +197,15 @@ fn partition_by_group_takes_a_budget_per_group() {
 #[test]
 fn flat_module_only_is_off_unless_asked() {
     let (counts, sizes) = planted(2, 6, 4, 4, 16, 3);
-    let spec = TrackSpec::base(counts.nrows());
-    assert!(flat_module_only(&counts, &sizes, &spec, false).is_none());
+    assert!(flat_module_only(&counts, &sizes, false).is_none());
 }
 
-/// On, a one-track axis flags exactly the rows the coarsener would put in its
+/// On, it flags exactly the rows the coarsener would put in its
 /// background group, and never a planted program's row.
 #[test]
 fn flat_module_only_flags_the_background_rows() {
     let (counts, sizes) = planted(2, 6, 4, 4, 16, 3);
-    let spec = TrackSpec::base(counts.nrows());
-    let flags = flat_module_only(&counts, &sizes, &spec, true).expect("flags");
+    let flags = flat_module_only(&counts, &sizes, true).expect("flags");
     assert_eq!(flags.len(), counts.nrows());
     assert!(
         flags[..12].iter().all(|&f| !f),
@@ -266,32 +215,6 @@ fn flat_module_only_flags_the_background_rows() {
         flags[12..].iter().all(|&f| f),
         "a flat/empty row kept: {flags:?}"
     );
-}
-
-/// A multi-track axis never gets the switch: module-only rows need a one-track
-/// axis, and the partition there is over genes, not rows.
-#[test]
-fn flat_module_only_skips_a_multi_track_axis() {
-    let (counts, sizes) = planted(2, 6, 4, 4, 16, 3);
-    let n_g = counts.nrows();
-    let mut stacked = DMatrix::<f32>::zeros(2 * n_g, counts.ncols());
-    stacked.rows_mut(0, n_g).copy_from(&counts);
-    stacked.rows_mut(n_g, n_g).copy_from(&counts);
-    let spec = TrackSpec {
-        track_of_row: (0..2 * n_g).map(|r| u32::from(r >= n_g)).collect(),
-        gene_of_row: (0..2 * n_g).map(|r| (r % n_g) as u32).collect(),
-        tracks: vec![
-            TrackInfo {
-                name: "t0".into(),
-                is_count: true,
-            },
-            TrackInfo {
-                name: "t1".into(),
-                is_count: true,
-            },
-        ],
-    };
-    assert!(flat_module_only(&stacked, &sizes, &spec, true).is_none());
 }
 
 /// `planted` plus `n_scattered` isolated rows: each counted heavily in ONE
