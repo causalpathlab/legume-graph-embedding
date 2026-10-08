@@ -77,7 +77,7 @@ fn config() -> FitConfig {
         hier_modules_per_unit: 2,
         module_only_min_rows: 0,
         feature_modules: None,
-        displaced: None,
+        divergence: None,
         preset_features: None,
         strata: None,
         cis_gates: None,
@@ -87,7 +87,7 @@ fn config() -> FitConfig {
 }
 
 /// The pseudobulks the fit trains on depend on the live rows alone: a backend
-/// that also holds rows the axis was cut away from (a split-off displaced
+/// that also holds rows the axis was cut away from (a split-off divergent
 /// track) gives the same partition and the same pseudobulk counts as a
 /// backend holding only the live rows.
 #[test]

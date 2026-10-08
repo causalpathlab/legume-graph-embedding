@@ -18,9 +18,7 @@ mod setup;
 
 pub use batch_fold::BatchGeneFold;
 pub use config::{FeatureModuleConfig, FitConfig, FitOutput, MultiomeOptions, ParentModulesOwned};
-pub use divergence::{
-    split_displaced, DisplacedAxis, DisplacedTrackConfig, DisplacementEncoder, DisplacementOutput,
-};
+pub use divergence::{split_divergence, DivergenceAxis, DivergenceConfig, DivergenceOutput};
 pub use hier::{CisCoupling, CisGateReadout, CisGates};
 pub use module_args::FeatureModuleArgs;
 pub use module_partition::{parent_module_logits, partition_modules};
@@ -89,7 +87,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     anyhow::ensure!(
         !(collapse_masked && config.emit_finest_collapse),
         "the finest collapse cannot be emitted when the fit reads only part of the backend's \
-         rows (a split-off displaced track)"
+         rows (a split-off divergent track)"
     );
     // Per-batch gene fold for phase 2, from the finest collapse's `δ`. The count
     // backend numbers batches by sorted name; the unified data by first appearance
@@ -513,22 +511,19 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         }
     }
 
-    // A displaced track, against the finished base tables in the cells' frame.
+    // A divergent track, against the finished base tables in the cells' frame.
     // Skipped on an interrupted fit: the cells were never placed.
-    let displacement = match &config.displaced {
+    let divergence = match &config.divergence {
         Some(knobs) if !stop.load(std::sync::atomic::Ordering::Relaxed) => {
             let e_feat = DMatrix::<f32>::from_tensor(&cell_model.e_feat)?;
             let b_feat: Vec<f32> = cell_model.b_feat.flatten_all()?.to_vec1()?;
-            let tables: Vec<&DMatrix<f32>> = pb_embeddings.iter().map(|l| &l.e_pb).collect();
-            Some(divergence::fit_displaced(
+            Some(divergence::fit_divergence(
                 unified,
                 knobs,
+                &cell_model.e_cell,
                 &e_feat,
                 &b_feat,
-                &tables,
-                &cell_to_pb_per_level,
                 config.seed,
-                &config.device,
             )?)
         }
         _ => None,
@@ -544,7 +539,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         cell_encoder: phase2.cell_encoder,
         module_labels: out.labels,
         cis_gates: out.cis,
-        displacement,
+        divergence,
     })
 }
 

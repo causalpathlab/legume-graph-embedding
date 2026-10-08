@@ -51,10 +51,9 @@ pub use eval::{
 };
 pub use feature_qc::{hvg_feature_qc, FeatureQcConfig, FeatureQcResult};
 pub use fit::{
-    fit, partition_modules, split_displaced, CellEncoder, CisCoupling, CisGateReadout, CisGates,
-    DisplacedAxis, DisplacedTrackConfig, DisplacementEncoder, DisplacementOutput,
-    FeatureModuleArgs, FeatureModuleConfig, FitConfig, FitOutput, MultiomeOptions,
-    ParentModulesOwned,
+    fit, partition_modules, split_divergence, CellEncoder, CisCoupling, CisGateReadout, CisGates,
+    DivergenceAxis, DivergenceConfig, DivergenceOutput, FeatureModuleArgs, FeatureModuleConfig,
+    FitConfig, FitOutput, MultiomeOptions, ParentModulesOwned,
 };
 pub use model::JointEmbedModel;
 pub use multiome_plan::{

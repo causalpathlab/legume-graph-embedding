@@ -1,50 +1,47 @@
-//! A count track read as a **displacement** of the base track: the
-//! unspliced-against-spliced phase portrait, in the base track's space.
+//! A count track read against the base track, gene by gene: the
+//! unspliced-against-spliced phase portrait, on the base fit's cell states.
 //!
-//! The base track (spliced counts) alone places every unit and trains the
-//! gene features. For every unit `u` and gene `g`, the displaced track
-//! (unspliced counts) is read against the base reads of the same unit and
-//! gene: of the `x^s_ug + x^u_ug` reads, how many are displaced,
+//! The base track (spliced counts) alone places every cell (`θ_c`) and trains
+//! the gene rows (`ρ_g`, `b_g`). For every cell `c` and gene `g`, the
+//! divergent track (unspliced counts) is read against the base reads of the
+//! same cell and gene: of the `x^s_cg + x^u_cg` reads, how many are on the divergent track,
 //!
 //! ```text
-//! x^u_ug ~ Binom(x^s_ug + x^u_ug, σ(κ_u + δ_g + ⟨d_u, ρ_g⟩))
+//! x^u_cg ~ Binom(x^s_cg + x^u_cg, σ(κ_c + δ_g + ⟨θ_c, η_g⟩))
 //! ```
 //!
-//! - `δ_g`: the gene's log ratio, its displaced bias against its base bias
-//!   (`b'_g − b_g`);
-//! - `κ_u`: the unit's overall displaced share (capture, depth);
-//! - `⟨d_u, ρ_g⟩`: the unit's displacement `d_u` read through the base
-//!   track's gene features `ρ_g`, which are not trained here.
+//! - `κ_c`: the cell's overall divergent share (capture, depth), profiled
+//!   per cell;
+//! - `δ_g`: the gene's log ratio for a typical cell;
+//! - `η_g`: the gene's direction in the cell-state space along which its
+//!   divergent share rises, one vector per gene, ridge-shrunk. `θ_c` stays
+//!   the base fit's, so nothing here moves the base space.
 //!
 //! In splicing kinetics, `log(u/s)` sits at the gene's steady-state ratio
 //! `log γ_g` when the gene is neither induced nor repressed, above it while
-//! induced, below it while repressed. `δ_g` is fitted across all units, so it
-//! is the gene's AVERAGE ratio. [`steady_anchor`] then estimates, per gene,
-//! where the steady state sits against that average, `ā_g`, from the finest
-//! pseudobulks at both ends of the gene's base score. A unit's log
-//! velocity ratio is `⟨d_u, ρ_g⟩ − ā_g`, and its velocity
-//! `γ_g s_ug (e^{⟨d_u, ρ_g⟩ − ā_g} − 1)`.
+//! induced, below it while repressed. [`steady_anchor`] reads each gene's
+//! steady state, `ā_g`, off the observed ratio of the cells at both ends of the
+//! gene's base score, as the steady-state fit of RNA velocity does. A cell's
+//! log velocity ratio is `ℓ_cg = ⟨θ_c, η_g⟩ − ā_g`, and `log γ_g = δ_g + ā_g`.
 //!
-//! Nothing here reaches `θ`, `ρ` or `b`, so the displaced track cannot move
-//! the base space, whatever its depth.
+//! [`cell_velocity`] turns those into one vector per cell in the base space:
+//! with `β = 1`, `d log s_g / dt = γ_g (e^{ℓ_cg} − 1)`, and a move `v` of
+//! `θ_c` changes the base model's `log π_cg` by `⟨v, ρ_g − ρ̄_c⟩`
+//! (`π_c = softmax_g(⟨θ_c, ρ_g⟩ + b_g)`, `ρ̄_c = Σ_g π_cg ρ_g`), so
 //!
-//! Two stages, as the base fit has:
-//! 1. **pseudobulks**: a free `d_p`, `κ_p` per pseudobulk of every level, and
-//!    the gene ratios `δ`; ridge toward no displacement;
-//! 2. **cells**: an encoder reads a cell's displaced counts through the frozen
-//!    gene table and gives `(d_c, κ_c)`; distilled onto the cell's finest
-//!    pseudobulk's, then refined on the cell's own counts, ridge toward the
-//!    pseudobulk's.
+//! ```text
+//! θ̇_c = argmin_v Σ_g π_cg (⟨v, ρ_g − ρ̄_c⟩ − γ_g (e^{ℓ_cg} − 1))²
+//! ```
 
 use crate::data::UnifiedData;
 use crate::progress::new_progress_bar;
-use anyhow::Context;
 use legume_numeric::candle::candle_core::{DType, Device, Tensor, Var};
-use legume_numeric::candle::candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
-use legume_numeric::candle::encoder::{PooledGeneEncoder, PooledGeneEncoderArgs};
-use legume_numeric::candle::feature_embedding::FeatureEmbedding;
+use legume_numeric::candle::candle_nn::ops::{sigmoid, softmax_last_dim};
+use legume_numeric::candle::candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use legume_numeric::candle::grad_clip::clipped_backward_step;
+use legume_numeric::candle::loss::log_sigmoid;
 use legume_numeric::matrix::rand_util::mix_seed;
+use legume_numeric::matrix::traits::ConvertMatOps;
 use log::info;
 use nalgebra::DMatrix;
 use rand::rngs::StdRng;
@@ -52,45 +49,49 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rayon::prelude::*;
 
-/// Width of the encoder trunk, as phase 2's.
-const TRUNK_WIDTH: usize = 128;
-/// Units per optimizer step.
-const UNITS_PER_STEP: usize = 128;
+/// Cells per optimizer step.
+const CELLS_PER_STEP: usize = 128;
 const GRAD_CLIP: f64 = 5.0;
-/// Share of a gene's finest pseudobulks taken as steady state at EACH end of
-/// its base score.
+/// Newton steps on each cell's `κ` per optimizer step, from its last value.
+const KAPPA_STEPS: usize = 3;
+/// Newton steps on each cell's `κ` once the gene terms are fitted.
+const KAPPA_FINAL_STEPS: usize = 20;
+/// Share of the cells taken as steady state at EACH end of a gene's base
+/// score.
 const STEADY_QUANTILE: f64 = 0.05;
-/// The var-name prefix the encoder is saved under.
-const VAR_PREFIX: &str = "displaced_enc";
-/// The per-gene mean's tensor name inside the saved file.
-const MEAN_TENSOR: &str = "displaced_enc.feature_mean";
-/// Sub-stream tags for this module's seeds.
-const SEED_PB: u64 = 0x4449_5350_5042;
-const SEED_CELL: u64 = 0x4449_5350_4345;
+/// Genes per block when scoring every cell against a block of genes.
+const GENES_PER_BLOCK: usize = 256;
+/// Cells per block when solving the per-cell velocities.
+const CELLS_PER_VELOCITY_BLOCK: usize = 16;
+/// The largest log velocity ratio the velocity reads, so one runaway gene
+/// cannot dominate a cell's least squares.
+const MAX_LOG_RATIO: f64 = 5.0;
+/// Sub-stream tag for this module's seed.
+const SEED_FIT: u64 = 0x4449_5350_4345;
 
 ////////////////////
 // Axis and knobs //
 ////////////////////
 
-/// Where the base and the displaced counts of every gene of the live (base)
-/// axis are in the count backend, after [`split_displaced`] cut the axis down
+/// Where the base and the divergent counts of every gene of the live (base)
+/// axis are in the count backend, after [`split_divergence`] cut the axis down
 /// to the base track.
 #[derive(Clone, Debug)]
-pub struct DisplacedAxis {
+pub struct DivergenceAxis {
     /// Per live row (gene): the backend row of its base-track counts.
     pub base_backend_row: Vec<u32>,
-    /// Per live row (gene): the backend row of its displaced-track counts,
-    /// `u32::MAX` for a gene the displaced track has no row for.
-    pub displaced_backend_row: Vec<u32>,
-    /// The displaced track's name, e.g. `count/unspliced`.
+    /// Per live row (gene): the backend row of its divergent-track counts,
+    /// `u32::MAX` for a gene the divergent track has no row for.
+    pub divergent_backend_row: Vec<u32>,
+    /// The divergent track's name, e.g. `count/unspliced`.
     pub track_name: Box<str>,
 }
 
-impl DisplacedAxis {
-    /// Live rows carrying a displaced row, ascending: the displaced support.
+impl DivergenceAxis {
+    /// Live rows carrying a divergent row, ascending: the divergence support.
     #[must_use]
     pub fn support(&self) -> Vec<u32> {
-        self.displaced_backend_row
+        self.divergent_backend_row
             .iter()
             .enumerate()
             .filter(|&(_, &r)| r != u32::MAX)
@@ -99,63 +100,41 @@ impl DisplacedAxis {
     }
 }
 
-/// How the displaced track is learned. See the module docs.
+/// How the divergent track is learned. See the module docs.
 #[derive(Clone, Debug)]
-pub struct DisplacedTrackConfig {
-    pub axis: DisplacedAxis,
-    /// Ridge precision on a pseudobulk's displacement (`1/σ²`).
-    pub l2_pb: f32,
-    /// Ridge precision of a cell's displacement around its pseudobulk's
-    /// (`1/τ²`).
-    pub l2_cell: f32,
-    /// Passes over the pseudobulks.
-    pub pb_epochs: usize,
-    /// Passes over the cells distilling the encoder onto the pseudobulks.
-    pub distill_epochs: usize,
-    /// Passes over the cells refining the encoder on their own counts.
-    pub refine_epochs: usize,
+pub struct DivergenceConfig {
+    pub axis: DivergenceAxis,
+    /// Ridge on the genes' directions, `λ/2 Σ_g ‖η_g‖²`, against the summed
+    /// binomial log-likelihood of every cell.
+    pub l2: f32,
+    /// Passes over the cells.
+    pub epochs: usize,
     pub learning_rate: f64,
 }
 
-impl DisplacedTrackConfig {
-    /// The default knobs on `axis`.
-    #[must_use]
-    pub fn new(axis: DisplacedAxis) -> Self {
-        Self {
-            axis,
-            l2_pb: 1.0,
-            l2_cell: 1.0,
-            pb_epochs: 50,
-            distill_epochs: 20,
-            refine_epochs: 10,
-            learning_rate: 1e-2,
-        }
-    }
-}
-
-/// Cut `unified` down to the base track's rows and say where the displaced
+/// Cut `unified` down to the base track's rows and say where the divergent
 /// track's counts are. Call before building the fit's other per-feature inputs
 /// (they then index the base axis).
 ///
 /// Gene `i` is `base_rows[i]` on the current feature axis, and
-/// `displaced_rows[i]` its displaced-track row, `None` for a gene the displaced
+/// `divergent_rows[i]` its divergent-track row, `None` for a gene the divergent
 /// track has no row for. `base_rows` must be strictly ascending: the live axis
 /// is the base rows in that order, and [`UnifiedData::subset_features`] takes a
-/// selection as wide as the axis to be the axis itself. No displaced row may be
-/// a base row or another gene's displaced row. The rows are mapped to backend
+/// selection as wide as the axis to be the axis itself. No divergent row may be
+/// a base row or another gene's divergent row. The rows are mapped to backend
 /// rows before the cut; the live axis's names are the base rows' names.
-pub fn split_displaced(
+pub fn split_divergence(
     unified: &mut UnifiedData,
     base_rows: &[usize],
-    displaced_rows: &[Option<usize>],
+    divergent_rows: &[Option<usize>],
     track_name: &str,
-) -> anyhow::Result<DisplacedAxis> {
+) -> anyhow::Result<DivergenceAxis> {
     let n_features = unified.n_features();
     anyhow::ensure!(
-        base_rows.len() == displaced_rows.len(),
-        "{} base rows but {} displaced-row entries: one of each per gene",
+        base_rows.len() == divergent_rows.len(),
+        "{} base rows but {} divergent-row entries: one of each per gene",
         base_rows.len(),
-        displaced_rows.len()
+        divergent_rows.len()
     );
     anyhow::ensure!(
         base_rows.windows(2).all(|w| w[0] < w[1]),
@@ -167,34 +146,34 @@ pub fn split_displaced(
             "base row {last} is past the {n_features}-row feature axis"
         );
     }
-    // Every row is used at most once: a base row by its gene, a displaced row
+    // Every row is used at most once: a base row by its gene, a divergent row
     // by one gene and never as a base row.
     let mut used = vec![false; n_features];
     for &row in base_rows {
         used[row] = true;
     }
-    for (g, row) in displaced_rows.iter().enumerate() {
+    for (g, row) in divergent_rows.iter().enumerate() {
         let Some(row) = *row else { continue };
         anyhow::ensure!(
             row < n_features,
-            "gene {g}'s displaced row {row} is past the {n_features}-row feature axis"
+            "gene {g}'s divergent row {row} is past the {n_features}-row feature axis"
         );
         anyhow::ensure!(
             !used[row],
-            "gene {g}'s displaced row {row} is already a base row or another gene's displaced row"
+            "gene {g}'s divergent row {row} is already a base row or another gene's divergent row"
         );
         used[row] = true;
     }
     let backend = &unified.feature_to_backend_row;
     let base_backend_row: Vec<u32> = base_rows.iter().map(|&row| backend[row] as u32).collect();
-    let displaced_backend_row: Vec<u32> = displaced_rows
+    let divergent_backend_row: Vec<u32> = divergent_rows
         .iter()
         .map(|row| row.map_or(u32::MAX, |r| backend[r] as u32))
         .collect();
     unified.subset_features(base_rows);
-    Ok(DisplacedAxis {
+    Ok(DivergenceAxis {
         base_backend_row,
-        displaced_backend_row,
+        divergent_backend_row,
         track_name: track_name.into(),
     })
 }
@@ -203,158 +182,82 @@ pub fn split_displaced(
 // Results //
 /////////////
 
-/// What the displaced track's fit gives back.
-pub struct DisplacementOutput {
+/// What the divergent track's fit gives back.
+pub struct DivergenceOutput {
     pub track_name: Box<str>,
-    /// Live rows of the displaced support, ascending: the genes every
-    /// per-gene vector below and every `d · ρ` readout index.
+    /// Live rows of the divergence support, ascending: the genes every
+    /// per-gene vector and every row of `loading` below index.
     pub genes: Vec<u32>,
-    /// Per support gene, the displaced track's bias `b'_g = b_g + δ_g`.
-    pub b_displaced: Vec<f32>,
-    /// Per support gene, the base track's bias `b_g` (in the cells' frame).
-    pub b_base: Vec<f32>,
-    /// Per support gene, `ā_g`: where the gene's steady state sits against
-    /// its average log ratio `δ_g`. A unit's log velocity ratio is
-    /// `⟨d_u, ρ_g⟩ − ā_g`.
+    /// Per support gene, `δ_g`: the log ratio of divergent to base reads for
+    /// a typical cell (`κ` is centred over the cells).
+    pub ratio: Vec<f32>,
+    /// Per support gene, `ā_g`: the observed log ratio of the gene's
+    /// steady-state cells against `κ_c + δ_g`. A cell's log velocity ratio is
+    /// `⟨θ_c, η_g⟩ − ā_g`, and `log γ_g = δ_g + ā_g`.
     pub steady_anchor: Vec<f32>,
-    /// Per level (coarsest → finest), `[n_pb × H]` pseudobulk displacements.
-    pub d_pb: Vec<DMatrix<f32>>,
-    /// Per level, each pseudobulk's intercept `κ_p`.
-    pub kappa_pb: Vec<Vec<f32>>,
-    /// `[n_cells × H]` cell displacements.
-    pub d_cell: DMatrix<f32>,
-    /// Each cell's intercept `κ_c`.
+    /// Per support gene, `log γ_g = δ_g + ā_g`, the steady-state log ratio.
+    pub log_gamma: Vec<f32>,
+    /// `[S × H]` the genes' directions `η_g`.
+    pub loading: DMatrix<f32>,
+    /// Per cell, `κ_c` (centred over the cells with reads).
     pub kappa_cell: Vec<f32>,
-    /// Each cell's finest pseudobulk: a row of the last level of `d_pb`, or
-    /// `u32::MAX` for a cell in none.
-    pub cell_pb: Vec<u32>,
-    /// The cell encoder, for placing new cells' displaced counts.
-    pub encoder: DisplacementEncoder,
+    /// `[n_cells × H]` each cell's velocity `θ̇_c` in the base space; zero for
+    /// a cell with no reads on the support.
+    pub velocity_cell: DMatrix<f32>,
 }
 
 //////////////////////
 // Host-side inputs //
 //////////////////////
 
-/// One unit's counts on the displaced support: local gene ids and counts, for
-/// the base and the displaced track.
+/// One cell's counts on the divergence support: local gene ids and counts, for
+/// the base and the divergent track.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct UnitCounts {
+pub(crate) struct CellCounts {
     pub base: Vec<(u32, f32)>,
-    pub displaced: Vec<(u32, f32)>,
+    pub divergent: Vec<(u32, f32)>,
 }
 
-impl UnitCounts {
+impl CellCounts {
     fn is_empty(&self) -> bool {
-        self.base.is_empty() && self.displaced.is_empty()
+        self.base.is_empty() && self.divergent.is_empty()
     }
 }
 
-/// The frozen base tables on the displaced support.
+/// The frozen base tables on the divergence support.
 pub(crate) struct Frozen {
-    /// `[S × H]` row-major gene rows ρ.
-    pub rho: Vec<f32>,
+    /// `[S × H]` gene rows ρ.
+    pub rho: DMatrix<f32>,
     /// `[S]` base biases b.
     pub b: Vec<f32>,
-    pub h: usize,
 }
 
-impl Frozen {
-    fn s(&self) -> usize {
-        self.b.len()
-    }
-
-    fn rho_row(&self, g: usize) -> &[f32] {
-        &self.rho[g * self.h..(g + 1) * self.h]
-    }
-}
-
-/// Sum `rows`' counts per group: `groups[p]` lists the members of group `p`.
-pub(crate) fn sum_groups(rows: &[UnitCounts], groups: &[Vec<usize>]) -> Vec<UnitCounts> {
-    groups
-        .par_iter()
-        .map(|members| {
-            let mut base: rustc_hash::FxHashMap<u32, f32> = Default::default();
-            let mut disp: rustc_hash::FxHashMap<u32, f32> = Default::default();
-            for &c in members {
-                for &(g, v) in &rows[c].base {
-                    *base.entry(g).or_default() += v;
-                }
-                for &(g, v) in &rows[c].displaced {
-                    *disp.entry(g).or_default() += v;
-                }
-            }
-            let mut base: Vec<(u32, f32)> = base.into_iter().collect();
-            let mut displaced: Vec<(u32, f32)> = disp.into_iter().collect();
-            base.sort_unstable_by_key(|&(g, _)| g);
-            displaced.sort_unstable_by_key(|&(g, _)| g);
-            UnitCounts { base, displaced }
-        })
-        .collect()
-}
-
-/// Dense `[n × s]` base and displaced blocks of `units`.
-fn dense_block(units: &[&UnitCounts], s: usize) -> (Vec<f32>, Vec<f32>) {
-    let n = units.len();
+/// Dense `[n × s]` base and divergent blocks of `cells`.
+fn dense_block(cells: &[&CellCounts], s: usize) -> (Vec<f32>, Vec<f32>) {
+    let n = cells.len();
     let mut xb = vec![0f32; n * s];
     let mut xd = vec![0f32; n * s];
     xb.par_chunks_mut(s)
         .zip(xd.par_chunks_mut(s))
-        .zip(units.par_iter())
+        .zip(cells.par_iter())
         .for_each(|((b, d), u)| {
             for &(g, v) in &u.base {
                 b[g as usize] = v;
             }
-            for &(g, v) in &u.displaced {
+            for &(g, v) in &u.divergent {
                 d[g as usize] = v;
             }
         });
     (xb, xd)
 }
 
-//////////////////////
-// The likelihood   //
-//////////////////////
-
-/// The device-side frozen table: `[H × S]`, ρ transposed, for `d · ρᵀ`.
-fn rho_t(frozen: &Frozen, dev: &Device) -> anyhow::Result<Tensor> {
-    let rho = Tensor::from_slice(&frozen.rho, (frozen.s(), frozen.h), dev)?;
-    Ok(rho.t()?.contiguous()?)
-}
-
-/// The per-unit negative log-likelihood `[n]` of the displaced reads among
-/// all reads of each (unit, gene): `xd ~ Binom(xb + xd, σ(logit))` with
-/// `logit = κ + δ + d·ρᵀ`. `d` `[n × H]`, `kappa` `[n]`, `delta` `[1 × S]`.
-fn phase_loss(
-    rho_t: &Tensor,
-    d: &Tensor,
-    kappa: &Tensor,
-    delta: &Tensor,
-    xb: &Tensor,
-    xd: &Tensor,
-) -> anyhow::Result<Tensor> {
-    let logit = d
-        .matmul(rho_t)?
-        .broadcast_add(delta)?
-        .broadcast_add(&kappa.unsqueeze(1)?)?;
-    let pos = (xd * softplus(&logit.neg()?)?)?;
-    let neg = (xb * softplus(&logit)?)?;
-    Ok((pos + neg)?.sum(1)?)
-}
-
-/// `ln(1 + eˣ)`, stable: `max(x, 0) + ln(1 + e^{−|x|})`.
-fn softplus(x: &Tensor) -> anyhow::Result<Tensor> {
-    let tail = (x.abs()?.neg()?.exp()? + 1.0)?.log()?;
-    Ok((x.relu()? + tail)?)
-}
-
-/// Each gene's pooled log ratio over `units`, `ln((Σ x^u + ½)/(Σ x^s + ½))`:
+/// Each gene's pooled log ratio over `cells`, `ln((Σ x^u + ½)/(Σ x^s + ½))`:
 /// the starting `δ`.
-fn pooled_log_ratio(units: &[UnitCounts], s: usize) -> Vec<f32> {
+fn pooled_log_ratio(cells: &[CellCounts], s: usize) -> Vec<f32> {
     let mut su = vec![0f64; s];
     let mut ss = vec![0f64; s];
-    for u in units {
-        for &(g, v) in &u.displaced {
+    for u in cells {
+        for &(g, v) in &u.divergent {
             su[g as usize] += f64::from(v);
         }
         for &(g, v) in &u.base {
@@ -367,373 +270,351 @@ fn pooled_log_ratio(units: &[UnitCounts], s: usize) -> Vec<f32> {
         .collect()
 }
 
-///////////////////////////////
-// Stage 1: the pseudobulks  //
-///////////////////////////////
+////////////////////
+// The likelihood //
+////////////////////
 
-/// The pseudobulks' fit.
-pub(crate) struct PbFit {
-    /// `[n_units × H]`.
-    pub d: DMatrix<f32>,
-    pub kappa: Vec<f32>,
-    /// `[S]` the genes' average log ratio.
-    pub delta: Vec<f32>,
+/// The per-cell negative log-likelihood `[n]` of the divergent reads among
+/// all reads of each (cell, gene): `xd ~ Binom(xb + xd, σ(logit))`.
+fn binomial_nll(logit: &Tensor, xb: &Tensor, xd: &Tensor) -> anyhow::Result<Tensor> {
+    let pos = (xd * log_sigmoid(logit)?)?;
+    let neg = (xb * log_sigmoid(&logit.neg()?)?)?;
+    Ok((pos + neg)?.neg()?.sum(1)?)
 }
 
-/// Fit `d_p`, `κ_p` and the gene ratios `δ` on `units`.
-pub(crate) fn fit_pseudobulks(
-    frozen: &Frozen,
-    units: &[UnitCounts],
-    knobs: &DisplacedTrackConfig,
+/// Each cell's `κ` maximising its own likelihood given the rest of its
+/// logits `a` `[n × S]`: `steps` Newton steps from `kappa` `[n]`. A cell with
+/// no reads keeps its start.
+fn profile_kappa(
+    a: &Tensor,
+    xb: &Tensor,
+    xd: &Tensor,
+    kappa: &Tensor,
+    steps: usize,
+) -> anyhow::Result<Tensor> {
+    let n_reads = (xb + xd)?;
+    let mut k = kappa.clone();
+    for _ in 0..steps {
+        let p = sigmoid(&a.broadcast_add(&k.unsqueeze(1)?)?)?;
+        let grad = ((&n_reads * &p)? - xd)?.sum(1)?;
+        let curv = (&n_reads * (&p * (1.0 - &p)?)?)?.sum(1)?;
+        k = (k - (grad / (curv + 1e-6)?)?)?;
+    }
+    Ok(k)
+}
+
+//////////////
+// The fit  //
+//////////////
+
+/// The gene terms and the cells' intercepts.
+pub(crate) struct RatioFit {
+    /// `[n_cells]`.
+    pub kappa: Vec<f32>,
+    /// `[S]`.
+    pub delta: Vec<f32>,
+    /// `[S × H]`.
+    pub eta: DMatrix<f32>,
+}
+
+/// Fit `κ_c`, `δ_g` and `η_g` on the cells: `theta` `[n_cells × H]` fixed
+/// (on `dev`), `cells` their counts on the support. Adam on minibatches of
+/// cells over `δ` and `η`, each cell's `κ` profiled by Newton steps inside
+/// every step; then `κ` centred over the cells with reads, its mean moved into
+/// `δ`.
+pub(crate) fn fit_ratio(
+    theta: &Tensor,
+    cells: &[CellCounts],
+    s: usize,
+    knobs: &DivergenceConfig,
     seed: u64,
-    dev: &Device,
-) -> anyhow::Result<PbFit> {
-    let (n, h, s) = (units.len(), frozen.h, frozen.s());
-    let rho_t = rho_t(frozen, dev)?;
-    let mut rng = StdRng::seed_from_u64(mix_seed(seed, SEED_PB));
-    let d = Var::zeros((n, h), DType::F32, dev)?;
-    let kappa = Var::zeros(n, DType::F32, dev)?;
-    let delta = Var::from_tensor(&Tensor::from_vec(pooled_log_ratio(units, s), (1, s), dev)?)?;
+) -> anyhow::Result<RatioFit> {
+    let (n, h) = theta.dims2()?;
+    anyhow::ensure!(n == cells.len(), "θ is not [cells × H]");
+    let dev = theta.device();
+    let delta = Var::from_tensor(&Tensor::from_vec(pooled_log_ratio(cells, s), (1, s), dev)?)?;
+    // Stored transposed, `[H × S]`, so `θ ηᵀ` is a plain matmul.
+    let eta_t = Var::zeros((h, s), DType::F32, dev)?;
+    let mut kappa = vec![0f32; n];
     let mut adam = AdamW::new(
-        vec![d.clone(), kappa.clone(), delta.clone()],
+        vec![delta.clone(), eta_t.clone()],
         ParamsAdamW {
             lr: knobs.learning_rate,
             weight_decay: 0.0,
             ..Default::default()
         },
     )?;
-    let mut order: Vec<usize> = (0..n).filter(|&u| !units[u].is_empty()).collect();
-    let half_l2 = f64::from(knobs.l2_pb) / 2.0;
+    let mut active: Vec<usize> = (0..n).filter(|&c| !cells[c].is_empty()).collect();
+    let n_active = active.len().max(1);
+    // The objective is `Σ_c NLL_c + λ/2 ‖η‖²`, divided by the number of
+    // cells so a minibatch mean estimates it.
+    let ridge = f64::from(knobs.l2) / 2.0 / n_active as f64;
+    let mut rng = StdRng::seed_from_u64(mix_seed(seed, SEED_FIT));
     info!(
-        "Displaced track — fitting {} pseudobulks' displacements over {s} genes: {} epochs, \
-         ridge {}",
-        order.len(),
-        knobs.pb_epochs,
-        knobs.l2_pb
+        "Divergence — fitting {} cells' {s} gene ratios and directions: {} epochs, ridge {}",
+        active.len(),
+        knobs.epochs,
+        knobs.l2
     );
-    let bar = new_progress_bar(knobs.pb_epochs as u64);
-    for _ in 0..knobs.pb_epochs {
-        order.shuffle(&mut rng);
-        for chunk in order.chunks(UNITS_PER_STEP) {
-            let rows: Vec<&UnitCounts> = chunk.iter().map(|&u| &units[u]).collect();
-            let (xb, xd) = dense_block(&rows, s);
-            let m = chunk.len();
-            let idx = Tensor::from_vec(chunk.iter().map(|&u| u as u32).collect(), m, dev)?;
-            let xb = Tensor::from_vec(xb, (m, s), dev)?;
-            let xd = Tensor::from_vec(xd, (m, s), dev)?;
-            let dd = d.as_tensor().index_select(&idx, 0)?;
-            let kk = kappa.as_tensor().index_select(&idx, 0)?;
-            let fit = phase_loss(&rho_t, &dd, &kk, delta.as_tensor(), &xb, &xd)?;
-            let ridge = dd.sqr()?.sum(1)?.affine(half_l2, 0.0)?;
-            let loss = (fit + ridge)?.mean_all()?;
-            clipped_backward_step(&mut adam, &loss, GRAD_CLIP)?;
-        }
-        bar.inc(1);
-    }
-    bar.finish_and_clear();
-    Ok(PbFit {
-        d: from_device(d.as_tensor())?,
-        kappa: kappa.as_tensor().to_vec1()?,
-        delta: delta.as_tensor().flatten_all()?.to_vec1()?,
-    })
-}
-
-/// Fix the displacements' gauge. Adding one `c` to every unit's `d` and
-/// `−⟨c, ρ_g⟩` to every `δ_g` leaves every score unchanged, so the likelihood
-/// cannot tell where their mean sits (a weak ridge barely can). Move the
-/// units' mean into `δ`: afterwards `d` is a unit's displacement relative to
-/// the average unit.
-fn center_units(fit: &mut PbFit, f: &Frozen) {
-    let c = center_columns(&mut fit.d);
-    for (g, delta) in fit.delta.iter_mut().enumerate() {
-        *delta += dot(f.rho_row(g), &c);
-    }
-    log::info!(
-        "Displaced track — moved the displacements' shared mean (|c| = {:.3}) into the gene ratios",
-        dot(&c, &c).sqrt()
-    );
-}
-
-/// Subtract each column's mean; return the means.
-fn center_columns(m: &mut DMatrix<f32>) -> Vec<f32> {
-    let n = m.nrows().max(1) as f32;
-    let c: Vec<f32> = m.column_iter().map(|col| col.sum() / n).collect();
-    for mut row in m.row_iter_mut() {
-        for (x, mean) in row.iter_mut().zip(&c) {
-            *x -= mean;
-        }
-    }
-    c
-}
-
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-/// Per gene, `ā_g`: the log ratio of the displaced reads of the gene's
-/// steady-state units to what `κ_p + δ_g` expects of them, with no
-/// displacement. Steady-state units are the `STEADY_QUANTILE` of `units` at
-/// each end of the gene's base score `⟨θ_p, ρ_g⟩ + b_g`, as the steady-state
-/// fit of RNA velocity takes the cells at both extremes of a gene's spliced
-/// expression. `theta` `[n × H]` places `units`.
-pub(crate) fn steady_anchor(
-    frozen: &Frozen,
-    theta: &DMatrix<f32>,
-    units: &[UnitCounts],
-    fit: &PbFit,
-    rows: std::ops::Range<usize>,
-) -> Vec<f32> {
-    let (s, n) = (frozen.s(), units.len());
-    let rho = DMatrix::from_row_slice(s, frozen.h, &frozen.rho);
-    let score = theta * rho.transpose(); // [n × S], b_g added per column below
-    let k = ((n as f64 * STEADY_QUANTILE).ceil() as usize).clamp(1, n.max(1));
-    // Per gene, the k-th lowest and k-th highest score: the ends' thresholds.
-    let bounds: Vec<(f32, f32)> = (0..s)
-        .into_par_iter()
-        .map(|g| {
-            let mut col: Vec<f32> = score.column(g).iter().copied().collect();
-            col.sort_unstable_by(f32::total_cmp);
-            (col[k - 1], col[n - k])
-        })
-        .collect();
-    let mut num = vec![0f64; s];
-    let mut den = vec![0f64; s];
-    for (p, unit) in units.iter().enumerate() {
-        let row = rows.start + p;
-        let at_end = |g: usize| {
-            let x = score[(p, g)];
-            x <= bounds[g].0 || x >= bounds[g].1
-        };
-        for &(g, v) in &unit.displaced {
-            if at_end(g as usize) {
-                num[g as usize] += f64::from(v);
-            }
-        }
-        for &(g, v) in &unit.base {
-            let g = g as usize;
-            if at_end(g) {
-                let logit = fit.kappa[row] + fit.delta[g];
-                den[g] += f64::from(v) * f64::from(logit).exp();
-            }
-        }
-    }
-    num.iter()
-        .zip(&den)
-        .map(|(&a, &b)| ((a + 0.5) / (b + 0.5)).ln() as f32)
-        .collect()
-}
-
-/////////////////////////////////
-// Stage 2: the cells' encoder //
-/////////////////////////////////
-
-/// The trained cell encoder: reads displaced counts on the support, through
-/// the frozen gene table, and gives `[d, κ]`.
-pub struct DisplacementEncoder {
-    encoder: PooledGeneEncoder,
-    varmap: VarMap,
-    mean_1d: Tensor,
-    h: usize,
-}
-
-impl DisplacementEncoder {
-    fn build(frozen: &Frozen, mean_1d: &[f32], dev: &Device) -> anyhow::Result<Self> {
-        let rho = Tensor::from_slice(&frozen.rho, (frozen.s(), frozen.h), dev)?;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, dev);
-        let encoder = PooledGeneEncoder::new(
-            FeatureEmbedding::fixed(rho),
-            PooledGeneEncoderArgs {
-                layers: &[TRUNK_WIDTH],
-                out_dim: frozen.h + 1,
-                attn_pool: true,
-                in_dim_extra: 0,
-            },
-            &varmap,
-            vb.pp(VAR_PREFIX),
-        )?;
-        let mean_1d = Tensor::from_slice(mean_1d, (1, frozen.s()), dev)?;
-        Ok(Self {
-            encoder,
-            varmap,
-            mean_1d,
-            h: frozen.h,
-        })
-    }
-
-    /// `(d [n × H], κ [n])` for dense displaced counts `x [n × S]`.
-    fn forward(&self, x: &Tensor, train: bool) -> anyhow::Result<(Tensor, Tensor)> {
-        let z = self
-            .encoder
-            .forward(x, None, Some(&self.mean_1d), None, train)?;
-        let d = z.narrow(1, 0, self.h)?.contiguous()?;
-        let kappa = z.narrow(1, self.h, 1)?.squeeze(1)?.contiguous()?;
-        Ok((d, kappa))
-    }
-
-    /// Save the trunk and the per-gene mean as safetensors at `path`.
-    pub fn save(&self, path: &str) -> anyhow::Result<()> {
-        let mut tensors: std::collections::HashMap<String, Tensor> = self
-            .varmap
-            .data()
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
-            .collect();
-        tensors.insert(MEAN_TENSOR.to_string(), self.mean_1d.flatten_all()?);
-        legume_numeric::candle::candle_core::safetensors::save(&tensors, path)
-            .with_context(|| format!("saving the displaced-track encoder to {path}"))?;
-        Ok(())
-    }
-}
-
-/// The cells' fit.
-pub(crate) struct CellFit {
-    pub d: DMatrix<f32>,
-    pub kappa: Vec<f32>,
-    pub encoder: DisplacementEncoder,
-}
-
-/// Train the cell encoder: distil onto each cell's pseudobulk's displacement
-/// (`target` `[n × H]`), then refine on the cells' own counts against the
-/// gene ratios `delta`, ridge toward the targets.
-pub(crate) fn fit_cells(
-    frozen: &Frozen,
-    cells: &[UnitCounts],
-    target: &DMatrix<f32>,
-    delta: &[f32],
-    knobs: &DisplacedTrackConfig,
-    seed: u64,
-    dev: &Device,
-) -> anyhow::Result<CellFit> {
-    let (n, s) = (cells.len(), frozen.s());
-    anyhow::ensure!(
-        target.nrows() == n,
-        "the cells' targets are not [cells × H]"
-    );
-    let rho_t = rho_t(frozen, dev)?;
-    let target_t = to_device(target, dev)?;
-    let delta = Tensor::from_slice(delta, (1, s), dev)?;
-
-    // The trunk's gate divides by each gene's mean displaced rate.
-    let mut mean = vec![0f64; s];
-    for c in cells {
-        for &(g, v) in &c.displaced {
-            mean[g as usize] += f64::from(v);
-        }
-    }
-    let mean_1d: Vec<f32> = mean
-        .iter()
-        .map(|&m| ((m / n.max(1) as f64) as f32).max(1e-6))
-        .collect();
-    let encoder = DisplacementEncoder::build(frozen, &mean_1d, dev)?;
-
-    let mut rng = StdRng::seed_from_u64(mix_seed(seed, SEED_CELL));
-    let active: Vec<usize> = (0..n).filter(|&c| !cells[c].is_empty()).collect();
-    let mut train = active.clone();
-
-    let block = |ids: &[usize]| -> anyhow::Result<(Tensor, Tensor, Tensor)> {
-        let rows: Vec<&UnitCounts> = ids.iter().map(|&c| &cells[c]).collect();
+    // A minibatch: the logits without κ, the counts, and the cells' last κ.
+    let batch = |ids: &[usize], kappa: &[f32]| -> anyhow::Result<[Tensor; 4]> {
+        let rows: Vec<&CellCounts> = ids.iter().map(|&c| &cells[c]).collect();
         let (xb, xd) = dense_block(&rows, s);
         let m = ids.len();
         let idx = Tensor::from_vec(ids.iter().map(|&c| c as u32).collect(), m, dev)?;
-        Ok((
-            idx,
+        let a = theta
+            .index_select(&idx, 0)?
+            .matmul(eta_t.as_tensor())?
+            .broadcast_add(delta.as_tensor())?;
+        let k0 = Tensor::from_vec(ids.iter().map(|&c| kappa[c]).collect::<Vec<f32>>(), m, dev)?;
+        Ok([
+            a,
             Tensor::from_vec(xb, (m, s), dev)?,
             Tensor::from_vec(xd, (m, s), dev)?,
-        ))
+            k0,
+        ])
     };
-
-    let mut adam = AdamW::new(
-        encoder.varmap.all_vars(),
-        ParamsAdamW {
-            lr: knobs.learning_rate / 10.0,
-            weight_decay: 1e-4,
-            ..Default::default()
-        },
-    )?;
-    info!(
-        "Displaced track — encoding {} cells: {} distil + {} refine epochs",
-        train.len(),
-        knobs.distill_epochs,
-        knobs.refine_epochs
-    );
-    let half_l2 = f64::from(knobs.l2_cell) / 2.0;
-    let bar = new_progress_bar((knobs.distill_epochs + knobs.refine_epochs) as u64);
-    for epoch in 0..knobs.distill_epochs + knobs.refine_epochs {
-        let distil = epoch < knobs.distill_epochs;
-        train.shuffle(&mut rng);
-        for chunk in train.chunks(UNITS_PER_STEP) {
-            let (idx, xb, xd) = block(chunk)?;
-            let (d, kappa) = encoder.forward(&xd, true)?;
-            let toward = (&d - &target_t.index_select(&idx, 0)?)?.sqr()?.sum(1)?;
-            let loss = if distil {
-                toward.mean_all()?
-            } else {
-                let fit = phase_loss(&rho_t, &d, &kappa, &delta, &xb, &xd)?;
-                (fit + toward.affine(half_l2, 0.0)?)?.mean_all()?
-            };
+    let store = |ids: &[usize], k: &Tensor, kappa: &mut [f32]| -> anyhow::Result<()> {
+        for (&c, v) in ids.iter().zip(k.to_vec1::<f32>()?) {
+            kappa[c] = v;
+        }
+        Ok(())
+    };
+    let bar = new_progress_bar(knobs.epochs as u64);
+    for _ in 0..knobs.epochs {
+        active.shuffle(&mut rng);
+        for chunk in active.chunks(CELLS_PER_STEP) {
+            let [a, xb, xd, k0] = batch(chunk, &kappa)?;
+            let k = profile_kappa(&a.detach(), &xb, &xd, &k0, KAPPA_STEPS)?.detach();
+            let fit = binomial_nll(&a.broadcast_add(&k.unsqueeze(1)?)?, &xb, &xd)?;
+            let loss =
+                (fit.mean_all()? + eta_t.as_tensor().sqr()?.sum_all()?.affine(ridge, 0.0)?)?;
             clipped_backward_step(&mut adam, &loss, GRAD_CLIP)?;
+            store(chunk, &k, &mut kappa)?;
         }
         bar.inc(1);
     }
     bar.finish_and_clear();
 
-    // Every cell through the trained encoder; empty cells keep their targets.
-    let mut d_all = target.clone();
-    let mut kappa_all = vec![0f32; n];
-    for chunk in active.chunks(UNITS_PER_STEP) {
-        let (_, _, xd) = block(chunk)?;
-        let (d, kappa) = encoder.forward(&xd, false)?;
-        let d = from_device(&d)?;
-        let kappa: Vec<f32> = kappa.to_vec1()?;
-        for (k, &c) in chunk.iter().enumerate() {
-            d_all.row_mut(c).copy_from(&d.row(k));
-            kappa_all[c] = kappa[k];
+    // Every cell's κ at the fitted gene terms, then centred.
+    for chunk in active.chunks(CELLS_PER_STEP) {
+        let [a, xb, xd, k0] = batch(chunk, &kappa)?;
+        let k = profile_kappa(&a, &xb, &xd, &k0, KAPPA_FINAL_STEPS)?;
+        store(chunk, &k, &mut kappa)?;
+    }
+    let mean = active.iter().map(|&c| f64::from(kappa[c])).sum::<f64>() / n_active as f64;
+    for &c in &active {
+        kappa[c] -= mean as f32;
+    }
+    let delta: Vec<f32> = delta
+        .as_tensor()
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .into_iter()
+        .map(|d| d + mean as f32)
+        .collect();
+    Ok(RatioFit {
+        kappa,
+        delta,
+        eta: DMatrix::from_tensor(&eta_t.as_tensor().t()?)?,
+    })
+}
+
+/////////////////////
+// Steady state    //
+/////////////////////
+
+/// Per gene, `ā_g`: the log ratio of the divergent reads of the cells at
+/// both `STEADY_QUANTILE` ends of the gene's base score `⟨θ_c, ρ_g⟩ + b_g` to
+/// what `κ_c + δ_g` expects of them from their base reads,
+/// `ln((Σ x^u + ½) / (Σ x^s e^{κ_c + δ_g} + ½))`. The ends are taken as the
+/// gene's steady state, as the steady-state fit of RNA velocity takes the
+/// cells at both extremes of a gene's spliced expression.
+pub(crate) fn steady_anchor(
+    theta: &Tensor,
+    frozen: &Frozen,
+    fit: &RatioFit,
+    cells: &[CellCounts],
+) -> anyhow::Result<Vec<f32>> {
+    let (n, s) = (theta.dim(0)?, frozen.b.len());
+    if n == 0 {
+        return Ok(vec![0.0; s]);
+    }
+    // Each gene's base and divergent reads per cell.
+    let mut base: Vec<Vec<(u32, f32)>> = vec![Vec::new(); s];
+    let mut divergent: Vec<Vec<(u32, f32)>> = vec![Vec::new(); s];
+    for (c, cell) in cells.iter().enumerate() {
+        for &(g, v) in &cell.base {
+            base[g as usize].push((c as u32, v));
+        }
+        for &(g, v) in &cell.divergent {
+            divergent[g as usize].push((c as u32, v));
         }
     }
-    Ok(CellFit {
-        d: d_all,
-        kappa: kappa_all,
-        encoder,
-    })
+    let k = ((n as f64 * STEADY_QUANTILE).ceil() as usize).clamp(1, n);
+    let mut anchor = vec![0f32; s];
+    for start in (0..s).step_by(GENES_PER_BLOCK) {
+        let end = (start + GENES_PER_BLOCK).min(s);
+        let w = end - start;
+        // `[w × n]`, one gene's scores per row; its bias `b_g` shifts the
+        // whole row and so cannot move which cells are at its ends.
+        let rho_blk = to_device(&frozen.rho.rows(start, w).into_owned(), theta.device())?;
+        let score: Vec<f32> = rho_blk.matmul(&theta.t()?)?.flatten_all()?.to_vec1()?;
+        let blk: Vec<f32> = (0..w)
+            .into_par_iter()
+            .map(|j| {
+                let g = start + j;
+                let row = &score[j * n..(j + 1) * n];
+                let mut order = row.to_vec();
+                let (_, &mut lo, upper) = order.select_nth_unstable_by(k - 1, f32::total_cmp);
+                let hi = if n - k > k - 1 {
+                    *upper.select_nth_unstable_by(n - k - k, f32::total_cmp).1
+                } else {
+                    lo
+                };
+                let at_end = |c: u32| row[c as usize] <= lo || row[c as usize] >= hi;
+                let num: f64 = divergent[g]
+                    .iter()
+                    .filter(|&&(c, _)| at_end(c))
+                    .map(|&(_, v)| f64::from(v))
+                    .sum();
+                let den: f64 = base[g]
+                    .iter()
+                    .filter(|&&(c, _)| at_end(c))
+                    .map(|&(c, v)| {
+                        f64::from(v) * f64::from(fit.kappa[c as usize] + fit.delta[g]).exp()
+                    })
+                    .sum();
+                ((num + 0.5) / (den + 0.5)).ln() as f32
+            })
+            .collect();
+        anchor[start..end].copy_from_slice(&blk);
+    }
+    Ok(anchor)
+}
+
+/////////////////////
+// Cell velocity   //
+/////////////////////
+
+/// Each cell's velocity in the base space: `θ̇_c` solving the weighted least
+/// squares of the module docs, with `r_cg = γ_g (e^{ℓ_cg} − 1)`,
+/// `ℓ_cg = ⟨θ_c, η_g⟩ − ā_g`, `γ_g = e^{δ_g + ā_g}`. `π_c` is the base model's
+/// share of each support gene, renormalised over the support.
+pub(crate) fn cell_velocity(
+    theta: &Tensor,
+    frozen: &Frozen,
+    fit: &RatioFit,
+    anchor: &[f32],
+) -> anyhow::Result<DMatrix<f32>> {
+    let dev = theta.device();
+    let (n, h) = theta.dims2()?;
+    let s = frozen.b.len();
+    let rho = to_device(&frozen.rho, dev)?;
+    let rho_t = rho.t()?.contiguous()?;
+    let b = Tensor::from_slice(&frozen.b, (1, s), dev)?;
+    let eta_t = to_device(&fit.eta.transpose(), dev)?;
+    let anchor_t = Tensor::from_slice(anchor, (1, s), dev)?;
+    let gamma: Vec<f32> = fit
+        .delta
+        .iter()
+        .zip(anchor)
+        .map(|(d, a)| (d + a).exp())
+        .collect();
+    let gamma_t = Tensor::from_slice(&gamma, (1, s), dev)?;
+    let mut out = DMatrix::<f32>::zeros(n, h);
+    for start in (0..n).step_by(CELLS_PER_VELOCITY_BLOCK) {
+        let m = (start + CELLS_PER_VELOCITY_BLOCK).min(n) - start;
+        let th = theta.narrow(0, start, m)?;
+        let ell = th
+            .matmul(&eta_t)?
+            .broadcast_sub(&anchor_t)?
+            .clamp(-MAX_LOG_RATIO, MAX_LOG_RATIO)?;
+        let r = (ell.exp()? - 1.0)?.broadcast_mul(&gamma_t)?;
+        let v = solve_velocity(&th, &r, &rho, &rho_t, &b)?;
+        out.rows_mut(start, m).copy_from(&v);
+    }
+    Ok(out)
+}
+
+/// For cells `th` `[m × H]` and their targets `r` `[m × S]`: per cell, the
+/// `v` minimising `Σ_g π_cg (⟨v, ρ_g − ρ̄_c⟩ − r_cg)²`, `[m × H]`. A tiny
+/// ridge keeps a cell whose `π` spans fewer than H directions solvable.
+fn solve_velocity(
+    th: &Tensor,
+    r: &Tensor,
+    rho: &Tensor,
+    rho_t: &Tensor,
+    b: &Tensor,
+) -> anyhow::Result<DMatrix<f32>> {
+    let (m, h) = th.dims2()?;
+    let pi = softmax_last_dim(&th.matmul(rho_t)?.broadcast_add(b)?)?; // [m × S]
+    let rho_bar = pi.matmul(rho)?; // [m × H]
+    let w = (&pi * r)?; // [m × S]
+    let rhs = (w.matmul(rho)? - rho_bar.broadcast_mul(&w.sum_keepdim(1)?)?)?; // [m × H]
+
+    // Σ_g π_cg ρ_g ρ_gᵀ − ρ̄_c ρ̄_cᵀ, one symmetric H × H per cell.
+    let weighted = pi.unsqueeze(2)?.broadcast_mul(&rho.unsqueeze(0)?)?; // [m × S × H]
+    let second = rho_t.unsqueeze(0)?.broadcast_matmul(&weighted)?; // [m × H × H]
+    let outer = rho_bar.unsqueeze(2)?.matmul(&rho_bar.unsqueeze(1)?)?;
+    let lhs: Vec<f32> = (second - outer)?.flatten_all()?.to_vec1()?;
+    let rhs = DMatrix::<f32>::from_tensor(&rhs)?;
+    let rows: Vec<Vec<f32>> = (0..m)
+        .into_par_iter()
+        .map(|c| {
+            let block = &lhs[c * h * h..(c + 1) * h * h];
+            // Symmetric, so the row-major block reads the same column-major.
+            let mut a = DMatrix::from_column_slice(h, h, block);
+            let jitter = 1e-6 * (a.trace() / h as f32).max(1e-12) + 1e-12;
+            for i in 0..h {
+                a[(i, i)] += jitter;
+            }
+            let y = rhs.row(c).transpose();
+            if let Some(ch) = a.clone().cholesky() {
+                return ch.solve(&y).iter().copied().collect();
+            }
+            a.lu()
+                .solve(&y)
+                .map_or_else(|| vec![0.0; h], |v| v.iter().copied().collect())
+        })
+        .collect();
+    Ok(DMatrix::from_fn(m, h, |c, k| rows[c][k]))
 }
 
 /////////////////////////
 // From the fit's data //
 /////////////////////////
 
-/// Every cell's base and displaced counts on the support, streamed from the
+/// Every cell's base and divergent counts on the support, streamed from the
 /// count backend (raw counts). `support` are the live rows; local gene `i` is
 /// `support[i]`.
 pub(crate) fn read_counts(
     unified: &UnifiedData,
-    axis: &DisplacedAxis,
+    axis: &DivergenceAxis,
     support: &[u32],
-) -> anyhow::Result<Vec<UnitCounts>> {
+) -> anyhow::Result<Vec<CellCounts>> {
     let data = unified.count_backend();
     let n_cells = data.num_columns();
-    // backend row → (local gene, is displaced).
+    // backend row → (local gene, is divergent).
     let mut role = vec![(u32::MAX, false); data.num_rows()];
     for (i, &g) in support.iter().enumerate() {
         let g = g as usize;
         role[axis.base_backend_row[g] as usize] = (i as u32, false);
-        role[axis.displaced_backend_row[g] as usize] = (i as u32, true);
+        role[axis.divergent_backend_row[g] as usize] = (i as u32, true);
     }
-    let mut out: Vec<UnitCounts> = (0..n_cells).map(|_| UnitCounts::default()).collect();
+    let mut out: Vec<CellCounts> = (0..n_cells).map(|_| CellCounts::default()).collect();
     let chunk = (1usize << 14).min(n_cells.max(1));
     data.for_each_triplet(0..n_cells, chunk, |brow, col, v| {
         if v == 0.0 {
             return;
         }
-        let (g, displaced) = role[brow as usize];
+        let (g, divergent) = role[brow as usize];
         if g == u32::MAX {
             return;
         }
         let cell = &mut out[col as usize];
-        if displaced {
-            cell.displaced.push((g, v));
+        if divergent {
+            cell.divergent.push((g, v));
         } else {
             cell.base.push((g, v));
         }
@@ -741,116 +622,55 @@ pub(crate) fn read_counts(
     Ok(out)
 }
 
-/// Fit the displaced track after the base fit: the gene rows `e_feat`
-/// `[G × H]` and biases `b_feat` `[G]` in the cells' frame, the pseudobulk
-/// tables per level (same frame), and each level's cell membership.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fit_displaced(
+/// Fit the divergent track after the base fit: the cells' states `theta`
+/// `[n_cells × H]` (on the fit's device), the gene rows `e_feat` `[G × H]` and
+/// biases `b_feat` `[G]`, all in the cells' frame.
+pub(crate) fn fit_divergence(
     unified: &UnifiedData,
-    knobs: &DisplacedTrackConfig,
+    knobs: &DivergenceConfig,
+    theta: &Tensor,
     e_feat: &DMatrix<f32>,
     b_feat: &[f32],
-    pb_tables: &[&DMatrix<f32>],
-    cell_to_pb_per_level: &[Vec<usize>],
     seed: u64,
-    dev: &Device,
-) -> anyhow::Result<DisplacementOutput> {
-    let h = e_feat.ncols();
+) -> anyhow::Result<DivergenceOutput> {
     let support = knobs.axis.support();
     anyhow::ensure!(
         !support.is_empty(),
-        "the displaced track has no rows on the base axis"
+        "the divergent track has no rows on the base axis"
     );
-    let mut rho = Vec::with_capacity(support.len() * h);
-    for &g in &support {
-        rho.extend(e_feat.row(g as usize).iter().copied());
-    }
+    let rows: Vec<usize> = support.iter().map(|&g| g as usize).collect();
     let frozen = Frozen {
-        rho,
-        b: support.iter().map(|&g| b_feat[g as usize]).collect(),
-        h,
+        rho: e_feat.select_rows(&rows),
+        b: rows.iter().map(|&g| b_feat[g]).collect(),
     };
+    let theta = theta.contiguous()?;
     let cells = read_counts(unified, &knobs.axis, &support)?;
-
-    // Every level's pseudobulks, stacked.
-    let mut pb_counts = Vec::new();
-    let mut level_sizes = Vec::new();
-    for (table, c2pb) in pb_tables.iter().zip(cell_to_pb_per_level) {
-        let n_pb = table.nrows();
-        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_pb];
-        for (c, &p) in c2pb.iter().enumerate() {
-            if p < n_pb {
-                groups[p].push(c);
-            }
-        }
-        pb_counts.extend(sum_groups(&cells, &groups));
-        level_sizes.push(n_pb);
-    }
-    let mut pb = fit_pseudobulks(&frozen, &pb_counts, knobs, seed, dev)?;
-    center_units(&mut pb, &frozen);
-
-    // The steady state, on the finest level.
-    let finest = cell_to_pb_per_level.last().context("no pseudobulk level")?;
-    let finest_offset: usize = level_sizes[..level_sizes.len() - 1].iter().sum();
-    let n_finest = *level_sizes.last().expect("a level");
-    let finest_rows = finest_offset..finest_offset + n_finest;
-    let steady = steady_anchor(
-        &frozen,
-        pb_tables.last().expect("a level"),
-        &pb_counts[finest_rows.clone()],
-        &pb,
-        finest_rows,
-    );
-
-    // Each cell's finest pseudobulk's displacement is its target and centre.
-    let mut target = DMatrix::<f32>::zeros(cells.len(), h);
-    for (c, &p) in finest.iter().enumerate() {
-        if p < n_finest {
-            target.row_mut(c).copy_from(&pb.d.row(finest_offset + p));
+    let fit = fit_ratio(&theta, &cells, frozen.b.len(), knobs, seed)?;
+    let anchor = steady_anchor(&theta, &frozen, &fit, &cells)?;
+    info!("Divergence — each cell's velocity in the base space");
+    let mut velocity = cell_velocity(&theta, &frozen, &fit, &anchor)?;
+    for (c, cell) in cells.iter().enumerate() {
+        if cell.is_empty() {
+            velocity.row_mut(c).fill(0.0);
         }
     }
-    let fit = fit_cells(&frozen, &cells, &target, &pb.delta, knobs, seed, dev)?;
-
-    // Split the stacked pseudobulk rows back per level.
-    let mut d_pb = Vec::new();
-    let mut kappa_pb = Vec::new();
-    let mut at = 0usize;
-    for &n in &level_sizes {
-        d_pb.push(pb.d.rows(at, n).into_owned());
-        kappa_pb.push(pb.kappa[at..at + n].to_vec());
-        at += n;
-    }
-    Ok(DisplacementOutput {
+    let log_gamma = fit.delta.iter().zip(&anchor).map(|(d, a)| d + a).collect();
+    Ok(DivergenceOutput {
         track_name: knobs.axis.track_name.clone(),
-        b_displaced: frozen.b.iter().zip(&pb.delta).map(|(b, d)| b + d).collect(),
-        b_base: frozen.b.clone(),
         genes: support,
-        steady_anchor: steady,
-        d_pb,
-        kappa_pb,
-        d_cell: fit.d,
+        ratio: fit.delta,
+        steady_anchor: anchor,
+        log_gamma,
+        loading: fit.eta,
         kappa_cell: fit.kappa,
-        cell_pb: finest
-            .iter()
-            .map(|&p| if p < n_finest { p as u32 } else { u32::MAX })
-            .collect(),
-        encoder: fit.encoder,
+        velocity_cell: velocity,
     })
 }
 
-/////////////
-// Helpers //
-/////////////
-
+/// `m` on `dev` as a contiguous row-major tensor (`to_tensor` alone gives a
+/// transposed view, which CUDA's matmul refuses).
 fn to_device(m: &DMatrix<f32>, dev: &Device) -> anyhow::Result<Tensor> {
-    let rows: Vec<f32> = m.transpose().as_slice().to_vec();
-    Ok(Tensor::from_vec(rows, (m.nrows(), m.ncols()), dev)?)
-}
-
-fn from_device(t: &Tensor) -> anyhow::Result<DMatrix<f32>> {
-    let (n, h) = t.dims2()?;
-    let v: Vec<f32> = t.flatten_all()?.to_vec1()?;
-    Ok(DMatrix::from_row_slice(n, h, &v))
+    Ok(m.to_tensor(dev)?.contiguous()?)
 }
 
 #[cfg(test)]

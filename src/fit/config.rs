@@ -109,10 +109,10 @@ pub struct FitConfig {
     /// membership layer ([`crate::model::FeatModules`]) that `pinto cage`
     /// trains directly; `fit()` never builds that layer.
     pub feature_modules: Option<FeatureModuleConfig>,
-    /// A count track learned as a displacement of the base counts (see
-    /// [`crate::fit::divergence`]): set from [`crate::fit::divergence::split_displaced`],
+    /// A second count track read against the base counts gene by gene (see
+    /// [`crate::fit::divergence`]): set from [`crate::fit::divergence::split_divergence`],
     /// which already cut the axis to the base rows.
-    pub displaced: Option<crate::fit::divergence::DisplacedTrackConfig>,
+    pub divergence: Option<crate::fit::divergence::DivergenceConfig>,
     /// Gene rows of the dictionary given before the fit (a `senna fne`
     /// embedding, say): phase 1 starts from them, and under `freeze` pins them
     /// and trains only the rest — the unit side, every bias, and the rows of
@@ -251,6 +251,6 @@ pub struct FitOutput {
     pub module_labels: Vec<u32>,
     /// Phase-1 cis gates (θ, γ, `w`) when [`FitConfig::cis_gates`] was set.
     pub cis_gates: Option<crate::fit::hier::CisGateReadout>,
-    /// The displaced track's fit, when [`FitConfig::displaced`] was set.
-    pub displacement: Option<crate::fit::divergence::DisplacementOutput>,
+    /// The divergent track's fit, when [`FitConfig::divergence`] was set.
+    pub divergence: Option<crate::fit::divergence::DivergenceOutput>,
 }

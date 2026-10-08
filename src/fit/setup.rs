@@ -46,8 +46,8 @@ pub(super) struct Pseudobulks {
 /// Project, collapse, and materialize the per-level pseudobulk views.
 ///
 /// The projection and the collapse read only the backend rows of the live feature
-/// axis. When the backend holds more rows than that axis (a displaced track split
-/// off it, see [`crate::fit::divergence::split_displaced`]), they run on a clone of
+/// axis. When the backend holds more rows than that axis (a divergent track split
+/// off it, see [`crate::fit::divergence::split_divergence`]), they run on a clone of
 /// the backend with the other rows masked out, so those rows cannot shape the
 /// pseudobulks the fit trains on.
 ///
