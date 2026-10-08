@@ -33,7 +33,7 @@ impl RowCollapse {
         Self { row_of, n_rows }
     }
 
-    /// The collapse of a one-track axis with per-row `module_only` flags and
+    /// The collapse of a feature axis with per-row `module_only` flags and
     /// module `labels`. Rows are numbered in order of first appearance.
     /// `None` when no row is module-only (nothing to collapse).
     pub fn from_modules(module_only: &[bool], labels: &[u32]) -> Option<Self> {

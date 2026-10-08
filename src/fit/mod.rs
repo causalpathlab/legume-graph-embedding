@@ -5,6 +5,7 @@
 mod axes;
 pub mod batch_fold;
 mod config;
+pub mod divergence;
 pub mod hier;
 mod models;
 pub mod module_args;
@@ -16,15 +17,13 @@ mod samplers;
 mod setup;
 
 pub use batch_fold::BatchGeneFold;
-pub use config::{
-    validate_offset_rank, FeatureModuleConfig, FitConfig, FitOutput, MultiomeOptions,
-    ParentModulesOwned, TrackInfo, TrackSpec,
-};
+pub use config::{FeatureModuleConfig, FitConfig, FitOutput, MultiomeOptions, ParentModulesOwned};
+pub use divergence::{split_divergence, DivergenceAxis, DivergenceConfig, DivergenceOutput};
 pub use hier::{CisCoupling, CisGateReadout, CisGates};
 pub use module_args::FeatureModuleArgs;
 pub use module_partition::{parent_module_logits, partition_modules};
 pub use pb_readout::{majority_batch_per_pb, PbLevelEmbedding};
-pub use projection::{CellEncoder, CellEncoders, TrackEncoder};
+pub use projection::CellEncoder;
 pub use resolve_embedding::{train_rest, RestConfig, RestTrainInputs, TrainedRest};
 
 use crate::data::{Triplet, UnifiedData};
@@ -44,9 +43,8 @@ pub use projection::{
 };
 
 /// Two-phase fit, shared by `senna bge` and `senna gem` through the same
-/// driver: multilevel-pseudobulk phase 1 over the feature axis (one track,
-/// or several when the caller names tracks), then per-cell phase 2 against
-/// the frozen dictionary.
+/// driver: multilevel-pseudobulk phase 1 over the feature axis (every row its
+/// own gene), then per-cell phase 2 against the frozen dictionary.
 ///
 /// The bilinear score is `E_feat[f]·E_cell[c] + b_feat[f] + b_cell[c]`; the
 /// per-cell bias `b_cell` absorbs library size.
@@ -75,41 +73,36 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     // Shared upstream: projection → pseudobulks //
     ///////////////////////////////////////////////
     let n_features = unified.n_features();
-    let feature_to_backend = unified.feature_to_backend_row.clone();
-    // Row structure of the feature axis: plain genes (every row its own gene)
-    // unless the caller named tracks. Validated HERE, before anything reads it:
-    // the projection below sketches on the base track's rows, so an unchecked
-    // spec would reach the collapse before the error did.
-    let tracks = config
-        .tracks
-        .clone()
-        .unwrap_or_else(|| TrackSpec::base(n_features));
-    tracks
-        .validate(n_features)
-        .context("the fit's track spec does not describe this feature axis")?;
-    let n_tracks = tracks.n_tracks();
-    let pb = setup::build_pseudobulks(unified, &config, &tracks)?;
+    let pb = setup::build_pseudobulks(unified, &config)?;
     let setup::Pseudobulks {
         collapsed_levels,
         cell_to_pb_per_level,
         blobs: pb_blobs,
+        collapse_row_of_feature,
+        batch_names: collapse_batch_names,
+        masked: collapse_masked,
     } = pb;
+    // The emitted collapse is read back against the backend's own row names,
+    // which a collapse on the live rows alone no longer matches.
+    anyhow::ensure!(
+        !(collapse_masked && config.emit_finest_collapse),
+        "the finest collapse cannot be emitted when the fit reads only part of the backend's \
+         rows (a split-off divergent track)"
+    );
     // Per-batch gene fold for phase 2, from the finest collapse's `δ`. The count
     // backend numbers batches by sorted name; the unified data by first appearance
     // — matched by name inside.
     let batch_gene_fold: Option<BatchGeneFold> =
         match collapsed_levels.last().and_then(|c| c.delta.as_ref()) {
             Some(delta) => {
-                let collapse_batch_names =
-                    unified.count_backend().batch_names().ok_or_else(|| {
-                        anyhow::anyhow!("collapse fit a δ but the backend has no batch names")
-                    })?;
+                let collapse_batch_names = collapse_batch_names.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("collapse fit a δ but registered no batch names")
+                })?;
                 batch_fold::batch_gene_fold(batch_fold::FoldSource {
                     delta: delta.posterior_mean(),
-                    collapse_batch_names: &collapse_batch_names,
+                    collapse_batch_names,
                     unified_batch_names: &unified.batch_names,
-                    n_features,
-                    feature_to_backend: &feature_to_backend,
+                    collapse_row_of_feature: &collapse_row_of_feature,
                 })?
             }
             None => None,
@@ -142,7 +135,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
             Some(adj) => adj.posterior_mean(),
             None => finest.mu_observed.posterior_mean(),
         };
-        setup::gather_to_unified_axis(pb_full, n_features, &feature_to_backend)
+        setup::gather_to_unified_axis(pb_full, &collapse_row_of_feature)
     };
     let models::Heads {
         mut cell_model,
@@ -183,13 +176,12 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     } else {
         Vec::new()
     };
-    let units = hier::UnitTable::from_pseudobulks_and_cells_tracked(
+    let units = hier::UnitTable::from_pseudobulks_and_cells(
         &blobs,
         &n_pb_per_level,
         &cell_rows,
         cell_fold,
         n_features,
-        tracks.clone(),
     );
     // Module labels: under `senna update`, seeded from the parent's membership
     // (the argmax of `parent_module_logits`, i.e. the partition `senna update`
@@ -205,7 +197,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         let cell_to_pb = cell_to_pb_per_level.last().expect("at least one level");
         let (counts, sizes) = finest.observed_counts(cell_to_pb)?;
         Ok((
-            setup::gather_to_unified_axis(&counts, n_features, &feature_to_backend),
+            setup::gather_to_unified_axis(&counts, &collapse_row_of_feature),
             sizes,
         ))
     };
@@ -218,10 +210,10 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         .feature_modules
         .as_ref()
         .and_then(|g| g.parent.as_ref());
-    // Module-only modalities: a multiome axis, one track, no parent partition,
-    // and a modality at least `module_only_min_rows` rows wide.
+    // Module-only modalities: a multiome axis, no parent partition, and a
+    // modality at least `module_only_min_rows` rows wide.
     let module_only_plan = match (unified.feature_modality.as_deref(), parent) {
-        (Some(modality), None) if tracks.is_base() => {
+        (Some(modality), None) => {
             module_partition::module_only_modalities(modality, config.module_only_min_rows)
                 .map(|flags| (modality, flags))
         }
@@ -281,12 +273,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         let n_bg = n_scattered
             + merge_module_only(
                 &mut module_only,
-                module_partition::flat_module_only(
-                    &counts,
-                    &sizes,
-                    &tracks,
-                    config.flat_module_only,
-                ),
+                module_partition::flat_module_only(&counts, &sizes, config.flat_module_only),
             );
         info!(
             "Phase 1 (hier) — modality-pure modules: {n_per:?} per modality, {n} in \
@@ -304,10 +291,6 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     } else {
         match parent {
             Some(parent) => {
-                anyhow::ensure!(
-                    tracks.is_base(),
-                    "module warm start from a parent needs a single-track feature axis"
-                );
                 anyhow::ensure!(
                     parent.mu.ncols() == h,
                     "parent modules are {}-dimensional but this fit uses H={h}",
@@ -328,17 +311,14 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
             None => {
                 let (counts, sizes) = finest_counts()?;
                 let labels = module_partition::partition_modules(
-                    &module_partition::base_track_profile(&counts, &tracks),
+                    &counts,
                     &sizes,
                     n_per_modality,
                     config.seed,
                 )?;
-                if let Some(flags) = module_partition::flat_module_only(
-                    &counts,
-                    &sizes,
-                    &tracks,
-                    config.flat_module_only,
-                ) {
+                if let Some(flags) =
+                    module_partition::flat_module_only(&counts, &sizes, config.flat_module_only)
+                {
                     module_only = vec![false; n_features];
                     merge_module_only(&mut module_only, Some(flags));
                 }
@@ -366,8 +346,6 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
             weight_decay: config.weight_decay as f32,
             unit_weight_decay: config.unit_weight_decay.unwrap_or(config.weight_decay) as f32,
             seed: config.seed,
-            offset_l2: config.offset_l2,
-            offset_rank: config.offset_rank,
             device: config.device.clone(),
             module_only: module_only.clone(),
             cis_gates: config.cis_gates.clone(),
@@ -375,7 +353,6 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
             background_modules,
         },
         config.preset_features.as_ref(),
-        &config.preset_offsets,
         &stop,
     )?;
     // The composed dictionary into the shared feature Vars; each level's
@@ -423,7 +400,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     }
     info!(
         "Phase 1 (hier) — done: loss/unit {:.4}; dictionary {} × {h} composed from {n_modules} \
-         modules over {n_tracks} track(s)",
+         modules",
         out.final_loss_per_unit, n_features
     );
 
@@ -514,7 +491,6 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
             &config.device,
             batch_fold,
             Some(&spec),
-            &tracks,
             // Module-only rows share their module's row: phase 2 runs on one
             // row per such module (`None` when there are none).
             RowCollapse::from_modules(&module_only, &labels).as_ref(),
@@ -535,6 +511,24 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         }
     }
 
+    // A divergent track, against the finished base tables in the cells' frame.
+    // Skipped on an interrupted fit: the cells were never placed.
+    let divergence = match &config.divergence {
+        Some(knobs) if !stop.load(std::sync::atomic::Ordering::Relaxed) => {
+            let e_feat = DMatrix::<f32>::from_tensor(&cell_model.e_feat)?;
+            let b_feat: Vec<f32> = cell_model.b_feat.flatten_all()?.to_vec1()?;
+            Some(divergence::fit_divergence(
+                unified,
+                knobs,
+                &cell_model.e_cell,
+                &e_feat,
+                &b_feat,
+                config.seed,
+            )?)
+        }
+        _ => None,
+    };
+
     Ok(FitOutput {
         batch_gene_fold,
         model: cell_model,
@@ -543,10 +537,9 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         cell_nrms: phase2.cell_nrms,
         pb_embeddings,
         cell_encoder: phase2.cell_encoder,
-        // One fitted intercept per NON-base track; empty on a one-track axis.
-        track_intercepts: phase2.other_intercepts,
         module_labels: out.labels,
         cis_gates: out.cis,
+        divergence,
     })
 }
 

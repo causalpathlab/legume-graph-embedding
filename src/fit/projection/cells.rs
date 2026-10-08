@@ -3,9 +3,8 @@
 //! block Poisson-MAP SGD ([`block_sgd`]).
 
 use super::block_sgd;
-use super::encoder::{self, CellEncoders, DistillSpec};
+use super::encoder::{self, CellEncoder, DistillSpec};
 use super::{CellBatchFold, RowCollapse};
-use crate::fit::config::TrackSpec;
 use crate::loss::PerBatchStratifiedCellSampler;
 use crate::model::JointEmbedModel;
 use legume_numeric::candle::candle_core::Device;
@@ -24,13 +23,9 @@ pub(crate) struct Phase2Result {
     /// in the as-trained (un-gauged) frame, so `fit()` shifts them by this mean
     /// before they leave in the cells' frame.
     pub theta_mean: Vec<f32>,
-    /// The distilled encoders that placed the cells, when `distill` was given;
-    /// `None` when the block SGD did. One per COUNT track — a one-track fit
-    /// holds exactly one, which is what `senna bge` persists.
-    pub cell_encoder: Option<CellEncoders>,
-    /// The fitted intercept of every NON-base track, `[T - 1][n_cells]`; empty on
-    /// a one-track feature axis. Track 0's is `b_cell`, stored on the model.
-    pub other_intercepts: Vec<Vec<f32>>,
+    /// The distilled encoder that placed the cells, when `distill` was given;
+    /// `None` when the block SGD did. This is what `senna bge` persists.
+    pub cell_encoder: Option<CellEncoder>,
 }
 
 /// Flatten the per-batch samplers into one `(cell_id, features, counts)` list,
@@ -91,7 +86,6 @@ pub(crate) fn project_cells_phase2(
     dev: &Device,
     batch_fold: Option<CellBatchFold>,
     distill: Option<&DistillSpec<'_>>,
-    tracks: &TrackSpec,
     collapse: Option<&RowCollapse>,
 ) -> anyhow::Result<Phase2Result> {
     use anyhow::Context;
@@ -135,19 +129,10 @@ pub(crate) fn project_cells_phase2(
     };
     let (out, cell_encoder) = match distill {
         Some(spec) => {
-            let (out, enc) =
-                encoder::project_cells(&input, &cells, batch_fold, spec, tracks, collapse)?;
+            let (out, enc) = encoder::project_cells(&input, &cells, batch_fold, spec, collapse)?;
             (out, Some(enc))
         }
         None => {
-            // The cold solve is one partition over the whole feature axis, so it
-            // has no per-track intercept to give. Refusing here is what keeps a
-            // multi-track fit from silently losing them.
-            anyhow::ensure!(
-                tracks.is_base(),
-                "phase 2: the cold block SGD is single-partition — a multi-track \
-                 feature axis needs the distilled encoder path"
-            );
             anyhow::ensure!(
                 collapse.is_none(),
                 "phase 2: a collapsed feature axis needs the distilled encoder path"
@@ -173,12 +158,10 @@ pub(crate) fn project_cells_phase2(
         let shift: f32 = e_f.iter().zip(tm).map(|(e, m)| e * m).sum();
         *b += shift;
     }
-    // The persisted encoders place predict-time cells; give EVERY track's the
-    // same gauge so a query and the run's cells share one frame (the combined
-    // placement is a mean of them, so a shift missed on one track would move a
-    // cell by a fraction of θ̄).
-    if let Some(encs) = cell_encoder.as_ref() {
-        encs.shift_output(tm)?;
+    // The persisted encoder places predict-time cells; give it the same gauge
+    // so a query and the run's cells share one frame.
+    if let Some(enc) = cell_encoder.as_ref() {
+        enc.shift_output(tm)?;
     }
     let b_feat_t = Tensor::from_vec(b_feat, n_features, dev)?;
     {
@@ -212,7 +195,6 @@ pub(crate) fn project_cells_phase2(
         cell_nrms,
         theta_mean: out.gauge.theta_mean,
         cell_encoder,
-        other_intercepts: out.other_intercepts,
     })
 }
 

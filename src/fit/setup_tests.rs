@@ -1,117 +1,133 @@
 use super::*;
-use crate::fit::config::{TrackInfo, TrackSpec};
-use data_beans::sparse_io::{create_sparse_from_triplets, SparseIoBackend};
-use data_beans::sparse_io_vector::SparseIoVec;
+use crate::data::{load_unified_data, LoadUnifiedArgs};
+use data_beans::sparse_io::{create_sparse_from_dmatrix, SparseIoBackend};
 
-/// `rows × 4` planted counts; row `r` of the returned backend holds
-/// `triplets` entries whose row index is `rows_kept[r]` in the full layout, so
-/// the two constructions below hold the SAME numbers in the same row order.
-fn backend(rows: usize, rows_kept: &[usize]) -> SparseIoVec {
-    let value = |r: usize, c: usize| (1 + (r * 7 + c * 3) % 11) as f32;
-    let mut triplets: Vec<(u64, u64, f32)> = Vec::new();
-    for (new_r, &old_r) in rows_kept.iter().enumerate() {
-        for c in 0..4usize {
-            triplets.push((new_r as u64, c as u64, value(old_r, c)));
-        }
-    }
-    let shape = (rows, 4usize, triplets.len());
-    let mut b = create_sparse_from_triplets(&triplets, shape, None, Some(&SparseIoBackend::Zarr))
-        .expect("backend");
-    b.register_row_names_vec(
-        &(0..rows)
-            .map(|r| format!("r{r}").into_boxed_str())
-            .collect::<Vec<_>>(),
-    );
-    b.register_column_names_vec(
-        &(0..4)
-            .map(|c| format!("c{c}").into_boxed_str())
-            .collect::<Vec<_>>(),
-    );
-    let mut v = SparseIoVec::new();
-    v.push(std::sync::Arc::from(b), None).expect("push");
-    v
+const CELLS: usize = 240;
+const GENES: usize = 30;
+
+/// Base rows: four cell groups, each with its own block of high genes.
+fn base_counts() -> DMatrix<f32> {
+    DMatrix::from_fn(GENES, CELLS, |g, c| {
+        let group = c % 4;
+        let high = g * 4 / GENES == group;
+        (1 + (c * 7 + g * 13) % 3) as f32 + if high { 12.0 } else { 0.0 }
+    })
 }
 
-/// Six feature rows over three genes: rows 0..3 on the base track, rows 3..6 on
-/// a second track.
-fn two_track_spec() -> TrackSpec {
-    TrackSpec {
-        track_of_row: vec![0, 0, 0, 1, 1, 1],
-        gene_of_row: vec![0, 1, 2, 0, 1, 2],
-        tracks: vec![
-            TrackInfo {
-                name: "t0".into(),
-                is_count: true,
-            },
-            TrackInfo {
-                name: "t1".into(),
-                is_count: true,
-            },
-        ],
-    }
+/// Extra rows with a different, deeper pattern: high on every other cell.
+fn extra_counts() -> DMatrix<f32> {
+    DMatrix::from_fn(GENES, CELLS, |g, c| {
+        let high = (c / 2 + g) % 2 == 0;
+        (1 + (c * 5 + g * 3) % 4) as f32 + if high { 60.0 } else { 0.0 }
+    })
 }
 
-#[test]
-fn a_one_track_axis_masks_nothing() {
-    assert!(base_track_row_mask(&TrackSpec::base(6), &(0..6).collect::<Vec<_>>(), 6).is_none());
-}
-
-#[test]
-fn the_row_mask_keeps_the_base_tracks_backend_rows() {
-    // A feature axis narrowed by an earlier pass: unified feature `i` lives on
-    // backend row `2 * i`.
-    let f2b: Vec<usize> = (0..6).map(|i| i * 2).collect();
-    let keep = base_track_row_mask(&two_track_spec(), &f2b, 12).expect("two tracks ⇒ a mask");
-    let kept: Vec<usize> = keep
-        .iter()
-        .enumerate()
-        .filter(|&(_, &k)| k)
-        .map(|(i, _)| i)
+fn write_backend(dir: &std::path::Path, stem: &str, counts: &DMatrix<f32>) -> Box<str> {
+    let path: Box<str> = dir
+        .join(format!("{stem}.zarr"))
+        .to_string_lossy()
+        .into_owned()
+        .into();
+    let mut b = create_sparse_from_dmatrix(counts, Some(&path), Some(&SparseIoBackend::Zarr))
+        .expect("create backend");
+    let rows: Vec<Box<str>> = (0..counts.nrows())
+        .map(|r| format!("GENE{r}").into())
         .collect();
-    assert_eq!(kept, vec![0, 2, 4]);
+    let cols: Vec<Box<str>> = (0..counts.ncols())
+        .map(|c| format!("C{c}").into())
+        .collect();
+    b.register_row_names_vec(&rows);
+    b.register_column_names_vec(&cols);
+    path
+}
+
+fn load(path: Box<str>) -> UnifiedData {
+    load_unified_data(LoadUnifiedArgs {
+        data_files: vec![path],
+        preload: true,
+        ..Default::default()
+    })
+    .expect("load")
+}
+
+fn config() -> FitConfig {
+    FitConfig {
+        embedding_dim: 4,
+        anchor_batches: None,
+        bulk_batches: None,
+        emit_finest_collapse: false,
+        num_levels: 2,
+        sort_dim: 4,
+        knn_pb_samples: 5,
+        num_opt_iter: 5,
+        proj_dim: 8,
+        epochs: 1,
+        batches_per_epoch: None,
+        batch_size: 64,
+        learning_rate: 0.01,
+        seed: 3,
+        device: legume_numeric::candle::candle_core::Device::Cpu,
+        block_size: None,
+        hvg_weights: None,
+        refine: data_beans::alg::refine_multilevel::RefineParams::default(),
+        weight_decay: 0.0,
+        unit_weight_decay: None,
+        phase1_cells_per_pb: 0,
+        hier_units_per_step: 64,
+        hier_modules_per_unit: 2,
+        module_only_min_rows: 0,
+        feature_modules: None,
+        divergence: None,
+        preset_features: None,
+        strata: None,
+        cis_gates: None,
+        flat_module_only: false,
+        multiome: None,
+    }
+}
+
+/// The pseudobulks the fit trains on depend on the live rows alone: a backend
+/// that also holds rows the axis was cut away from (a split-off divergent
+/// track) gives the same partition and the same pseudobulk counts as a
+/// backend holding only the live rows.
+#[test]
+fn rows_outside_the_live_axis_do_not_shape_the_pseudobulks() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = base_counts();
+    let mut both = DMatrix::<f32>::zeros(2 * GENES, CELLS);
+    both.rows_mut(0, GENES).copy_from(&base);
+    both.rows_mut(GENES, GENES).copy_from(&extra_counts());
+
+    let mut alone = load(write_backend(dir.path(), "alone", &base));
+    let mut wide = load(write_backend(dir.path(), "wide", &both));
+    wide.subset_features(&(0..GENES).collect::<Vec<_>>());
+    assert_eq!(wide.count_backend().num_rows(), 2 * GENES);
+
+    let a = build_pseudobulks(&mut alone, &config()).unwrap();
+    let b = build_pseudobulks(&mut wide, &config()).unwrap();
+    assert!(!a.masked);
+    assert!(b.masked, "the wide backend is read through its live rows");
+    assert_eq!(b.collapse_row_of_feature, (0..GENES).collect::<Vec<_>>());
+    assert_eq!(a.cell_to_pb_per_level, b.cell_to_pb_per_level);
+    for (la, lb) in a.collapsed_levels.iter().zip(&b.collapsed_levels) {
+        let ma =
+            gather_to_unified_axis(la.mu_observed.posterior_mean(), &a.collapse_row_of_feature);
+        let mb =
+            gather_to_unified_axis(lb.mu_observed.posterior_mean(), &b.collapse_row_of_feature);
+        assert_eq!(ma.shape(), mb.shape());
+        assert!(
+            ma.iter()
+                .zip(mb.iter())
+                .all(|(x, y)| (x - y).abs() <= 1e-5 * (1.0 + x.abs())),
+            "pseudobulk counts differ"
+        );
+    }
 }
 
 #[test]
-fn weights_follow_the_rows_they_belong_to() {
-    let w = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
-    let keep = vec![false, true, true, false, true];
-    assert_eq!(subset_kept(&w, &keep), vec![2.0, 3.0, 5.0]);
-}
-
-/// The projection that seeds the collapse must see the base track alone, so a
-/// row-masked clone of a two-track backend has to sketch exactly like a backend
-/// that only ever held those rows.
-#[test]
-fn the_masked_sketch_equals_a_base_only_backends_sketch() {
-    let full = backend(6, &[0, 1, 2, 3, 4, 5]);
-    let base_only = backend(3, &[0, 1, 2]);
-    let keep = base_track_row_mask(&two_track_spec(), &(0..6).collect::<Vec<_>>(), 6)
-        .expect("two tracks ⇒ a mask");
-    let mut view = full.clone_for_collapse();
-    view.mask_rows(&keep).expect("mask");
-    assert_eq!(view.num_rows(), 3);
-
-    let none: Option<&[Box<str>]> = None;
-    let masked = project_backend(&view, 3, None, none, None, 1234).expect("masked sketch");
-    let direct = project_backend(&base_only, 3, None, none, None, 1234).expect("base sketch");
-    assert_eq!(masked.proj.shape(), direct.proj.shape());
-    for (a, b) in masked.proj.iter().zip(direct.proj.iter()) {
-        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
-    }
-
-    // The same, weighted: the weights are subset to the kept rows in order.
-    let w_full = vec![1.0f32, 0.0, 2.0, 9.0, 9.0, 9.0];
-    let w_base = subset_kept(&w_full, &keep);
-    assert_eq!(w_base, vec![1.0, 0.0, 2.0]);
-    let masked_w = project_backend(&view, 3, None, none, Some(&w_base), 1234).expect("masked");
-    let direct_w = project_backend(&base_only, 3, None, none, Some(&w_base), 1234).expect("base");
-    for (a, b) in masked_w.proj.iter().zip(direct_w.proj.iter()) {
-        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
-    }
-    // …and the weights actually bite: dropping a row changes the sketch.
-    assert!(masked_w
-        .proj
-        .iter()
-        .zip(masked.proj.iter())
-        .any(|(a, b)| (a - b).abs() > 1e-6));
+fn gather_reads_each_features_row() {
+    let rows = DMatrix::from_row_slice(3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let out = gather_to_unified_axis(&rows, &[2, 0]);
+    assert_eq!(out, DMatrix::from_row_slice(2, 2, &[5.0, 6.0, 1.0, 2.0]));
+    assert_eq!(gather_to_unified_axis(&rows, &[0, 1, 2]), rows);
 }

@@ -9,39 +9,11 @@
 //! term rewards putting every feature in the module that already scores well —
 //! so the partition comes from the data and does not move during training.
 
-use super::config::{ParentModulesOwned, TrackSpec};
+use super::config::ParentModulesOwned;
 use data_beans::alg::feature_coarsening::{coarsen_features, partition_features, PartitionOptions};
 use legume_numeric::matrix::rand_util::mix_seed;
 use log::info;
 use nalgebra::DMatrix;
-
-/// The base track's rows of a `[n_features × S]` profile, re-keyed by gene:
-/// `[n_genes × S]`. The module partition is over GENES, so a multi-track
-/// feature axis is reduced to its base track before clustering — the base track
-/// is the one the model itself is; every other track is an offset from it. A
-/// gene with no base row (never observed on the base track) keeps a zero
-/// profile row, which the warm start already routes to its background module.
-/// Identity on a one-track axis, where row IS gene.
-#[must_use]
-pub fn base_track_profile(profile: &DMatrix<f32>, tracks: &TrackSpec) -> DMatrix<f32> {
-    debug_assert_eq!(
-        profile.nrows(),
-        tracks.track_of_row.len(),
-        "the profile and the track spec describe the same feature axis"
-    );
-    let mut out = DMatrix::<f32>::zeros(tracks.n_genes(), profile.ncols());
-    for (row, (&t, &g)) in tracks
-        .track_of_row
-        .iter()
-        .zip(&tracks.gene_of_row)
-        .enumerate()
-    {
-        if t == 0 {
-            out.set_row(g as usize, &profile.row(row));
-        }
-    }
-    out
-}
 
 /// The module partition: a single-level [`coarsen_features`] at `n_modules`,
 /// one module id (`< n_modules`) per feature.
@@ -134,16 +106,10 @@ pub fn module_only_modalities(modality: &[u32], min_rows: usize) -> Option<Vec<b
 /// Poisson test ignores overdispersion and calls almost every feature
 /// non-flat.
 ///
-/// Opt-in (`enabled`), and `None` on a multi-track axis: module-only rows need
-/// one track, and there the partition is over genes rather than rows.
+/// Opt-in: `None` unless `enabled`.
 #[must_use]
-pub fn flat_module_only(
-    counts: &DMatrix<f32>,
-    sizes: &[f32],
-    tracks: &TrackSpec,
-    enabled: bool,
-) -> Option<Vec<bool>> {
-    if !enabled || !tracks.is_base() {
+pub fn flat_module_only(counts: &DMatrix<f32>, sizes: &[f32], enabled: bool) -> Option<Vec<bool>> {
+    if !enabled {
         return None;
     }
     let informative = data_beans::alg::feature_coarsening::informative_features(counts, sizes);

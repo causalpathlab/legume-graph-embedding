@@ -21,8 +21,7 @@ fn maps_collapse_batches_by_name_not_by_column() {
         delta: &delta,
         collapse_batch_names: &names(&["early", "late"]),
         unified_batch_names: &names(&["late", "early"]),
-        n_features: 3,
-        feature_to_backend: &[0, 1, 2],
+        collapse_row_of_feature: &[0, 1, 2],
     })
     .unwrap()
     .expect("two batches ⇒ a fold");
@@ -32,8 +31,8 @@ fn maps_collapse_batches_by_name_not_by_column() {
     assert_close(off.row(1), &[1.0, 2.0, 4.0]);
 }
 
-/// Backend rows are gathered onto the unified feature axis through
-/// `feature_to_backend`, like every other collapse table.
+/// Collapse rows are gathered onto the unified feature axis through
+/// `collapse_row_of_feature`, like every other collapse table.
 #[test]
 fn gathers_rows_onto_the_unified_feature_axis() {
     let delta = DMatrix::from_row_slice(4, 2, &[1.0, 1.0, 2.0, 3.0, 1.0, 1.0, 4.0, 5.0]);
@@ -41,8 +40,7 @@ fn gathers_rows_onto_the_unified_feature_axis() {
         delta: &delta,
         collapse_batch_names: &names(&["a", "b"]),
         unified_batch_names: &names(&["a", "b"]),
-        n_features: 2,
-        feature_to_backend: &[3, 1],
+        collapse_row_of_feature: &[3, 1],
     })
     .unwrap()
     .unwrap();
@@ -58,8 +56,7 @@ fn one_batch_yields_no_fold() {
         delta: &delta,
         collapse_batch_names: &names(&["only"]),
         unified_batch_names: &names(&["only"]),
-        n_features: 2,
-        feature_to_backend: &[0, 1],
+        collapse_row_of_feature: &[0, 1],
     })
     .unwrap();
     assert!(off.is_none());
@@ -72,8 +69,7 @@ fn unified_batch_missing_from_the_collapse_is_an_error() {
         delta: &delta,
         collapse_batch_names: &names(&["a", "b"]),
         unified_batch_names: &names(&["a", "c"]),
-        n_features: 2,
-        feature_to_backend: &[0, 1],
+        collapse_row_of_feature: &[0, 1],
     })
     .expect_err("unknown batch must fail");
     assert!(err.to_string().contains('c'), "{err}");
@@ -86,8 +82,7 @@ fn nonpositive_delta_is_floored() {
         delta: &delta,
         collapse_batch_names: &names(&["a", "b"]),
         unified_batch_names: &names(&["a", "b"]),
-        n_features: 2,
-        feature_to_backend: &[0, 1],
+        collapse_row_of_feature: &[0, 1],
     })
     .unwrap()
     .unwrap();

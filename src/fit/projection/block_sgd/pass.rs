@@ -233,13 +233,8 @@ pub(super) struct PassSpec<'a> {
 /// One pass's per-cell result, indexed by position in `cells` (not by global id).
 pub(crate) struct PassOut {
     pub(crate) latent: Vec<f32>,
-    /// The base track's per-cell intercept — the only one a single-partition pass
-    /// has, and track 0's on a multi-track axis.
+    /// The per-cell intercept.
     pub(crate) intercept: Vec<f32>,
-    /// Tracks `1..T`, one `[n_kept]` intercept vector each; **empty** on every
-    /// single-partition pass (this one included — see
-    /// [`super::tracks`] for the pass that fills it).
-    pub(crate) other_intercepts: Vec<Vec<f32>>,
 }
 
 pub(super) fn run_pass(
@@ -301,11 +296,7 @@ pub(super) fn run_pass(
             String::new()
         },
     );
-    Ok(PassOut {
-        latent,
-        intercept,
-        other_intercepts: Vec::new(),
-    })
+    Ok(PassOut { latent, intercept })
 }
 
 //////////////////////////////////
@@ -320,10 +311,7 @@ pub(super) fn run_pass(
 /// step_size = lr · √(1 − β₂^t) / (1 − β₁^t),   t = step + 1
 /// ```
 ///
-/// The decay lets a block settle instead of dithering around the optimum. Shared
-/// by [`super::solve`] and [`super::tracks`] because a schedule re-typed in two
-/// loops is a schedule that drifts, and a one-track axis never runs the second
-/// one — nothing would catch it. Scalar only: the loop bodies stay apart.
+/// The decay lets a block settle instead of dithering around the optimum.
 pub(super) fn adam_step_size(lr0: f64, step: usize, max_steps: usize) -> f64 {
     let frac = step as f64 / max_steps as f64;
     let lr = lr0 * (1.0 - frac * (1.0 - LR_FLOOR_FRAC));
@@ -365,10 +353,8 @@ pub(super) struct PassStats {
 }
 
 impl PassStats {
-    /// Fold one finished block's report in. The per-track solve
-    /// ([`super::tracks`]) returns its own block type, so this takes the numbers
-    /// rather than a `BlockOut` — one place that decides what "a block hit the
-    /// cap" and "an edge's share of the deviance" mean, for both loops.
+    /// Fold one finished block's report in — the one place that decides what "a
+    /// block hit the cap" and "an edge's share of the deviance" mean.
     pub(super) fn fold(
         &mut self,
         steps: usize,

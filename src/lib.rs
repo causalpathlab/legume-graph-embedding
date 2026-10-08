@@ -51,16 +51,16 @@ pub use eval::{
 };
 pub use feature_qc::{hvg_feature_qc, FeatureQcConfig, FeatureQcResult};
 pub use fit::{
-    fit, partition_modules, validate_offset_rank, CellEncoders, CisCoupling, CisGateReadout,
-    CisGates, FeatureModuleArgs, FeatureModuleConfig, FitConfig, FitOutput, MultiomeOptions,
-    ParentModulesOwned, TrackEncoder, TrackInfo, TrackSpec,
+    fit, partition_modules, split_divergence, CellEncoder, CisCoupling, CisGateReadout, CisGates,
+    DivergenceAxis, DivergenceConfig, DivergenceOutput, FeatureModuleArgs, FeatureModuleConfig,
+    FitConfig, FitOutput, MultiomeOptions, ParentModulesOwned,
 };
 pub use model::JointEmbedModel;
 pub use multiome_plan::{
     detect_multiome_plan, plan_from_axes, read_file_axes, FileAxes, MultiomePlan,
 };
 pub use postprocess::{cell_clusters, feature_coembedding, feature_coembedding_fixed_t};
-pub use preset_mode::{LoraArgs, LoraSpec, PresetMode, PresetOffsets, PresetRows};
+pub use preset_mode::{LoraArgs, LoraSpec, PresetMode, PresetRows};
 
 /// Graceful-stop on Ctrl+C. Lives in `legume_numeric::matrix` so the annotation crates *below* this one
 /// (`enrichment`, which owns the raw-count marker bootstrap) can share the same flag and the same

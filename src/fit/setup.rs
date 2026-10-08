@@ -6,7 +6,7 @@
 //! cells into the collapse, and the collapse exists only to produce these blobs. None
 //! of it touches a model, a Var or an optimizer.
 
-use super::config::{FitConfig, TrackSpec};
+use super::config::FitConfig;
 use crate::data::UnifiedData;
 use data_beans::alg::collapse_data::{
     collapse_columns_multilevel_with_hierarchy, MultilevelParams,
@@ -31,12 +31,25 @@ pub(super) struct Pseudobulks {
     pub cell_to_pb_per_level: Vec<Vec<usize>>,
     /// One `UnifiedData` per level, on the unified feature axis.
     pub blobs: Vec<UnifiedData>,
+    /// Feature → row of the collapse's per-row outputs (`mu_*`, `delta`,
+    /// `observed_counts`). The backend row itself when the collapse read the
+    /// whole backend; the row's rank among the live rows when it read only
+    /// those (see [`build_pseudobulks`]).
+    pub collapse_row_of_feature: Vec<usize>,
+    /// The batch names the collapse registered, in the order of its `delta`
+    /// columns; `None` when it registered none.
+    pub batch_names: Option<Vec<Box<str>>>,
+    /// Whether the collapse read only the live feature rows of a wider backend.
+    pub masked: bool,
 }
 
 /// Project, collapse, and materialize the per-level pseudobulk views.
 ///
-/// `tracks` is the fit's already-validated feature-axis structure (`fit` builds and
-/// checks it before calling): the projection sketches on its base track's rows.
+/// The projection and the collapse read only the backend rows of the live feature
+/// axis. When the backend holds more rows than that axis (a divergent track split
+/// off it, see [`crate::fit::divergence::split_divergence`]), they run on a clone of
+/// the backend with the other rows masked out, so those rows cannot shape the
+/// pseudobulks the fit trains on.
 ///
 /// `sort_dim` controls how many bits of the binary-sketched projection are used to hash
 /// cells into the *finest* pb-sample partition, so `2^sort_dim` bounds the number of
@@ -45,20 +58,65 @@ pub(super) struct Pseudobulks {
 pub(super) fn build_pseudobulks(
     unified: &mut UnifiedData,
     config: &FitConfig,
-    tracks: &TrackSpec,
 ) -> anyhow::Result<Pseudobulks> {
     let n_features = unified.n_features();
-    let feature_to_backend = unified.feature_to_backend_row.clone();
     let batch_labels: Vec<Box<str>> = unified.batch_labels();
+    let n_batches = unified.n_batches();
+    let backend_rows = unified.count_backend().num_rows();
+    let mut keep = vec![false; backend_rows];
+    for &brow in &unified.feature_to_backend_row {
+        keep[brow] = true;
+    }
+    let masked = keep.iter().any(|&k| !k);
+    // The live rows, renumbered compactly in backend order: what a masked
+    // backend calls them.
+    let collapse_row_of_feature: Vec<usize> = if masked {
+        let mut rank = vec![usize::MAX; backend_rows];
+        let mut next = 0usize;
+        for (brow, &k) in keep.iter().enumerate() {
+            if k {
+                rank[brow] = next;
+                next += 1;
+            }
+        }
+        unified
+            .feature_to_backend_row
+            .iter()
+            .map(|&brow| rank[brow])
+            .collect()
+    } else {
+        unified.feature_to_backend_row.clone()
+    };
+    let mut live_view = if masked {
+        info!(
+            "Projection and collapse on the {} live of {backend_rows} backend rows",
+            n_features
+        );
+        let mut view = unified.count_backend().clone_for_collapse();
+        view.mask_rows(&keep)?;
+        Some(view)
+    } else {
+        None
+    };
+    let backend: &mut SparseIoVec = match live_view.as_mut() {
+        Some(view) => view,
+        None => unified.count_backend_mut(),
+    };
 
-    let proj_out = project(unified, config, &batch_labels, tracks)?;
+    let proj_out = project(
+        backend,
+        config,
+        &batch_labels,
+        n_batches,
+        &collapse_row_of_feature,
+    )?;
 
     info!(
         "Multilevel collapse (sort_dim={}, {} levels requested)...",
         config.sort_dim, config.num_levels
     );
     let collapse_out = collapse_columns_multilevel_with_hierarchy(
-        unified.count_backend_mut(),
+        backend,
         &proj_out.proj,
         &batch_labels,
         &MultilevelParams {
@@ -82,6 +140,7 @@ pub(super) fn build_pseudobulks(
             strata: config.strata.clone(),
         },
     )?;
+    let batch_names = backend.batch_names();
     let mut collapsed_levels = collapse_out.levels;
     let mut cell_to_pb_per_level = collapse_out.cell_to_pb_per_level;
     // The collapse emits finest-first. Reverse both so levels run coarsest..finest —
@@ -89,16 +148,14 @@ pub(super) fn build_pseudobulks(
     collapsed_levels.reverse();
     cell_to_pb_per_level.reverse();
 
-    // pb counts live on the unified feature axis. When the backend holds more rows than
-    // that axis — an HVG mask having narrowed `unified.feature_names`, say — gather the
-    // unified rows out of the backend's pb matrix; otherwise reuse it as-is.
+    // pb counts live on the unified feature axis: gather each feature's collapse row.
     let mut blobs: Vec<UnifiedData> = Vec::with_capacity(collapsed_levels.len());
     for collapsed in &collapsed_levels {
         let pb_full: &DMatrix<f32> = match &collapsed.mu_adjusted {
             Some(adj) => adj.posterior_mean(),
             None => collapsed.mu_observed.posterior_mean(),
         };
-        let pb_count_ds = gather_to_unified_axis(pb_full, n_features, &feature_to_backend);
+        let pb_count_ds = gather_to_unified_axis(pb_full, &collapse_row_of_feature);
         blobs.push(UnifiedData::from_pseudobulks(
             &pb_count_ds,
             unified.feature_names.clone(),
@@ -113,120 +170,59 @@ pub(super) fn build_pseudobulks(
         collapsed_levels,
         cell_to_pb_per_level,
         blobs,
+        collapse_row_of_feature,
+        batch_names,
+        masked,
     })
 }
 
-/// The batch-corrected random projection the collapse hashes on, HVG-weighted when the
-/// caller supplied weights.
-///
-/// On a multi-track feature axis the sketch runs on the BASE track's rows alone: the
-/// other tracks are offsets from the base model, not independent measurements, and a
-/// sketch that stacked them would hash cells partly on the offsets' own scale. The
-/// collapse itself still runs on the FULL backend with this sketch, so refinement,
-/// `mu_adjusted` and `δ` cover every row. One track ⇒ no mask, no clone, the previous
-/// call.
+/// The batch-corrected random projection the collapse hashes on, over `backend`
+/// (the rows the collapse reads), HVG-weighted when the caller supplied weights.
+/// `collapse_row_of_feature` places each feature's weight on its backend row; rows
+/// no feature maps to get 0 and sit out the projection basis.
 fn project(
-    unified: &UnifiedData,
+    backend: &SparseIoVec,
     config: &FitConfig,
     batch_labels: &[Box<str>],
-    tracks: &TrackSpec,
+    n_batches: usize,
+    collapse_row_of_feature: &[usize],
 ) -> anyhow::Result<data_beans::alg::random_projection::RandColProjOut> {
     info!(
         "Batch-corrected projection (proj_dim={}, {} batches)...",
-        config.proj_dim,
-        unified.n_batches()
+        config.proj_dim, n_batches
     );
-    let batch_arg = (unified.n_batches() > 1).then_some(batch_labels);
-    let backend = unified.count_backend();
-    // The projection runs on the full backend row axis, which may be wider than the
-    // compact feature axis when a prior pass dropped features (e.g. the two-pass null-QC
-    // refine in `senna bge`). Scatter the compact weights to backend rows; rows not in
-    // the current feature axis get 0 so they sit out the projection basis. Identity —
-    // and a no-op — when no subset has happened.
+    let batch_arg = (n_batches > 1).then_some(batch_labels);
     let backend_w: Option<Vec<f32>> = match config.hvg_weights.as_deref() {
         None => None,
         Some(w) => {
             anyhow::ensure!(
-                w.len() == unified.n_features(),
+                w.len() == collapse_row_of_feature.len(),
                 "hvg_weights length {} != n_features {} (the HVG mask must be aligned to the \
                  unified feature axis BEFORE any subset/coarsening — pass full-axis weights from \
                  the wrapper)",
                 w.len(),
-                unified.n_features()
+                collapse_row_of_feature.len()
             );
             info!(
                 "HVG-weighted projection: {} weighted features (>= 1.0)",
                 w.iter().filter(|&&x| x > 0.0).count()
             );
             let mut backend_w = vec![0.0f32; backend.num_rows()];
-            for (compact_i, &brow) in unified.feature_to_backend_row.iter().enumerate() {
-                backend_w[brow] = w[compact_i];
+            for (feature, &row) in collapse_row_of_feature.iter().enumerate() {
+                backend_w[row] = w[feature];
             }
             Some(backend_w)
         }
     };
 
-    let keep = base_track_row_mask(tracks, &unified.feature_to_backend_row, backend.num_rows());
-    let Some(keep) = keep else {
-        return project_backend(
-            backend,
-            config.proj_dim,
-            config.block_size,
-            batch_arg,
-            backend_w.as_deref(),
-            config.seed,
-        );
-    };
-    info!(
-        "Multi-track feature axis: sketching on the base track's {} of {} backend rows",
-        keep.iter().filter(|&&k| k).count(),
-        keep.len()
-    );
-    let mut view = backend.clone_for_collapse();
-    view.mask_rows(&keep)?;
-    // `mask_rows` RENUMBERS the kept rows compactly, so the weight vector has to be
-    // subset the same way — a full-axis vector would misalign every row.
-    let view_w = backend_w.map(|w| subset_kept(&w, &keep));
     project_backend(
-        &view,
+        backend,
         config.proj_dim,
         config.block_size,
         batch_arg,
-        view_w.as_deref(),
+        backend_w.as_deref(),
         config.seed,
     )
-}
-
-/// Which backend rows the sketch reads: the base track's, or `None` when the feature
-/// axis is a single track and there is nothing to mask.
-fn base_track_row_mask(
-    tracks: &TrackSpec,
-    feature_to_backend: &[usize],
-    backend_rows: usize,
-) -> Option<Vec<bool>> {
-    if tracks.n_tracks() <= 1 {
-        return None;
-    }
-    let mut keep = vec![false; backend_rows];
-    for (feature, &t) in tracks.track_of_row.iter().enumerate() {
-        if t == 0 {
-            if let Some(&brow) = feature_to_backend.get(feature) {
-                keep[brow] = true;
-            }
-        }
-    }
-    Some(keep)
-}
-
-/// `values` restricted to the `keep`ed positions, in the same order — the order
-/// [`SparseIoVec::mask_rows`] renumbers them into.
-fn subset_kept(values: &[f32], keep: &[bool]) -> Vec<f32> {
-    values
-        .iter()
-        .zip(keep)
-        .filter(|&(_, &k)| k)
-        .map(|(&v, _)| v)
-        .collect()
 }
 
 /// One random projection over `backend`, weighted when `row_weights` is given (length =
@@ -251,21 +247,23 @@ where
     }
 }
 
-/// Gather a backend-row matrix onto the compact unified feature axis. A clone when the
-/// two already agree, which is every run without a feature subset.
+/// Gather a collapse-row matrix onto the unified feature axis: row `f` of the result
+/// is row `row_of_feature[f]` of `rows`. A clone when the map is the identity, which
+/// is every run without a feature subset.
 pub(super) fn gather_to_unified_axis(
-    backend: &DMatrix<f32>,
-    n_features: usize,
-    feature_to_backend: &[usize],
+    rows: &DMatrix<f32>,
+    row_of_feature: &[usize],
 ) -> DMatrix<f32> {
-    if backend.nrows() == n_features {
-        return backend.clone();
+    let identity = rows.nrows() == row_of_feature.len()
+        && row_of_feature.iter().enumerate().all(|(f, &r)| f == r);
+    if identity {
+        return rows.clone();
     }
-    let cols = backend.ncols();
-    let mut out = DMatrix::<f32>::zeros(n_features, cols);
-    for (new_i, &old_i) in feature_to_backend.iter().enumerate() {
+    let cols = rows.ncols();
+    let mut out = DMatrix::<f32>::zeros(row_of_feature.len(), cols);
+    for (f, &r) in row_of_feature.iter().enumerate() {
         for s in 0..cols {
-            out[(new_i, s)] = backend[(old_i, s)];
+            out[(f, s)] = rows[(r, s)];
         }
     }
     out
@@ -273,4 +271,4 @@ pub(super) fn gather_to_unified_axis(
 
 #[cfg(test)]
 #[path = "setup_tests.rs"]
-mod setup_tests;
+mod tests;

@@ -62,15 +62,14 @@ impl BatchGeneFold {
 
 /// What [`batch_gene_fold`] reads.
 pub(crate) struct FoldSource<'a> {
-    /// The collapse's `δ` posterior mean, `[backend_rows × collapse_batches]`.
+    /// The collapse's `δ` posterior mean, `[collapse_rows × collapse_batches]`.
     pub delta: &'a DMatrix<f32>,
     /// The collapse's batch names, in `delta`'s column order.
     pub collapse_batch_names: &'a [Box<str>],
     /// Unified batch names, in unified batch-id order.
     pub unified_batch_names: &'a [Box<str>],
-    pub n_features: usize,
-    /// Unified feature → backend row.
-    pub feature_to_backend: &'a [usize],
+    /// Unified feature → collapse row (`Pseudobulks::collapse_row_of_feature`).
+    pub collapse_row_of_feature: &'a [usize],
 }
 
 /// Build the per-batch fold table, or `None` when there is a single unified
@@ -92,9 +91,8 @@ pub(crate) fn batch_gene_fold(src: FoldSource) -> anyhow::Result<Option<BatchGen
         .enumerate()
         .map(|(c, name)| (name.as_ref(), c))
         .collect();
-    let delta =
-        super::setup::gather_to_unified_axis(src.delta, src.n_features, src.feature_to_backend);
-    let n_features = src.n_features;
+    let delta = super::setup::gather_to_unified_axis(src.delta, src.collapse_row_of_feature);
+    let n_features = src.collapse_row_of_feature.len();
     let mut fold = Vec::with_capacity(n_batches * n_features);
     for name in src.unified_batch_names {
         let &c = col_of.get(name.as_ref()).with_context(|| {
