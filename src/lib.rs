@@ -50,10 +50,11 @@ pub use eval::{
     write_feature_coembedding, write_module_tables, EmbeddingFileNames, OutputContext,
 };
 pub use feature_qc::{hvg_feature_qc, FeatureQcConfig, FeatureQcResult};
+pub use fit::hier::{UnitContext, UnitTable};
 pub use fit::{
     fit, partition_modules, validate_offset_rank, CellEncoders, CisCoupling, CisGateReadout,
     CisGates, FeatureModuleArgs, FeatureModuleConfig, FitConfig, FitOutput, MultiomeOptions,
-    ParentModulesOwned, TrackEncoder, TrackInfo, TrackSpec,
+    ParentModulesOwned, TrackEncoder, TrackInfo, TrackSpec, UnitContextBuilder,
 };
 pub use model::JointEmbedModel;
 pub use multiome_plan::{

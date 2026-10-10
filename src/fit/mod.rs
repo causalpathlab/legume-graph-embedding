@@ -18,7 +18,7 @@ mod setup;
 pub use batch_fold::BatchGeneFold;
 pub use config::{
     validate_offset_rank, FeatureModuleConfig, FitConfig, FitOutput, MultiomeOptions,
-    ParentModulesOwned, TrackInfo, TrackSpec,
+    ParentModulesOwned, TrackInfo, TrackSpec, UnitContextBuilder,
 };
 pub use hier::{CisCoupling, CisGateReadout, CisGates};
 pub use module_args::FeatureModuleArgs;
@@ -183,7 +183,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     } else {
         Vec::new()
     };
-    let units = hier::UnitTable::from_pseudobulks_and_cells_tracked(
+    let mut units = hier::UnitTable::from_pseudobulks_and_cells_tracked(
         &blobs,
         &n_pb_per_level,
         &cell_rows,
@@ -191,6 +191,13 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         n_features,
         tracks.clone(),
     );
+    if let Some(builder) = config.unit_context.as_ref() {
+        units.context = Some(
+            builder
+                .build(&units, &cell_to_pb_per_level)
+                .context("building the units' context")?,
+        );
+    }
     // Module labels: under `senna update`, seeded from the parent's membership
     // (the argmax of `parent_module_logits`, i.e. the partition `senna update`
     // claims to carry — matched features take the parent's module, unmatched
@@ -547,6 +554,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         track_intercepts: phase2.other_intercepts,
         module_labels: out.labels,
         cis_gates: out.cis,
+        unit_context: out.context,
     })
 }
 

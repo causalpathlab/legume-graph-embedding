@@ -10,6 +10,15 @@
 //! L = Σ_u Σ_t w^t_u [ L₁(u,t) + Σ_k (c^t_k/K)·L₂(u, t, m_k) ] + ridge
 //! ```
 //!
+//! Under a unit context (see [`super::units::UnitContext`]) each unit also
+//! observes which targets it co-occurs with, scored like its counts by one
+//! exact softmax over all targets and weighted by the same `w^0_u`:
+//!
+//! ```text
+//! p_uv = softmax_v ( ⟨e_u, c_v⟩ + b_v )   L₃(u) = − Σ_v q_uv · log p_uv
+//! L += Σ_u w^0_u · L₃(u)
+//! ```
+//!
 //! # The SUPPORT rule
 //!
 //! Every softmax runs over the track's own support `S_t`, never over the whole
@@ -98,6 +107,8 @@ pub struct StepStats {
     pub loss_ridge: f64,
     /// The weighted cis alignment gap; `0` without gates.
     pub loss_align: f64,
+    /// The context term `Σ_u w_u · L₃(u)`; `0` without a unit context.
+    pub loss_context: f64,
 }
 
 /// What every step reads and never writes: the unit table, the partition and
@@ -339,6 +350,39 @@ fn score_gene_batches(
     Ok(total)
 }
 
+/// The context term over the plan's units: `e_b · cᵀ + b`, softmaxed over
+/// every target, weighted by each unit's track-0 weight and its observed
+/// shares. `None` without a unit context or when no unit in the plan has one.
+fn context_level(
+    params: &HierParams,
+    ctx: &StepCtx<'_>,
+    plan: &StepPlan,
+    e_b: &Tensor,
+) -> CResult<Option<Tensor>> {
+    let (Some(context), Some(cp)) = (ctx.units.context.as_ref(), params.context.as_ref()) else {
+        return Ok(None);
+    };
+    let v = context.n_targets;
+    let (mut pos, mut val) = (Vec::new(), Vec::new());
+    for (i, &u) in plan.units.iter().enumerate() {
+        let w = ctx.units.weight_of(u as usize, 0);
+        for &(t, q) in &context.rows[u as usize] {
+            pos.push((i * v + t as usize) as u32);
+            val.push(w * q);
+        }
+    }
+    if pos.is_empty() {
+        return Ok(None);
+    }
+    let dev = &params.dev;
+    let s = e_b
+        .matmul(&cp.c.as_tensor().t()?)?
+        .broadcast_add(&cp.b.as_tensor().unsqueeze(0)?)?;
+    let logp = log_softmax(&s, D::Minus1)?.flatten_all()?;
+    let picked = gather_rows(&logp, &to_1d(&pos, dev)?)?;
+    (picked * to_1d(&val, dev)?)?.sum_all()?.neg().map(Some)
+}
+
 /// The module table the step scores: `μ`, plus the LoRA module residual.
 fn cis_module_table(params: &HierParams) -> CResult<Tensor> {
     match params.lora.as_ref() {
@@ -472,6 +516,7 @@ pub fn step_loss(
             add_into(&mut loss_gene, l)?;
         }
     }
+    let loss_context = context_level(params, ctx, plan, &e_b)?;
     let mut loss_ridge: Option<Tensor> = None;
     if offset_l2_step > 0.0 {
         let n_m = params.b_m.dims()[0];
@@ -495,9 +540,9 @@ pub fn step_loss(
             (l.gene.ridge()? + l.module.ridge()?)?.affine(f64::from(lora_ridge_step), 0.0)?,
         )?;
     }
-    // One host sync for the three numbers.
+    // One host sync for the four numbers.
     let zero = || Tensor::zeros((), DType::F32, dev);
-    let parts: Vec<Tensor> = [&loss_module, &loss_gene, &loss_ridge]
+    let parts: Vec<Tensor> = [&loss_module, &loss_gene, &loss_ridge, &loss_context]
         .into_iter()
         .map(|p| match p {
             Some(x) => Ok(x.clone()),
@@ -510,11 +555,12 @@ pub fn step_loss(
         loss_gene: f64::from(vals[1]),
         loss_ridge: f64::from(vals[2]),
         loss_align: 0.0,
+        loss_context: f64::from(vals[3]),
     };
     let total = parts
         .into_iter()
         .reduce(|a, b| (a + b).expect("same shape"))
-        .expect("three parts");
+        .expect("four parts");
     Ok((stats, total))
 }
 
@@ -532,6 +578,8 @@ pub struct Optimizers {
     pub cis: Option<AdamW>,
     /// The per-unit group intercepts, one row per unit like `e_u`.
     pub group: Option<RowAdagrad>,
+    /// The context target rows and biases, like `r` and `b_g`.
+    pub context: Option<RowAdagrad>,
 }
 
 impl Optimizers {
@@ -578,6 +626,10 @@ impl Optimizers {
             },
             group: match params.group.as_ref() {
                 Some(_) => Some(RowAdagrad::new(n_u, lr, dev)?),
+                None => None,
+            },
+            context: match params.context.as_ref() {
+                Some(cp) => Some(RowAdagrad::new(cp.c.dims()[0], lr, dev)?),
                 None => None,
             },
         })
@@ -663,6 +715,9 @@ pub fn apply(
     if let (Some(l), Some([opt_m, opt_g])) = (params.lora.as_ref(), opt.lora.as_mut()) {
         l.module.step(opt_m, grads)?;
         l.gene.step(opt_g, grads)?;
+    }
+    if let (Some(cp), Some(o)) = (params.context.as_ref(), opt.context.as_mut()) {
+        pair(o, &cp.c, &cp.b, None, decay)?;
     }
     if let Some(o) = opt.cis.as_mut() {
         o.step(grads)?;

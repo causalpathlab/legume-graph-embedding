@@ -175,6 +175,20 @@ impl TrackSpec {
     }
 }
 
+/// Builds the phase-1 units' [`crate::fit::hier::UnitContext`] once they
+/// exist: the caller's own notion of which targets each unit co-occurs with
+/// (e.g. the pseudobulks it shares its time with). It sees every unit's level
+/// and source index (a pseudobulk index at a pb level, the cell index for a
+/// cell unit) and each level's cell → pseudobulk map, indexed like the fit's
+/// cells.
+pub trait UnitContextBuilder: Send + Sync {
+    fn build(
+        &self,
+        units: &crate::fit::hier::UnitTable,
+        cell_to_pb_per_level: &[Vec<usize>],
+    ) -> anyhow::Result<crate::fit::hier::UnitContext>;
+}
+
 /// Hyperparameter / configuration bundle for [`fit`]. Constructed by
 /// each caller from its own CLI arguments — this crate doesn't import
 /// `clap`.
@@ -297,6 +311,9 @@ pub struct FitConfig {
     /// Optional cis peak→gene coupling: pairs, mixture share and alignment
     /// weight. `None` keeps the plain fit (bge / gem).
     pub cis_gates: Option<crate::fit::hier::CisCoupling>,
+    /// Optional per-unit context, built once the phase-1 units exist (see
+    /// [`UnitContextBuilder`]). `None` keeps the plain fit.
+    pub unit_context: Option<std::sync::Arc<dyn UnitContextBuilder>>,
     /// FLAT feature rows go module-only: no residual, so the gene-level softmax
     /// never scores them. A feature is flat when one rate explains its counts
     /// over the finest pseudobulks (a Poisson homogeneity test; see
@@ -440,6 +457,9 @@ pub struct FitOutput {
     pub module_labels: Vec<u32>,
     /// Phase-1 cis gates (θ, γ, `w`) when [`FitConfig::cis_gates`] was set.
     pub cis_gates: Option<crate::fit::hier::CisGateReadout>,
+    /// The context targets' rows `[V × H]` and biases, when
+    /// [`FitConfig::unit_context`] was set.
+    pub unit_context: Option<(nalgebra::DMatrix<f32>, Vec<f32>)>,
 }
 
 #[cfg(test)]

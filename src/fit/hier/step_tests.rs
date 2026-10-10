@@ -3,7 +3,7 @@ use crate::data::Triplet;
 use crate::fit::config::{TrackInfo, TrackSpec};
 use crate::fit::hier::params::{HostOffset, PresetGenes, PresetMode, PresetOffsets};
 use crate::fit::hier::partition::{Partition, TrackSupport, UnitModules};
-use crate::fit::hier::units::UnitTable;
+use crate::fit::hier::units::{UnitContext, UnitTable};
 use crate::LoraSpec;
 use legume_numeric::candle::candle_core::Device;
 use legume_numeric::candle::convert::to_host;
@@ -748,4 +748,76 @@ fn the_gene_offset_stays_low_rank_and_a_pinned_offset_base_holds() {
     for g in [0usize, 3] {
         assert_eq!(&r1[g * h..(g + 1) * h], &r0[g * h..(g + 1) * h]);
     }
+}
+
+/// The context term is `Σ_u w_u · (− Σ_v q_uv log softmax_v(⟨e_u, c_v⟩ + b_v))`,
+/// written here from the formula in f64 with no shared code; the rest of the
+/// step is unchanged by it.
+#[test]
+fn the_context_term_matches_the_f64_reference() {
+    let (mut units, part, um, sup, p) = fixture();
+    let n_u = units.n_units();
+    let n_v = 3;
+    let rows: Vec<Vec<(u32, f32)>> = (0..n_u)
+        .map(|u| match u % 3 {
+            0 => vec![(0, 0.5), (2, 0.5)],
+            1 => vec![(1, 1.0)],
+            _ => Vec::new(),
+        })
+        .collect();
+    let p = p.with_context(n_v).unwrap();
+    let plan = plan_all();
+    let stats_of = |units: &UnitTable| {
+        step_loss(
+            &p,
+            &StepCtx {
+                units,
+                um: &um,
+                part: &part,
+                sup: &sup,
+                skip_module: &[],
+            },
+            &plan,
+            0.0,
+            0.0,
+            None,
+        )
+        .unwrap()
+        .0
+    };
+    let before = stats_of(&units);
+    assert_eq!(before.loss_context, 0.0);
+    units.context = Some(UnitContext {
+        n_targets: n_v,
+        rows: rows.clone(),
+    });
+    let after = stats_of(&units);
+
+    let h = p.h;
+    let e = to_host(p.e_u.as_tensor()).unwrap();
+    let c = to_host(p.context.as_ref().unwrap().c.as_tensor()).unwrap();
+    let mut want = 0f64;
+    for &u in &plan.units {
+        let u = u as usize;
+        let scores: Vec<f64> = (0..n_v)
+            .map(|v| {
+                (0..h)
+                    .map(|k| f64::from(e[u * h + k]) * f64::from(c[v * h + k]))
+                    .sum()
+            })
+            .collect();
+        let lp = log_softmax_f64(&scores);
+        let w = f64::from(units.weight_of(u, 0));
+        for &(v, q) in &rows[u] {
+            want -= w * f64::from(q) * lp[v as usize];
+        }
+    }
+    assert!(want > 0.0);
+    assert!(
+        (after.loss_context - want).abs() < 1e-4 * (1.0 + want),
+        "{} vs {want}",
+        after.loss_context
+    );
+    assert_eq!(after.loss_gene, before.loss_gene);
+    assert_eq!(after.loss_module, before.loss_module);
 }

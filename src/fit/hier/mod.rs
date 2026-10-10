@@ -12,4 +12,4 @@ pub mod units;
 pub use cis_gates::{CisCoupling, CisGateReadout, CisGates};
 pub use params::PresetGenes;
 pub use train::{train, HierConfig, HierOutput};
-pub use units::UnitTable;
+pub use units::{UnitContext, UnitTable};

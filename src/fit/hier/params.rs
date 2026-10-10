@@ -150,7 +150,19 @@ pub struct HierParams {
     pub cis: Option<super::cis_gates::CisGateParams>,
     /// Optional per-unit intercept per module group (see [`GroupIntercepts`]).
     pub group: Option<GroupIntercepts>,
+    /// The context targets' rows and biases, when the units carry a
+    /// [`super::units::UnitContext`] (see [`Self::with_context`]).
+    pub context: Option<ContextParams>,
 }
+
+/// `[V, H]` target rows `c` and `[V]` biases of a unit context.
+pub struct ContextParams {
+    pub c: Var,
+    pub b: Var,
+}
+
+/// Seed salt of the context target rows.
+const CONTEXT_SALT: u64 = 0x4354_5854;
 
 /// One intercept per unit and module GROUP (a modality, on a multiome axis),
 /// added to the unit's module scores:
@@ -248,6 +260,24 @@ fn var2(data: Vec<f32>, rows: usize, cols: usize, dev: &Device) -> CResult<Var> 
 pub type HostOffset = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
 impl HierParams {
+    /// Add `n_targets` context rows, drawn like the gene rows.
+    pub fn with_context(mut self, n_targets: usize) -> CResult<Self> {
+        self.context = Some(ContextParams {
+            c: var2(
+                randn(
+                    n_targets * self.h,
+                    INIT_STDEV,
+                    mix_seed(self.seed, CONTEXT_SALT),
+                ),
+                n_targets,
+                self.h,
+                &self.dev,
+            )?,
+            b: Var::zeros(n_targets, DType::F32, &self.dev)?,
+        });
+        Ok(self)
+    }
+
     /// The one-track tables: no offsets.
     pub fn new(
         n_units: usize,
@@ -319,6 +349,7 @@ impl HierParams {
             seed,
             cis: None,
             group: None,
+            context: None,
         })
     }
 

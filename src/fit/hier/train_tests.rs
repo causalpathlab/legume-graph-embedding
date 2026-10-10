@@ -1,7 +1,7 @@
 use super::*;
 use crate::data::Triplet;
 use crate::fit::config::{TrackInfo, TrackSpec};
-use crate::fit::hier::units::UnitTable;
+use crate::fit::hier::units::{UnitContext, UnitTable};
 use crate::fit::projection::RowCollapse;
 use crate::{LoraSpec, PresetMode, PresetOffsets};
 use std::sync::atomic::AtomicBool;
@@ -1140,4 +1140,197 @@ fn centring_zeroes_each_groups_mean_and_keeps_within_group_differences() {
     }
     assert!(((c[0] - c[2]) - (raw[0] - raw[2])).abs() < 1e-6);
     assert!(((c[5] - c[9]) - (raw[5] - raw[9])).abs() < 1e-6);
+}
+
+/// Ten units with the SAME counts (one program, no noise): look-alikes that
+/// expression alone cannot tell apart. `with_context` gives units 0..5 the
+/// targets 0..5 and units 5..10 the targets 5..10 — two disjoint sets of time
+/// neighbours.
+fn look_alike_units(with_context: bool) -> (UnitTable, Vec<u32>) {
+    let mut trip = Vec::new();
+    for u in 0..10u32 {
+        for g in 0..10u32 {
+            trip.push(t(u, g, 20.0 + (g % 3) as f32));
+        }
+    }
+    let mut units = UnitTable::from_pseudobulks_and_cells(&[&trip], &[10], &[], None, 10);
+    if with_context {
+        let share = 1.0 / 5.0;
+        let rows = (0..10u32)
+            .map(|u| {
+                let first = if u < 5 { 0 } else { 5 };
+                (first..first + 5).map(|v| (v, share)).collect()
+            })
+            .collect();
+        units.context = Some(UnitContext {
+            n_targets: 10,
+            rows,
+        });
+    }
+    (units, vec![0; 10])
+}
+
+/// Mean cosine within the two halves minus across them.
+fn half_separation(e: &DMatrix<f32>) -> f32 {
+    let (mut within, mut across, mut n_w, mut n_a) = (0.0, 0.0, 0, 0);
+    for a in 0..10 {
+        for b in (a + 1)..10 {
+            let c = cosine(&row(e, a), &row(e, b));
+            if (a < 5) == (b < 5) {
+                within += c;
+                n_w += 1;
+            } else {
+                across += c;
+                n_a += 1;
+            }
+        }
+    }
+    within / n_w as f32 - across / n_a as f32
+}
+
+/// The time-neighbour context is what tells look-alikes apart: with identical
+/// counts the plain fit has no reason to split the halves, while the context
+/// (disjoint neighbour sets) splits them.
+#[test]
+fn a_unit_context_separates_look_alikes_that_counts_cannot() {
+    let cfg = HierConfig {
+        n_modules: 1,
+        modules_per_unit: 1,
+        ..cfg()
+    };
+    let (plain, labels) = look_alike_units(false);
+    let (timed, _) = look_alike_units(true);
+    let without = run(&plain, &labels, 4, &cfg, None, &[]).unwrap();
+    let with = run(&timed, &labels, 4, &cfg, None, &[]).unwrap();
+    let (s0, s1) = (half_separation(&without.e_u), half_separation(&with.e_u));
+    assert!(s0.abs() < 0.2, "no context: separation {s0}");
+    assert!(s1 > 0.5, "with context: separation {s1} (vs {s0} without)");
+    assert!(with.final_loss_per_unit.is_finite());
+}
+
+/// Thirty units on a time line τ_u = u/29 with CONTINUOUS programs: an early
+/// gene set fading in τ, a late set rising, and a transient set pulsing at
+/// τ = ½. Units at τ and 1 − τ near the pulse share most of their counts —
+/// look-alikes from opposite sides of it. With `width = Some(k)`, each unit's
+/// context is its neighbours on the time line, `q_uv ∝ exp(−(Δτ)²/2σ²)` with
+/// σ = k grid steps (a fixture, not a fitted width); `k = 0` is δ-sharp, the
+/// unit alone.
+fn pulse_units(width: Option<f32>) -> (UnitTable, Vec<u32>, Vec<f32>) {
+    let n = 30u32;
+    let tau: Vec<f32> = (0..n).map(|u| u as f32 / (n - 1) as f32).collect();
+    let mut trip = Vec::new();
+    for u in 0..n {
+        let x = tau[u as usize];
+        for g in 0..18u32 {
+            let level = match g / 6 {
+                0 => 2.0 + 30.0 * (1.0 - x),
+                1 => 2.0 + 30.0 * x,
+                _ => 2.0 + 60.0 * (-((x - 0.5) / 0.15).powi(2)).exp(),
+            };
+            trip.push(t(u, g, level));
+        }
+    }
+    let mut units = UnitTable::from_pseudobulks_and_cells(&[&trip], &[n as usize], &[], None, 18);
+    if let Some(k) = width {
+        let sigma = k / (n - 1) as f32;
+        let rows = (0..n as usize)
+            .map(|u| {
+                let w: Vec<f32> = (0..n as usize)
+                    .map(|v| match sigma > 0.0 {
+                        true => (-((tau[v] - tau[u]) / sigma).powi(2) / 2.0).exp(),
+                        false => f32::from(u8::from(u == v)),
+                    })
+                    .collect();
+                let z: f32 = w.iter().sum();
+                (0..n).zip(w).map(|(v, x)| (v, x / z)).collect()
+            })
+            .collect();
+        units.context = Some(UnitContext {
+            n_targets: n as usize,
+            rows,
+        });
+    }
+    (units, (0..18u32).map(|g| g / 6).collect(), tau)
+}
+
+/// Mean squared distance between units `a` and `b` over all pairs in
+/// `pairs`, relative to the mean over all pairs.
+fn relative_sq_dist(e: &DMatrix<f32>, pairs: &[(usize, usize)]) -> f32 {
+    let d = |a: usize, b: usize| (e.row(a) - e.row(b)).norm_squared();
+    let n = e.nrows();
+    let all: f32 = (0..n)
+        .flat_map(|a| ((a + 1)..n).map(move |b| (a, b)))
+        .map(|(a, b)| d(a, b))
+        .sum::<f32>()
+        / (n * (n - 1) / 2) as f32;
+    pairs.iter().map(|&(a, b)| d(a, b)).sum::<f32>() / pairs.len() as f32 / all
+}
+
+/// The pulse look-alikes (τ and 1 − τ around the pulse) sit close under the
+/// plain fit — their counts nearly agree — and are pushed apart by the time
+/// context, while time neighbours stay close.
+#[test]
+fn a_time_context_separates_look_alikes_across_a_pulse() {
+    let cfg = HierConfig {
+        n_modules: 3,
+        modules_per_unit: 3,
+        ..cfg()
+    };
+    let (plain, labels, _) = pulse_units(None);
+    let (timed, _, _) = pulse_units(Some(1.0));
+    let without = run(&plain, &labels, 4, &cfg, None, &[]).unwrap();
+    let with = run(&timed, &labels, 4, &cfg, None, &[]).unwrap();
+    // Mirror pairs across the pulse, 3..6 grid steps from it on each side.
+    let mirror: Vec<(usize, usize)> = (9..12).map(|a| (a, 29 - a)).collect();
+    let next: Vec<(usize, usize)> = (0..29).map(|a| (a, a + 1)).collect();
+    let (m0, m1) = (
+        relative_sq_dist(&without.e_u, &mirror),
+        relative_sq_dist(&with.e_u, &mirror),
+    );
+    assert!(
+        m0 < 0.5,
+        "plain fit: mirror pairs at {m0} of the mean distance"
+    );
+    assert!(
+        m1 > 2.0 * m0,
+        "time context: mirror pairs at {m1} (plain {m0})"
+    );
+    assert!(
+        relative_sq_dist(&with.e_u, &next) < 0.2,
+        "time neighbours stay close"
+    );
+}
+
+/// What a miscalibrated time posterior costs, on record. δ-sharp (every unit
+/// its own only time neighbour) repels the time neighbours themselves: the
+/// line breaks up. Five times too wide blurs the pulse: the mirror pairs drift
+/// back toward the plain fit's distance.
+#[test]
+fn a_miscalibrated_time_context_degrades_as_expected() {
+    let cfg = HierConfig {
+        n_modules: 3,
+        modules_per_unit: 3,
+        ..cfg()
+    };
+    let fit = |width| {
+        let (units, labels, _) = pulse_units(width);
+        run(&units, &labels, 4, &cfg, None, &[]).unwrap().e_u
+    };
+    let mirror: Vec<(usize, usize)> = (9..12).map(|a| (a, 29 - a)).collect();
+    let next: Vec<(usize, usize)> = (0..29).map(|a| (a, a + 1)).collect();
+    let (right, sharp, wide) = (fit(Some(1.0)), fit(Some(0.0)), fit(Some(5.0)));
+    let next_of = |e: &DMatrix<f32>| relative_sq_dist(e, &next);
+    let mirror_of = |e: &DMatrix<f32>| relative_sq_dist(e, &mirror);
+    assert!(
+        next_of(&sharp) > 3.0 * next_of(&right),
+        "δ-sharp: time neighbours at {} (calibrated {})",
+        next_of(&sharp),
+        next_of(&right)
+    );
+    assert!(
+        mirror_of(&wide) < mirror_of(&right),
+        "5× wide: mirror pairs at {} (calibrated {})",
+        mirror_of(&wide),
+        mirror_of(&right)
+    );
 }

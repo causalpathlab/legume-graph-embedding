@@ -23,6 +23,56 @@ pub struct UnitTable {
     pub source_index: Vec<u32>,
     /// The pseudobulk units, which come first: `0..n_pb_units`; cells follow.
     pub n_pb_units: usize,
+    /// Optional second observation per unit: which of `n_targets` targets it
+    /// co-occurs with (see [`UnitContext`]). `None` is the plain fit.
+    pub context: Option<UnitContext>,
+}
+
+/// Each unit's observed distribution over `n_targets` context targets — e.g.
+/// the pseudobulks it shares its time with. The fit models it like the unit's
+/// counts: an exact softmax `p(v | u) ∝ exp(⟨e_u, c_v⟩ + b_v)` over all
+/// targets, weighted by the unit's own track-0 weight, so the context enters
+/// the one likelihood with no weight of its own.
+///
+/// Invariants: one row per unit; a row's `(target, share)` entries have
+/// distinct targets below `n_targets` and shares ≥ 0 summing to 1, or the row
+/// is empty (the unit observes no context).
+#[derive(Clone, Debug)]
+pub struct UnitContext {
+    pub n_targets: usize,
+    pub rows: Vec<Vec<(u32, f32)>>,
+}
+
+impl UnitContext {
+    /// Check the invariants against a table of `n_units` units.
+    pub fn validate(&self, n_units: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.rows.len() == n_units,
+            "a context row per unit: {} rows for {n_units} units",
+            self.rows.len()
+        );
+        for (u, row) in self.rows.iter().enumerate() {
+            if row.is_empty() {
+                continue;
+            }
+            let mut seen = std::collections::HashSet::with_capacity(row.len());
+            let mut sum = 0f32;
+            for &(v, q) in row {
+                anyhow::ensure!(
+                    (v as usize) < self.n_targets && seen.insert(v),
+                    "unit {u}: context target {v} repeated or past {}",
+                    self.n_targets
+                );
+                anyhow::ensure!(q.is_finite() && q >= 0.0, "unit {u}: context share {q}");
+                sum += q;
+            }
+            anyhow::ensure!(
+                (sum - 1.0).abs() < 1e-3,
+                "unit {u}: context shares sum to {sum}, not 1"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl UnitTable {
@@ -171,6 +221,7 @@ impl UnitTable {
             level,
             source_index,
             n_pb_units,
+            context: None,
         }
     }
 }

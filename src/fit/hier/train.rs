@@ -84,6 +84,9 @@ pub struct HierOutput {
     /// `[n_units, K − 1]` per-unit group intercepts, when
     /// [`HierConfig::module_group`] named two or more groups.
     pub group_intercepts: Option<DMatrix<f32>>,
+    /// `[V × H]` context target rows and their `[V]` biases, when the units
+    /// carried a context.
+    pub context: Option<(DMatrix<f32>, Vec<f32>)>,
 }
 
 /// A `(unit, track)`'s module draw: `q` restricted to the modules with a gene
@@ -250,6 +253,7 @@ where
         stats.loss_module += s.loss_module;
         stats.loss_gene += s.loss_gene;
         stats.loss_ridge += s.loss_ridge;
+        stats.loss_context += s.loss_context;
         grads = Some(match grads {
             None => g,
             Some(mut acc) => {
@@ -310,6 +314,15 @@ pub fn train(
     let n_features = units.n_features;
     let mut params =
         HierParams::new_tracked(n_u, n_m, d, n_t, h, cfg.offset_rank, cfg.seed, &cfg.device)?;
+    if let Some(context) = units.context.as_ref() {
+        context.validate(n_u)?;
+        params = params.with_context(context.n_targets)?;
+        info!(
+            "Phase 1 (hier) — unit context: {} of {n_u} units observe a distribution over {}              targets",
+            context.rows.iter().filter(|r| !r.is_empty()).count(),
+            context.n_targets
+        );
+    }
     if let Some(f) = preset {
         let mut is_module_only = vec![false; part.module_of.len()];
         for &g in module_only.iter().flat_map(|mo| &mo.genes) {
@@ -532,11 +545,13 @@ pub fn train(
             acc.loss_gene += stats.loss_gene;
             acc.loss_ridge += stats.loss_ridge;
             acc.loss_align += stats.loss_align;
+            acc.loss_context += stats.loss_context;
             n_units_seen += chunk.len();
         }
         let per_unit = 1.0 / n_units_seen.max(1) as f64;
         last_per_unit =
-            (acc.loss_module + acc.loss_gene + acc.loss_ridge + acc.loss_align) * per_unit;
+            (acc.loss_module + acc.loss_gene + acc.loss_ridge + acc.loss_align + acc.loss_context)
+                * per_unit;
         bar.inc(1);
         // Every epoch, at info: visible under `-v`, silent otherwise.
         let elapsed = t0.elapsed().as_secs_f64();
@@ -544,7 +559,7 @@ pub fn train(
         let eta = elapsed / (epoch + 1) as f64 * (cfg.epochs - epoch - 1) as f64;
         info!(
             "Phase 1 (hier) — epoch {}/{}: loss/unit {:.4} (module {:.4}, gene {:.4}, \
-             ridge {:.4}, align {:.4}), {:.1} ms/step, eta {:.0} s",
+             ridge {:.4}, align {:.4}, context {:.4}), {:.1} ms/step, eta {:.0} s",
             epoch + 1,
             cfg.epochs,
             last_per_unit,
@@ -552,6 +567,7 @@ pub fn train(
             acc.loss_gene * per_unit,
             acc.loss_ridge * per_unit,
             acc.loss_align * per_unit,
+            acc.loss_context * per_unit,
             ms,
             eta
         );
@@ -580,6 +596,13 @@ pub fn train(
         )),
         None => None,
     };
+    let context = match params.context.as_ref() {
+        Some(cp) => Some((
+            DMatrix::<f32>::from_row_slice(cp.c.dims()[0], h, &to_host(cp.c.as_tensor())?),
+            to_host(cp.b.as_tensor())?,
+        )),
+        None => None,
+    };
     Ok(HierOutput {
         e_u,
         rho,
@@ -588,6 +611,7 @@ pub fn train(
         labels: labels.to_vec(),
         cis,
         group_intercepts,
+        context,
     })
 }
 
