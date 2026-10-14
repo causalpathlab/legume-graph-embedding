@@ -204,6 +204,20 @@ pub struct FitConfig {
     /// In-batch k-NN used when merging cells into pseudobulk samples.
     /// Maps to [`MultilevelParams::knn_pb_samples`].
     pub knn_pb_samples: usize,
+    /// A given cell → pseudobulk partition to collapse on instead of building
+    /// one: every cell's pseudobulk at every level, FINEST FIRST (the order
+    /// [`MultilevelCollapseOut::cell_to_pb_per_level`] comes in), one inner
+    /// `Vec` per level, each indexed by the columns of the count backend the
+    /// fit collapses (`unified.count_backend()`). Its length sets the number of
+    /// levels, overriding [`Self::num_levels`]; keep [`Self::sort_dim`] at the
+    /// source fit's, since the collapse spreads the levels over it and refuses
+    /// a count it cannot spread. The hash partition and the refinement are
+    /// skipped; the projection still seeds the cross-batch matching. This lets
+    /// a later fit collapse on another fit's partition. `None` = build the
+    /// partition as before.
+    ///
+    /// [`MultilevelCollapseOut::cell_to_pb_per_level`]: data_beans::alg::collapse_data::MultilevelCollapseOut::cell_to_pb_per_level
+    pub partition: Option<Vec<Vec<usize>>>,
     /// Coordinate-descent iterations for the per-batch δ correction
     /// inside the collapse. Maps to [`MultilevelParams::num_opt_iter`].
     pub num_opt_iter: usize,

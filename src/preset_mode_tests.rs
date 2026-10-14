@@ -13,7 +13,7 @@ fn only_init_leaves_the_rows_free() {
 }
 
 #[test]
-fn the_rank_must_be_strictly_between_zero_and_h() {
+fn the_rank_must_be_positive_but_may_reach_h() {
     let ok = PresetMode::Lora(LoraSpec {
         rank: 2,
         lr_ratio: 16.0,
@@ -27,13 +27,15 @@ fn the_rank_must_be_strictly_between_zero_and_h() {
     })
     .validate(4)
     .is_err());
-    assert!(PresetMode::Lora(LoraSpec {
-        rank: 4,
-        lr_ratio: 1.0,
-        ridge: 0.0
-    })
-    .validate(4)
-    .is_err());
+    for rank in [4, 9] {
+        assert!(PresetMode::Lora(LoraSpec {
+            rank,
+            lr_ratio: 1.0,
+            ridge: 0.0
+        })
+        .validate(4)
+        .is_ok());
+    }
     assert!(PresetMode::Lora(LoraSpec {
         rank: 1,
         lr_ratio: 0.0,
