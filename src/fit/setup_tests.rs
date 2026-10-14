@@ -115,3 +115,80 @@ fn the_masked_sketch_equals_a_base_only_backends_sketch() {
         .zip(masked.proj.iter())
         .any(|(a, b)| (a - b).abs() > 1e-6));
 }
+
+/// `n_cells` columns over six rows in two planted states (even / odd columns), with a
+/// small per-column wiggle so no two columns are identical.
+fn two_state_backend(n_cells: usize) -> SparseIoVec {
+    let mut triplets: Vec<(u64, u64, f32)> = Vec::new();
+    for c in 0..n_cells {
+        let wiggle = 1.0 + 0.05 * ((c % 5) as f32 - 2.0);
+        for r in 0..6usize {
+            let v = if c % 2 == 0 {
+                10.0 + 3.0 * (r % 2) as f32
+            } else {
+                4.0 + 2.0 * ((r + 1) % 2) as f32
+            };
+            triplets.push((r as u64, c as u64, v * wiggle));
+        }
+    }
+    let shape = (6usize, n_cells, triplets.len());
+    let mut b = create_sparse_from_triplets(&triplets, shape, None, Some(&SparseIoBackend::Zarr))
+        .expect("backend");
+    b.register_row_names_vec(
+        &(0..6)
+            .map(|r| format!("r{r}").into_boxed_str())
+            .collect::<Vec<_>>(),
+    );
+    b.register_column_names_vec(
+        &(0..n_cells)
+            .map(|c| format!("c{c}").into_boxed_str())
+            .collect::<Vec<_>>(),
+    );
+    let mut v = SparseIoVec::new();
+    v.push(std::sync::Arc::from(b), None).expect("push");
+    v
+}
+
+/// The two labelings induce the same equivalence on cells.
+fn same_partition(a: &[usize], b: &[usize]) -> bool {
+    let mut ab = rustc_hash::FxHashMap::default();
+    let mut ba = rustc_hash::FxHashMap::default();
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(&x, &y)| *ab.entry(x).or_insert(y) == y && *ba.entry(y).or_insert(x) == x)
+}
+
+/// A given partition is collapsed on as is: its groups ignore the planted states, so a
+/// refined hash partition could not land on them by chance.
+#[test]
+fn a_given_partition_is_the_one_collapsed_on() {
+    const N: usize = 60;
+    let mut v = two_state_backend(N);
+    let labels: Vec<Box<str>> = vec!["b0".into(); N];
+    let none: Option<&[Box<str>]> = None;
+    let proj = project_backend(&v, 3, None, none, None, 7)
+        .expect("proj")
+        .proj;
+    let finest: Vec<usize> = (0..N).map(|c| (c * 7919) % 5).collect();
+    let coarse: Vec<usize> = finest.iter().map(|&g| usize::from(g >= 3)).collect();
+    let partition = vec![finest.clone(), coarse.clone()];
+    let mut params = MultilevelParams::new(4);
+    params.num_levels = partition.len();
+    // The collapse spreads its levels between `sort_dim` and a fixed coarsest depth
+    // and refuses a level count it cannot spread, so two levels need a deep finest.
+    params.sort_dim = 8;
+    let out = collapse(&mut v, &proj, &labels, &params, Some(&partition)).expect("collapse");
+    assert_eq!(out.cell_to_pb_per_level.len(), 2);
+    assert!(same_partition(&finest, &out.cell_to_pb_per_level[0]));
+    assert!(same_partition(&coarse, &out.cell_to_pb_per_level[1]));
+    assert_eq!(out.levels[0].mu_observed.posterior_mean().ncols(), 5);
+    assert_eq!(out.levels[1].mu_observed.posterior_mean().ncols(), 2);
+}
+
+#[test]
+fn a_given_partition_must_map_every_backend_column() {
+    assert!(check_partition(&[vec![0; 4], vec![0; 4]], 4).is_ok());
+    assert!(check_partition(&[], 4).is_err());
+    assert!(check_partition(&[vec![0; 4], vec![0; 3]], 4).is_err());
+}

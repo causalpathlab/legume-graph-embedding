@@ -162,7 +162,7 @@ fn preset_rows_compose_back_exactly_and_the_mode_sets_the_pins() {
             &module_of,
             &[],
         )
-        .is_err());
+        .is_ok());
 }
 
 /// A given offset base `δ₀` on a non-base track: under freeze the residual

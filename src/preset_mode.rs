@@ -8,8 +8,9 @@
 
 /// `Lora`: the given row `ρ₀_g` stays as it is and the trained row is
 /// `ρ₀_g + u_g · V` with `u_g ∈ ℝ^rank` per gene and `V ∈ ℝ^{rank × H}`
-/// shared — `rank = 0` would be `Freeze` and `rank = H` is `Init` with a
-/// detour, so both ends are refused. `lr_ratio` is the LoRA+ knob: `V`, which
+/// shared — `rank = 0` would be `Freeze`, so it is refused; the rank may be
+/// raised as far as wanted, since even a full-rank residual stays anchored to
+/// the given table and shrunk by the ridge, which is not `Init`. `lr_ratio` is the LoRA+ knob: `V`, which
 /// starts at zero and is touched every step, takes `lr_ratio` times the row
 /// factor's learning rate; `1` is plain LoRA.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -45,8 +46,9 @@ impl PresetMode {
         }
     }
 
-    /// Refuse a rank that degenerates to another mode or exceeds the width.
-    pub fn validate(&self, h: usize) -> anyhow::Result<()> {
+    /// Refuse rank 0 (that is freeze) and a bad LoRA+ ratio or ridge. The rank
+    /// is not capped at the width `h`: it may be raised as far as wanted.
+    pub fn validate(&self, _h: usize) -> anyhow::Result<()> {
         if let Self::Lora(LoraSpec {
             rank,
             lr_ratio,
@@ -56,10 +58,6 @@ impl PresetMode {
             anyhow::ensure!(
                 rank >= 1,
                 "a LoRA residual needs rank ≥ 1 (rank 0 is freeze)"
-            );
-            anyhow::ensure!(
-                rank < h,
-                "a LoRA residual of rank {rank} is not low-rank at H={h} (rank H is init)"
             );
             anyhow::ensure!(
                 lr_ratio.is_finite() && lr_ratio > 0.0,

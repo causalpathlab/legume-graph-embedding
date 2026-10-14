@@ -465,7 +465,8 @@ fn lora_preset_rows_move_only_inside_a_shared_rank_r_residual() {
     assert!(ids.iter().any(|&g| out.b_feat[g as usize].abs() > 1e-6));
     assert!(out.final_loss_per_unit.is_finite());
 
-    assert!(run(&units, &labels, h, &cfg, Some(&lora(h, 1.0)), &[]).is_err());
+    // The rank is not capped at the width: a full-rank residual is still anchored.
+    assert!(run(&units, &labels, h, &cfg, Some(&lora(h, 1.0)), &[]).is_ok());
 }
 
 /// The track offsets' rank is its own number, never H: outside `1..=H` on a

@@ -9,7 +9,8 @@
 use super::config::{FitConfig, TrackSpec};
 use crate::data::UnifiedData;
 use data_beans::alg::collapse_data::{
-    collapse_columns_multilevel_with_hierarchy, MultilevelParams,
+    collapse_columns_multilevel_with_hierarchy, collapse_columns_multilevel_with_partition,
+    MultilevelCollapseOut, MultilevelParams,
 };
 use data_beans::alg::random_projection::RandProjOps;
 use data_beans::sparse_io_vector::SparseIoVec;
@@ -53,34 +54,37 @@ pub(super) fn build_pseudobulks(
 
     let proj_out = project(unified, config, &batch_labels, tracks)?;
 
-    info!(
-        "Multilevel collapse (sort_dim={}, {} levels requested)...",
-        config.sort_dim, config.num_levels
-    );
-    let collapse_out = collapse_columns_multilevel_with_hierarchy(
+    let params = MultilevelParams {
+        knn_pb_samples: config.knn_pb_samples,
+        // A given partition carries its own level count.
+        num_levels: config
+            .partition
+            .as_ref()
+            .map_or(config.num_levels, Vec::len)
+            .max(1),
+        sort_dim: config.sort_dim,
+        num_opt_iter: config.num_opt_iter,
+        refine: config.refine.clone(),
+        // Only `posterior_mean()` is ever read off this, so skip the sd / log_mean /
+        // log_sd planes — that is the bulk of the coarsen-stage memory at high
+        // pb-sample counts.
+        output_calibration: legume_numeric::param::traits::CalibrateTarget::MeanOnly,
+        anchor_batches: config.anchor_batches.clone(),
+        bulk_batches: config.bulk_batches.clone(),
+        observe_panels: true,
+        // The feature partition reads the finest level's counts
+        // (`CollapsedOut::observed_counts`), and the pseudobulk
+        // reference serializes them; both need the sufficient statistics.
+        keep_finest_stats: true,
+        pb_tree: None,
+        strata: config.strata.clone(),
+    };
+    let collapse_out = collapse(
         unified.count_backend_mut(),
         &proj_out.proj,
         &batch_labels,
-        &MultilevelParams {
-            knn_pb_samples: config.knn_pb_samples,
-            num_levels: config.num_levels.max(1),
-            sort_dim: config.sort_dim,
-            num_opt_iter: config.num_opt_iter,
-            refine: config.refine.clone(),
-            // Only `posterior_mean()` is ever read off this, so skip the sd / log_mean /
-            // log_sd planes — that is the bulk of the coarsen-stage memory at high
-            // pb-sample counts.
-            output_calibration: legume_numeric::param::traits::CalibrateTarget::MeanOnly,
-            anchor_batches: config.anchor_batches.clone(),
-            bulk_batches: config.bulk_batches.clone(),
-            observe_panels: true,
-            // The feature partition reads the finest level's counts
-            // (`CollapsedOut::observed_counts`), and the pseudobulk
-            // reference serializes them; both need the sufficient statistics.
-            keep_finest_stats: true,
-            pb_tree: None,
-            strata: config.strata.clone(),
-        },
+        &params,
+        config.partition.as_deref(),
     )?;
     let mut collapsed_levels = collapse_out.levels;
     let mut cell_to_pb_per_level = collapse_out.cell_to_pb_per_level;
@@ -114,6 +118,54 @@ pub(super) fn build_pseudobulks(
         cell_to_pb_per_level,
         blobs,
     })
+}
+
+/// The multilevel collapse of `backend`'s columns: built from the hash partition and
+/// refined, or — given `partition` (finest first, one cell → pseudobulk map per level,
+/// each indexing `backend`'s columns) — collapsed on that partition as is, the
+/// refinement skipped. `proj` still seeds the cross-batch matching either way.
+fn collapse(
+    backend: &mut SparseIoVec,
+    proj: &DMatrix<f32>,
+    batch_labels: &[Box<str>],
+    params: &MultilevelParams,
+    partition: Option<&[Vec<usize>]>,
+) -> anyhow::Result<MultilevelCollapseOut> {
+    let Some(partition) = partition else {
+        info!(
+            "Multilevel collapse (sort_dim={}, {} levels requested)...",
+            params.sort_dim, params.num_levels
+        );
+        return collapse_columns_multilevel_with_hierarchy(backend, proj, batch_labels, params);
+    };
+    check_partition(partition, backend.num_columns())?;
+    info!(
+        "Multilevel collapse on a given partition ({} levels, {} cells; refinement skipped)...",
+        partition.len(),
+        backend.num_columns()
+    );
+    collapse_columns_multilevel_with_partition(backend, proj, batch_labels, params, partition)
+        .map_err(|e| e.context("collapsing on the given partition"))
+}
+
+/// A given partition must hold at least the finest level, and every level must map each
+/// of the backend's `n_cells` columns. (The level count is the collapse's own: `fit`
+/// sets [`MultilevelParams::num_levels`] from it, and the collapse refuses a count that
+/// `sort_dim` cannot spread into as many distinct levels.)
+fn check_partition(partition: &[Vec<usize>], n_cells: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !partition.is_empty(),
+        "the given partition has no levels (it needs at least the finest)"
+    );
+    for (level, cell_to_pb) in partition.iter().enumerate() {
+        anyhow::ensure!(
+            cell_to_pb.len() == n_cells,
+            "the given partition's level {level} (finest first) maps {} cells, but the count \
+             backend has {n_cells} columns",
+            cell_to_pb.len()
+        );
+    }
+    Ok(())
 }
 
 /// The batch-corrected random projection the collapse hashes on, HVG-weighted when the

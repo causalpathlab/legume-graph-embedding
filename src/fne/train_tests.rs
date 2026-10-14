@@ -836,5 +836,6 @@ fn lora_preset_rows_carry_a_shared_rank_r_residual_over_the_given_rows() {
         }),
         ..base
     };
-    assert!(train(edges, types, rels, &full_rank).is_err());
+    // The rank is not capped at the width: a full-rank residual is still anchored.
+    assert!(train(edges, types, rels, &full_rank).is_ok());
 }
