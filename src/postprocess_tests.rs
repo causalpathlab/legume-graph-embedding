@@ -96,28 +96,161 @@ fn a_constant_column_stays_finite() {
     );
 }
 
-/// The end-to-end contract: the `T` returned by [`feature_coembedding`], applied
-/// the way `coembed_block` applies it, actually lands near the requested
-/// eff-cells target. This fails if calibration and application ever diverge in
-/// units — the failure mode the shared helper exists to prevent.
-#[test]
-fn the_calibrated_temperature_hits_its_eff_target() {
-    let (cells, feats) = fixture(96);
-    let target = 40.0;
-    let (co, t) = feature_coembedding(&cells, &feats, target).unwrap();
-    assert_eq!(co.dims2().unwrap(), (96, H));
+/// Each cell row scaled to unit norm, by hand — the units the softmax is meant to score in.
+fn unit_rows(cells: &Tensor) -> Tensor {
+    let norm = cells.sqr().unwrap().sum_keepdim(1).unwrap().sqrt().unwrap();
+    cells.broadcast_div(&norm).unwrap()
+}
 
-    let scores = standardize_columns(
-        &cells
+/// Direction-only scores, by hand: `standardize(ê_cell · e_fᵀ)`.
+fn direction_scores(cells: &Tensor, feats: &Tensor) -> Tensor {
+    standardize_columns(
+        &unit_rows(cells)
             .matmul(&feats.t().unwrap().contiguous().unwrap())
             .unwrap(),
     )
-    .unwrap();
-    let eff = eff_from_scores(&scores, f64::from(t)).unwrap();
+    .unwrap()
+}
+
+/// The end-to-end contract: the `T` returned by [`feature_coembedding`], applied to
+/// direction-only scores, actually lands near the requested eff-cells target. This
+/// fails if the calibration scores in different units from the ones the softmax is
+/// meant to use — on raw cells, a `T` calibrated against the longest cells.
+#[test]
+fn the_calibrated_temperature_hits_its_eff_target() {
+    let target = 40.0;
+    let cases = [
+        ("fixture", fixture(96)),
+        ("heavy-tailed", heavy_tailed_cloud(0)),
+    ];
+    for (name, (cells, feats)) in cases {
+        let (co, t) = feature_coembedding(&cells, &feats, target).unwrap();
+        assert_eq!(co.dims2().unwrap(), (feats.dim(0).unwrap(), H));
+        let eff = eff_from_scores(&direction_scores(&cells, &feats), f64::from(t)).unwrap();
+        assert!(
+            eff > target / 1.5 && eff < target * 1.5,
+            "{name}: calibrated T={t} gives eff {eff:.1} on direction scores, want within \
+             1.5× of {target}"
+        );
+    }
+}
+
+/// The temperature is a property of the cells' directions: rescaling every cell row by its
+/// own factor (three orders of magnitude) must not move it.
+#[test]
+fn the_temperature_ignores_cell_norm() {
+    let (cells, feats) = fixture(32);
+    let factors: Vec<f32> = (0..N).map(|i| 10f32.powf((i % 4) as f32 - 1.5)).collect();
+    let scaled = cells
+        .broadcast_mul(&Tensor::from_vec(factors, (N, 1), &Device::Cpu).unwrap())
+        .unwrap();
+    let (_, t) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    let (_, t_scaled) = feature_coembedding(&scaled, &feats, 40.0).unwrap();
     assert!(
-        eff > target / 3.0 && eff < target * 3.0,
-        "calibrated T={t} gives eff {eff:.1}, want within 3× of {target}"
+        (t - t_scaled).abs() < 1e-3 * t,
+        "T moved under a per-cell rescale: {t} → {t_scaled}"
     );
+}
+
+/// An all-zero cell row has no direction. It must leave the co-embedding finite.
+#[test]
+fn a_zero_cell_stays_finite() {
+    let (cells, feats) = fixture(8);
+    let zero = Tensor::zeros((1, H), DType::F32, &Device::Cpu).unwrap();
+    let cells = Tensor::cat(&[&cells, &zero], 0).unwrap();
+    let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    assert!(co
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .iter()
+        .all(|x| x.is_finite()));
+}
+
+/// Cells in a few angular clusters with a heavy-tailed (Student-t, 3 df) radius —
+/// max/median cell norm ~15, the regime the real runs sit in — and features of
+/// mixed norm.
+fn heavy_tailed_cloud(seed: u64) -> (Tensor, Tensor) {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, Normal, StudentT, Uniform};
+    const N_CELLS: usize = 1500;
+    const N_FEATS: usize = 120;
+    const K: usize = 6;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let normal = Normal::new(0f32, 1.0).unwrap();
+    let unit = |v: Vec<f32>| -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.into_iter().map(|x| x / n).collect()
+    };
+    let centres: Vec<Vec<f32>> = (0..K)
+        .map(|_| unit((0..H).map(|_| normal.sample(&mut rng)).collect()))
+        .collect();
+    let radius = StudentT::new(3f32).unwrap();
+    let mut cells = Vec::with_capacity(N_CELLS * H);
+    for i in 0..N_CELLS {
+        let dir = unit(
+            centres[i % K]
+                .iter()
+                .map(|&c| c + 0.2 * normal.sample(&mut rng))
+                .collect(),
+        );
+        let r = radius.sample(&mut rng).abs() + 0.2;
+        cells.extend(dir.iter().map(|&x| r * x));
+    }
+    let scale = Uniform::new(0.1f32, 3.0).unwrap();
+    let mut feats = Vec::with_capacity(N_FEATS * H);
+    for _ in 0..N_FEATS {
+        let s = scale.sample(&mut rng);
+        feats.extend((0..H).map(|_| s * normal.sample(&mut rng)));
+    }
+    let dev = Device::Cpu;
+    (
+        Tensor::from_vec(cells, (N_CELLS, H), &dev).unwrap(),
+        Tensor::from_vec(feats, (N_FEATS, H), &dev).unwrap(),
+    )
+}
+
+fn placement(cells: &Tensor, coembed: &Tensor) -> CoembedPlacement {
+    use legume_numeric::matrix::traits::ConvertMatOps;
+    coembed_placement(
+        &nalgebra::DMatrix::<f32>::from_tensor(cells).unwrap(),
+        &nalgebra::DMatrix::<f32>::from_tensor(coembed).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The placement contract on a heavy-tailed cloud. Scoring on raw cells (rebuilt here by
+/// hand) piles the softmax onto the longest cells: features land outside the cloud, next to
+/// its longest cells — which also checks that the fixture and the diagnostic see the bias.
+/// [`feature_coembedding`] must put them inside it, beside cells of ordinary norm.
+#[test]
+fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
+    let target = 40.0;
+    for seed in 0..3 {
+        let (cells, feats) = heavy_tailed_cloud(seed);
+
+        let raw = standardize_columns(
+            &cells
+                .matmul(&feats.t().unwrap().contiguous().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let t_raw = calibrate_t_for_eff(&raw, target).unwrap();
+        let on_raw = placement(&cells, &coembed_from_scores(&raw, &cells, t_raw).unwrap());
+        assert!(
+            on_raw.beyond_p99 > 0.3 && on_raw.nn_norm_pct > 70.0 && !on_raw.on_manifold(),
+            "seed {seed}: the fixture must reproduce the bias on raw-cell scores, got {on_raw}"
+        );
+
+        let (co, _) = feature_coembedding(&cells, &feats, target).unwrap();
+        let got = placement(&cells, &co);
+        assert!(
+            (got.nn_norm_pct - 50.0).abs() <= 10.0 && got.beyond_p99 < 0.15 && got.on_manifold(),
+            "seed {seed}: features must sit on the manifold, got {got}"
+        );
+    }
 }
 
 /// The clamp that keeps a big-cluster dataset off the far tail of the curve,

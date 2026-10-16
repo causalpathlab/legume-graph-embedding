@@ -59,7 +59,10 @@ pub use model::JointEmbedModel;
 pub use multiome_plan::{
     detect_multiome_plan, plan_from_axes, read_file_axes, FileAxes, MultiomePlan,
 };
-pub use postprocess::{cell_clusters, feature_coembedding, feature_coembedding_fixed_t};
+pub use postprocess::{
+    cell_clusters, coembed_placement, feature_coembedding, feature_coembedding_fixed_t,
+    CoembedPlacement,
+};
 pub use preset_mode::{LoraArgs, LoraSpec, PresetMode, PresetOffsets, PresetRows};
 
 /// Graceful-stop on Ctrl+C. Lives in `legume_numeric::matrix` so the annotation crates *below* this one

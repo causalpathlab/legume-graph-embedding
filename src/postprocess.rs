@@ -92,6 +92,9 @@ const MAX_TARGET_EFF: f64 = 100.0;
 /// column) divides by a positive number instead of producing `NaN`.
 const SD_FLOOR: f64 = 1e-6;
 
+mod placement;
+pub use placement::{coembed_placement, CoembedPlacement};
+
 /// Leiden-cluster the cell embedding once. Returns `(labels, target_eff)` where
 /// `labels[i]` is cell `i`'s cluster (dense `0..k`) and `target_eff` is the
 /// median cluster size — the eff-cells target for [`feature_coembedding`]. The

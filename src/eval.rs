@@ -10,7 +10,7 @@
 use crate::model::JointEmbedModel;
 use legume_numeric::candle::candle_core::Tensor;
 use legume_numeric::matrix::traits::IoOps;
-use log::info;
+use log::{info, warn};
 
 /// File stems for the two embedding tables.
 ///
@@ -239,5 +239,19 @@ pub fn write_feature_coembedding(
     info!(
         "Feature co-embedding (SIMBA-style, T={t:.4}) → {out_prefix}.feature_coembedding.parquet"
     );
+
+    use legume_numeric::matrix::traits::ConvertMatOps;
+    let placement = crate::postprocess::coembed_placement(
+        &nalgebra::DMatrix::<f32>::from_tensor(e_cell)?,
+        &nalgebra::DMatrix::<f32>::from_tensor(&coembed)?,
+    )?;
+    if placement.on_manifold() {
+        info!("co-embedding placement: {placement}");
+    } else {
+        warn!(
+            "co-embedding placement: {placement} — features sit outside the cell cloud or track \
+             cell norm (want beyond_p99 < 0.15 and nn_norm_pct within 50 ± 10)"
+        );
+    }
     Ok(())
 }
