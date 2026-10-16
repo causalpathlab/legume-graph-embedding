@@ -71,32 +71,39 @@ const MIN_TARGET_EFF: f64 = 20.0;
 ///
 /// Numbers below are in the SAME units [`eff_from_scores`] reports — the MEAN
 /// over features of inverse-Simpson `1/Σ_c p²` — because that is what the
-/// bisection actually drives. Measured on direction scores ([`ScoreKeys`]) on three
-/// real runs, against the placement contract ([`coembed_placement`]: `nn_norm_pct`
-/// → 50, `beyond_p99` → 0) and `top30_cos`, the share of a gene's 30 nearest cells
-/// that are among its 30 best cells by `cos(e_f, e_cell)`:
+/// bisection actually drives. Swept on direction scores ([`ScoreKeys`]) over 16
+/// real runs (dentate gyrus, erythroid and pancreas, five to seven model variants
+/// each), against the placement contract ([`coembed_placement`]) and `top30_cos`,
+/// the share of a gene's 30 nearest cells that are among its 30 best cells by
+/// `cos(e_f, e_cell)`:
 ///
-/// | run (cells) | target | nn_norm_pct | dist_pct | beyond_p99 | top30_cos |
-/// |---|---|---|---|---|---|
-/// | pancreas (3.7k) | 20 / 50 / 100 / 200 | 50.7 / 49.2 / 46.6 / 41.6 | 60 / 53 / 42 / 25 | ≤ 0.017 | 0.53 / 0.51 / 0.47 / 0.39 |
-/// | dentate gyrus (2.9k) | 20 / 50 / 100 / 200 | 76.0 / 77.2 / 78.3 / 79.4 | 85 / 87 / 88 / 89 | ≤ 0.004 | 0.49 / 0.46 / 0.42 / 0.34 |
-/// | bone marrow (263k) | 20 / 50 / 100 / 200 | 42.9 / 43.0 / 43.1 / 43.0 | 44 / 44 / 44 / 43 | 0.12 / 0.11 / 0.11 / 0.10 | 0.27 / 0.27 / 0.27 / 0.27 |
+/// | target | 20 | 50 | 100 | 200 |
+/// |---|---|---|---|---|
+/// | nn_norm_pct, dentate gyrus (5 runs) | 74–78 | 76–79 | 77–79 | 78–80 |
+/// | nn_norm_pct, erythroid (7 runs) | 28–43 | 29–43 | 29–43 | 29–43 |
+/// | nn_norm_pct, pancreas (4 runs) | 37–41 | 35–39 | 32–35 | 27–30 |
+/// | beyond_p99, pancreas | ≤ 0.09 | ≤ 0.04 | ≤ 0.009 | ≤ 0.003 |
+/// | top30_cos, all runs | 0.28–0.52 | 0.26–0.50 | 0.24–0.45 | 0.21–0.37 |
 ///
-/// On the small runs a smaller target places genes better by direction, and on
-/// the large one the target barely matters. 50 is the smallest value that keeps
-/// pancreas centred (`dist_pct` 53 — at 20 genes start to drift outward, 60) while
-/// taking most of the `top30_cos` gain over 100.
+/// A smaller target always sharpens the direction match (`top30_cos` rises as the
+/// target shrinks, on every run) and moves dentate gyrus and pancreas a little
+/// toward the middle, but it leaves erythroid flat or slightly worse, and on
+/// pancreas it puts several times more genes beyond the edge of the cloud. A
+/// pre-registered rule (50 must
+/// beat 100 on `nn_norm_pct` and `top30_cos` in a clear majority of runs without
+/// raising `beyond_p99`) held on 7 of 16, so the target stays at 100. The constant
+/// is also the clamp for the type-annotation anchors (`target_eff_from_labels`).
 ///
-/// An earlier revision set 100 from recall of the top cells by the raw dot
-/// `⟨e_f, e_cell⟩`. On raw-cell scores that metric rewarded the near-hard placement
-/// of a gene on the longest cells, which is the bias [`ScoreKeys`] removes; once
-/// genes are placed by direction it drops by design (top-30 by dot 0.33–0.55 →
-/// 0.02–0.30 on the runs above) and no longer measures the goal.
+/// An earlier revision justified 100 by recall of the top cells by the raw dot
+/// `⟨e_f, e_cell⟩`. On raw-cell scores that metric rewarded the near-hard
+/// placement of a gene on the longest cells, which is the bias [`ScoreKeys`]
+/// removes; once genes are placed by direction it drops by design and no longer
+/// measures the goal.
 ///
 /// Why a CONSTANT and not a fraction of `n`: a gene attends to a fixed-size
-/// neighbourhood, not a fixed share of the dataset — on the 263k-cell run the
+/// neighbourhood, not a fixed share of the dataset — on a 263k-cell run the
 /// placement is flat across the whole range, so scaling with `n` buys nothing.
-const MAX_TARGET_EFF: f64 = 50.0;
+const MAX_TARGET_EFF: f64 = 100.0;
 /// Floor on a feature's score SD, so a zero-embedding feature (constant score
 /// column) divides by a positive number instead of producing `NaN`.
 const SD_FLOOR: f64 = 1e-6;
