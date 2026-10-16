@@ -1,6 +1,9 @@
 //! End-to-end check that `annotate_embeddings` emits the cell→coarse-label
 //! `membership.tsv` (consumed by `senna gem` and `data-beans stat -g`)
 //! in the expected 2-column, header-less format.
+//!
+//! `annotate_embeddings` is deprecated; this keeps its output format pinned until it goes.
+#![allow(deprecated)]
 
 use graph_embedding_util::type_annotation::{
     annotate_embeddings, AnnotateProjConfig, InputEmbeddings,

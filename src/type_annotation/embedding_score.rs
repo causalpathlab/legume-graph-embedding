@@ -176,7 +176,7 @@ pub fn cell_covariance(cells: &DMatrix<f64>) -> Result<DMatrix<f64>> {
 }
 
 /// The mean of the cluster means. `groups[i]` is cell `i`'s cluster; cells marked
-/// [`UNASSIGNED`](super::UNASSIGNED) are left out.
+/// [`UNASSIGNED`] are left out.
 pub fn balanced_centre(cells: &DMatrix<f64>, groups: &[usize]) -> Result<DVector<f64>> {
     ensure!(
         groups.len() == cells.nrows(),
