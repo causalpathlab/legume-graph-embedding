@@ -26,14 +26,9 @@ fn nan_features_are_not_on_the_manifold() {
     let cells = spokes(400);
     let feats = DMatrix::from_element(10, H, f32::NAN);
     let got = coembed_placement(&cells, &feats).unwrap();
-    // Non-finite and beyond the cloud — not also clauses read off NaN statistics.
-    assert_eq!(
-        got.violations(),
-        [
-            PlacementViolation::NonFinite,
-            PlacementViolation::BeyondCloud
-        ]
-    );
+    // Non-finite — not also clauses read off NaN statistics. (Ten rows are too few for the
+    // share clauses; `NonFinite` already names the failure.)
+    assert_eq!(got.violations(), [PlacementViolation::NonFinite]);
 
     let mut one_bad = DMatrix::from_fn(10, H, |i, j| cells[(i * 40, j)]);
     one_bad.row_mut(3).fill(f32::NAN);

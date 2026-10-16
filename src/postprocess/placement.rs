@@ -35,7 +35,9 @@
 //! the reported quartiles; a baseline built at the co-embedding's own averaging scale is the
 //! planned way to gate it.
 //!
-//! A non-finite feature row counts as beyond p99 and is left out of every other statistic.
+//! A feature row with a non-finite distance (a NaN or infinite coordinate, or one so large its
+//! distance overflows) counts as beyond p99 and is left out of every other statistic. The
+//! share-based clauses are judged only over at least `NN_K` features.
 //!
 //! A pure function of `(cells, features)`, so a consumer can check any co-embedding it reads,
 //! not only the one this crate just wrote.
@@ -130,8 +132,11 @@ pub struct CoembedPlacement {
     pub non_finite: usize,
     /// Share of finite features at the hub (`CellCloud::is_at_hub`).
     pub hub_share: f32,
-    /// The nearest-cell statistics, reported but not gated; `None` when there are too few
-    /// cells or features (fewer than `NN_K`) for them to mean anything.
+    /// Feature rows measured. Below `NN_K` the shares are not judged: a share of a handful of
+    /// features is not evidence.
+    pub n_feats: usize,
+    /// The nearest-cell statistics, reported but not gated; `None` at `NN_K` cells or fewer,
+    /// or fewer than `NN_K` finite features, where they mean nothing.
     pub nearest: Option<NearestCells>,
 }
 
@@ -156,7 +161,8 @@ pub enum PlacementViolation {
     NonFinite,
     /// `beyond_p99` is at or above its bound: features sit outside the cell cloud.
     BeyondCloud,
-    /// More than half the features sit at the hub: the co-embedding located nothing.
+    /// More than half the features sit at the hub: the co-embedding locates almost nothing
+    /// (`hub_call` warns at the same majority).
     HubCollapse,
 }
 
@@ -171,25 +177,28 @@ impl std::fmt::Display for PlacementViolation {
             Self::HubCollapse => write!(
                 f,
                 "more than {HUB_COLLAPSE_SHARE} of the features within {HUB_RADIUS_FRAC}·R of \
-                 the centre, the co-embedding collapsed to the hub"
+                 the centre: it locates almost nothing (an untrained gene space, or a flat \
+                 softmax)"
             ),
         }
     }
 }
 
 impl CoembedPlacement {
-    /// The unambiguous failures this placement shows. (`hub_share` is NaN only when every row
-    /// is non-finite, which `NonFinite` already reports.)
+    /// The unambiguous failures this placement shows. The share-based clauses are judged only
+    /// over at least `NN_K` features. (`hub_share` is NaN when no row has a finite distance —
+    /// all non-finite, which `NonFinite` reports, or all overflowing, which counts as beyond.)
     #[must_use]
     pub fn violations(&self) -> Vec<PlacementViolation> {
+        let judged = self.n_feats >= NN_K;
         [
             (self.non_finite > 0, PlacementViolation::NonFinite),
             (
-                self.beyond_p99 >= MAX_BEYOND_P99,
+                judged && self.beyond_p99 >= MAX_BEYOND_P99,
                 PlacementViolation::BeyondCloud,
             ),
             (
-                self.hub_share > HUB_COLLAPSE_SHARE,
+                judged && self.hub_share > HUB_COLLAPSE_SHARE,
                 PlacementViolation::HubCollapse,
             ),
         ]
@@ -215,6 +224,7 @@ impl std::fmt::Display for CoembedPlacement {
             hub_share,
             non_finite,
             nearest,
+            ..
         } = self;
         write!(
             f,
@@ -230,7 +240,8 @@ impl std::fmt::Display for CoembedPlacement {
             )?,
             None => write!(
                 f,
-                ", nearest-cell percentile not measured (fewer than {NN_K} cells or features)"
+                ", nearest-cell percentile not measured (at most {NN_K} cells, or fewer than \
+                 {NN_K} finite features)"
             )?,
         }
         if *non_finite > 0 {
@@ -318,16 +329,24 @@ fn placement_of_rows(cells: &[f32], feats: &[f32], h: usize) -> anyhow::Result<C
         .collect();
     finite_dist.sort_unstable_by(f32::total_cmp);
     let dist_x_r = quantile_sorted(&finite_dist, 0.5) / radius;
-    let finite_pct: Vec<f32> = finite_dist.iter().map(|&x| pct(x)).collect();
-    let dist_pct = quantile_sorted(&finite_pct, 0.5);
+    // The median of per-feature percentiles: `pct` is monotone and `finite_dist` sorted, so it
+    // is the mean of the middle one or two features' percentiles.
+    let m = finite_dist.len();
+    let dist_pct = match m {
+        0 => f32::NAN,
+        _ if m % 2 == 1 => pct(finite_dist[m / 2]),
+        _ => 0.5 * (pct(finite_dist[m / 2 - 1]) + pct(finite_dist[m / 2])),
+    };
     // `finite_dist` is sorted, so the rows at the hub are a prefix.
     let hub_share =
         finite_dist.partition_point(|&x| cloud.is_at_hub(x)) as f32 / finite_dist.len() as f32;
 
     // Below a neighbourhood's worth of cells or features the statistics are degenerate.
     let nearest = (n > NN_K && finite_dist.len() >= NN_K).then(|| {
-        let cell_pct: Vec<f32> = cloud.dist.iter().map(|&x| pct(x)).collect();
-        nearest_cells(cells, feats, h, &feat_dist, &cell_pct)
+        let cell_idx = super::strided_indices(n, MAX_NN_CELLS);
+        let cell_pct: Vec<f32> = cell_idx.iter().map(|&i| pct(cloud.dist[i])).collect();
+        let finite_rows: Vec<usize> = (0..d).filter(|&g| feat_dist[g].is_finite()).collect();
+        nearest_cells(cells, &cell_idx, &cell_pct, feats, &finite_rows, h)
     });
 
     Ok(CoembedPlacement {
@@ -342,21 +361,21 @@ fn placement_of_rows(cells: &[f32], feats: &[f32], h: usize) -> anyhow::Result<C
             .filter(|&g| feats[g * h..(g + 1) * h].iter().any(|x| !x.is_finite()))
             .count(),
         hub_share,
+        n_feats: d,
         nearest,
     })
 }
 
-/// The report-only nearest-cell statistics, on strided subsamples, finite feature rows only.
-/// Needs more than `NN_K` cells; `cell_pct` is every cell's distance percentile.
+/// The report-only nearest-cell statistics over the sampled cells `cell_idx` (more than `NN_K`
+/// of them, with distance percentiles `cell_pct`) and a strided sample of `finite_rows`.
 fn nearest_cells(
     cells: &[f32],
-    feats: &[f32],
-    h: usize,
-    feat_dist: &[f32],
+    cell_idx: &[usize],
     cell_pct: &[f32],
+    feats: &[f32],
+    finite_rows: &[usize],
+    h: usize,
 ) -> NearestCells {
-    let (n, d) = (cells.len() / h, feats.len() / h);
-    let cell_idx = super::strided_indices(n, MAX_NN_CELLS);
     let sub_cells: Vec<&[f32]> = cell_idx
         .iter()
         .map(|&i| &cells[i * h..(i + 1) * h])
@@ -371,17 +390,12 @@ fn nearest_cells(
         d2.select_nth_unstable_by(NN_K - 1, |a, b| a.0.total_cmp(&b.0));
         d2[..NN_K].iter().map(|&(_, c)| c).collect()
     };
-    let nearest_pct = |e: &[f32]| {
-        nearest(e)
-            .iter()
-            .map(|&c| cell_pct[cell_idx[c]])
-            .sum::<f32>()
-            / NN_K as f32
-    };
+    let nearest_pct =
+        |e: &[f32]| nearest(e).iter().map(|&c| cell_pct[c]).sum::<f32>() / NN_K as f32;
 
-    let mut per_feat: Vec<f32> = super::strided_indices(d, MAX_NN_FEATS)
+    let mut per_feat: Vec<f32> = super::strided_indices(finite_rows.len(), MAX_NN_FEATS)
         .into_par_iter()
-        .filter(|&g| feat_dist[g].is_finite())
+        .map(|i| finite_rows[i])
         .map(|g| nearest_pct(&feats[g * h..(g + 1) * h]))
         .collect();
     per_feat.sort_unstable_by(f32::total_cmp);

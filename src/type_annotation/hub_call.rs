@@ -101,19 +101,20 @@ pub(super) fn zero_hub_parked(
     // judged. The same definition the co-embedding's placement diagnostic uses.
     let cloud = crate::postprocess::CellCloud::of(cell_emb);
     let radius = cloud.radius;
-    // Deliberately negated, not `radius <= 0.0`: this must also catch a NaN radius
-    // (a NaN anywhere in `cell_emb` propagates here), which `<=` would let through
-    // and turn every downstream `d2 < cutoff` test into a silent false.
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    if !(radius > 0.0) {
-        // Every cell is at the same point; there is no cloud, so there is no hub to call against.
+    // A NaN radius (a NaN anywhere in `cell_emb`) would make every hub test silently false,
+    // and an infinite one (distances that overflow) silently true for every row.
+    if !(radius.is_finite() && radius > 0.0) {
+        // No usable cloud (identical cells, or non-finite ones): no hub to call against.
         return 0;
     }
 
-    let parked: Vec<bool> = (0..g)
+    let dist: Vec<f32> = (0..g)
         .into_par_iter()
-        .map(|i| cloud.is_at_hub(l2_simd(&beta_flat[i * h..(i + 1) * h], &cloud.centre)))
+        .map(|i| l2_simd(&beta_flat[i * h..(i + 1) * h], &cloud.centre))
         .collect();
+    let parked: Vec<bool> = dist.iter().map(|&d| cloud.is_at_hub(d)).collect();
+    // The share is of rows with a finite position, as the placement diagnostic counts it.
+    let measured = dist.iter().filter(|d| d.is_finite()).count().max(1);
 
     let n_zeroed = parked.iter().filter(|&&p| p).count();
     if n_zeroed == 0 {
@@ -125,18 +126,19 @@ pub(super) fn zero_hub_parked(
         }
     }
 
-    let frac = n_zeroed as f64 / g as f64;
+    let frac = n_zeroed as f64 / measured as f64;
     info!(
-        "hub call: {n_zeroed}/{g} feature rows ({:.0}%) sit at the centre of the cell cloud — the \
-         co-embedding's signature for a gene it never learned. Zeroed, so they are read as missing \
-         data rather than averaged into a centroid.",
+        "hub call: {n_zeroed}/{measured} placed feature rows ({:.0}%) sit at the centre of the \
+         cell cloud — the co-embedding's signature for a gene it never learned. Zeroed, so they \
+         are read as missing data rather than averaged into a centroid.",
         100.0 * frac
     );
     if frac > f64::from(HUB_COLLAPSE_SHARE) {
         warn!(
-            "hub call: MORE THAN HALF the feature rows ({:.0}%) are parked at the cell-cloud \
+            "hub call: MORE THAN {:.0}% of the feature rows ({:.0}%) are parked at the cell-cloud \
              centre. This embedding has barely learned a gene space at all; a nearest-centroid \
              annotation over it will be noise whatever the markers say.",
+            100.0 * f64::from(HUB_COLLAPSE_SHARE),
             100.0 * frac
         );
     }
