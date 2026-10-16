@@ -16,6 +16,9 @@
 //! A pure function of `(cells, features)`, so a consumer can check any co-embedding it reads,
 //! not only the one this crate just wrote.
 
+#[cfg(test)]
+mod tests;
+
 use legume_numeric::matrix::dmatrix_io::DMatrix;
 use rayon::prelude::*;
 
