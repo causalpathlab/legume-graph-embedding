@@ -75,9 +75,9 @@ const MIN_TARGET_EFF: f64 = 20.0;
 ///
 /// | target | 20 | 50 | 100 | 200 |
 /// |---|---|---|---|---|
-/// | nn_norm_pct, dentate gyrus (5 runs) | 74–78 | 76–79 | 77–79 | 78–80 |
-/// | nn_norm_pct, erythroid (7 runs) | 28–43 | 29–43 | 29–43 | 29–43 |
-/// | nn_norm_pct, pancreas (4 runs) | 37–41 | 35–39 | 32–35 | 27–30 |
+/// | nearest-cell pct, dentate gyrus (5 runs) | 74–78 | 76–79 | 77–79 | 78–80 |
+/// | nearest-cell pct, erythroid (7 runs) | 28–43 | 29–43 | 29–43 | 29–43 |
+/// | nearest-cell pct, pancreas (4 runs) | 37–41 | 35–39 | 32–35 | 27–30 |
 /// | beyond_p99, pancreas | ≤ 0.09 | ≤ 0.04 | ≤ 0.009 | ≤ 0.003 |
 /// | top30_cos, all runs | 0.28–0.52 | 0.26–0.50 | 0.24–0.45 | 0.21–0.37 |
 ///
@@ -85,8 +85,9 @@ const MIN_TARGET_EFF: f64 = 20.0;
 /// target shrinks, on every run) and moves dentate gyrus and pancreas a little
 /// toward the middle, but it leaves erythroid flat or slightly worse, and on
 /// pancreas it puts several times more genes beyond the edge of the cloud. A rule
-/// fixed before the sweep (50 must beat 100 on `nn_norm_pct` and `top30_cos` in a
-/// clear majority of runs without raising `beyond_p99`) held on 7 of 16, so the
+/// fixed before the sweep (50 must beat 100 on the nearest-cell percentile and
+/// `top30_cos` in a clear majority of runs without raising `beyond_p99`) held on 7 of
+/// 16, so the
 /// target stays at 100. The constant is also the clamp for the type-annotation
 /// anchors (`target_eff_from_labels`). Recall of the top cells by the raw dot
 /// `⟨e_f, e_cell⟩` is not used: it rewards parking a gene on the longest cells.
@@ -103,7 +104,7 @@ const SD_FLOOR: f64 = 1e-6;
 const NORM_FLOOR: f64 = 1e-12;
 
 mod placement;
-pub(crate) use placement::HUB_RADIUS_FRAC;
+pub(crate) use placement::HUB_COLLAPSE_SHARE;
 pub use placement::{coembed_placement, CoembedPlacement, NearestCells, PlacementViolation};
 pub(crate) use placement::{coembed_placement_of_tensors, CellCloud};
 

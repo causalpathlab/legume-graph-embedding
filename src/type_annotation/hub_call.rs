@@ -39,7 +39,8 @@
 //! # The call
 //!
 //! Measure every gene's distance to the hub **in units of the cell cloud's own radius**
-//! `R = mean‖x − hub‖`, and zero the rows that sit within [`HUB_RADIUS_FRAC`] of the centre.
+//! `R = mean‖x − hub‖`, and zero the rows that sit at the hub
+//! ([`crate::postprocess::CellCloud::is_at_hub`]).
 //!
 //! The scale is the point of it. A gene can only tell one cell from another if its coordinate is an
 //! appreciable distance from the middle of them all; at `d ≪ R` it is very nearly equidistant from
@@ -76,7 +77,8 @@ use legume_numeric::matrix::dmatrix_io::DMatrix;
 use log::{info, warn};
 use rayon::prelude::*;
 
-use crate::postprocess::HUB_RADIUS_FRAC;
+use crate::postprocess::HUB_COLLAPSE_SHARE;
+use legume_numeric::matrix::knn::metric::l2_simd;
 
 /// Zero every feature row that the co-embedding parked at the hub of the cell cloud.
 ///
@@ -97,11 +99,8 @@ pub(super) fn zero_hub_parked(
     // The hub (the centre of the cell cloud, which is exactly where a flat softmax lands a
     // gene) and the cloud's own radius — the scale against which "close to the centre" is
     // judged. The same definition the co-embedding's placement diagnostic uses.
-    let crate::postprocess::CellCloud {
-        centre: hub,
-        radius,
-        ..
-    } = crate::postprocess::CellCloud::of(cell_emb);
+    let cloud = crate::postprocess::CellCloud::of(cell_emb);
+    let radius = cloud.radius;
     // Deliberately negated, not `radius <= 0.0`: this must also catch a NaN radius
     // (a NaN anywhere in `cell_emb` propagates here), which `<=` would let through
     // and turn every downstream `d2 < cutoff` test into a silent false.
@@ -110,21 +109,10 @@ pub(super) fn zero_hub_parked(
         // Every cell is at the same point; there is no cloud, so there is no hub to call against.
         return 0;
     }
-    let cutoff = HUB_RADIUS_FRAC * radius;
 
     let parked: Vec<bool> = (0..g)
         .into_par_iter()
-        .map(|i| {
-            let d2: f32 = beta_flat[i * h..(i + 1) * h]
-                .iter()
-                .zip(&hub)
-                .map(|(&x, &m)| {
-                    let d = x - m;
-                    d * d
-                })
-                .sum();
-            d2.sqrt() < cutoff
-        })
+        .map(|i| cloud.is_at_hub(l2_simd(&beta_flat[i * h..(i + 1) * h], &cloud.centre)))
         .collect();
 
     let n_zeroed = parked.iter().filter(|&&p| p).count();
@@ -144,7 +132,7 @@ pub(super) fn zero_hub_parked(
          data rather than averaged into a centroid.",
         100.0 * frac
     );
-    if frac > 0.5 {
+    if frac > f64::from(HUB_COLLAPSE_SHARE) {
         warn!(
             "hub call: MORE THAN HALF the feature rows ({:.0}%) are parked at the cell-cloud \
              centre. This embedding has barely learned a gene space at all; a nearest-centroid \

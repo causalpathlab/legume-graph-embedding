@@ -26,7 +26,14 @@ fn nan_features_are_not_on_the_manifold() {
     let cells = spokes(400);
     let feats = DMatrix::from_element(10, H, f32::NAN);
     let got = coembed_placement(&cells, &feats).unwrap();
-    assert!(!got.on_manifold(), "an all-NaN co-embedding passed: {got}");
+    // Non-finite and beyond the cloud — not also clauses read off NaN statistics.
+    assert_eq!(
+        got.violations(),
+        [
+            PlacementViolation::NonFinite,
+            PlacementViolation::BeyondCloud
+        ]
+    );
 
     let mut one_bad = DMatrix::from_fn(10, H, |i, j| cells[(i * 40, j)]);
     one_bad.row_mut(3).fill(f32::NAN);
@@ -112,19 +119,6 @@ fn a_huge_finite_row_is_not_counted_as_non_finite() {
     let got = coembed_placement(&cells, &feats).unwrap();
     assert_eq!(got.non_finite, 0, "{got}");
     assert!(got.beyond_p99 >= 0.1, "{got}");
-}
-
-/// All-NaN features fail as non-finite and beyond the cloud — not also as "outward" and
-/// "inward" at once from NaN statistics.
-#[test]
-fn nan_features_report_only_unambiguous_failures() {
-    let cells = spokes(400);
-    let feats = DMatrix::from_element(10, H, f32::NAN);
-    let v = format!(
-        "{:?}",
-        coembed_placement(&cells, &feats).unwrap().violations()
-    );
-    assert_eq!(v, "[NonFinite, BeyondCloud]");
 }
 
 /// `dist_pct` is the median over features of each feature's distance percentile. With two

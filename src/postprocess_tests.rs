@@ -312,10 +312,9 @@ fn elongated_cloud(seed: u64) -> (Tensor, Tensor) {
     to_tensors(cells, feats)
 }
 
-/// A co-embedded gene is an average of cells, so it sits somewhat inward of single cells;
-/// on an elongated cloud that puts the genes' nearest cells well below the 50th norm
-/// percentile without any bias. The contract must judge placement against how the cells'
-/// own local averages sit, not against a fixed 50.
+/// A co-embedded gene is an average of cells, so on an elongated cloud it sits well inward of
+/// single cells — its nearest cells far below the 50th norm percentile — without any bias.
+/// The contract does not judge that.
 #[test]
 fn an_elongated_cloud_stays_on_the_manifold() {
     for seed in 0..2 {
@@ -383,19 +382,20 @@ fn a_single_healthy_feature_passes() {
     }
 }
 
-/// Fewer cells than a nearest-cell neighbourhood: the statistics are degenerate, so float
-/// rounding must not decide the verdict.
+/// Fewer cells than a nearest-cell neighbourhood: the nearest-cell statistics are degenerate,
+/// so they are not measured, and the verdict rests on the unambiguous clauses alone.
 #[test]
-fn a_tiny_cloud_is_not_judged_on_rounding() {
+fn a_tiny_cloud_is_judged_without_nearest_cells() {
     let mut rng = StdRng::seed_from_u64(7);
     let normal = Normal::new(0f32, 1.0).unwrap();
-    for trial in 0..100 {
+    for trial in 0..25 {
         let n = 5 + trial % 25;
         let cells: Vec<f32> = (0..n * H).map(|_| normal.sample(&mut rng)).collect();
         let feats: Vec<f32> = (0..10 * H).map(|_| 0.3 * normal.sample(&mut rng)).collect();
         let cells = Tensor::from_vec(cells, (n, H), &Device::Cpu).unwrap();
         let feats = Tensor::from_vec(feats, (10, H), &Device::Cpu).unwrap();
         let got = placement(&cells, &feats);
+        assert!(got.nearest.is_none(), "trial {trial} ({n} cells): {got}");
         assert!(
             got.on_manifold(),
             "trial {trial} ({n} cells): {got}: {:?}",
