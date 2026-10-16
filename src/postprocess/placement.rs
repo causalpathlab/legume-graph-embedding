@@ -28,9 +28,9 @@
 #[cfg(test)]
 mod tests;
 
-use legume_numeric::candle::candle_core::Tensor;
+use legume_numeric::candle::candle_core::{DType, Tensor};
 use legume_numeric::matrix::dmatrix_io::DMatrix;
-use legume_numeric::matrix::knn::metric::l2_sq;
+use legume_numeric::matrix::knn::metric::{l2_simd, l2_sq};
 use rayon::prelude::*;
 
 /// Nearest cells per feature for `nn_norm_pct`.
@@ -72,7 +72,7 @@ impl CellCloud {
         centre.iter_mut().for_each(|c| *c /= n.max(1) as f32);
         let dist: Vec<f32> = cells
             .par_chunks_exact(h)
-            .map(|row| l2_sq(row, &centre).sqrt())
+            .map(|row| l2_simd(row, &centre))
             .collect();
         let radius = dist.iter().sum::<f32>() / n.max(1) as f32;
         Self {
@@ -181,7 +181,7 @@ pub(crate) fn coembed_placement_of_tensors(
         "coembed_placement: H mismatch (cells {h}, features {h2})"
     );
     let rows = |t: &Tensor| -> anyhow::Result<Vec<f32>> {
-        Ok(t.contiguous()?.flatten_all()?.to_vec1::<f32>()?)
+        Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?)
     };
     placement_of_rows(&rows(cells)?, &rows(feats)?, h)
 }
@@ -204,13 +204,17 @@ fn placement_of_rows(cells: &[f32], feats: &[f32], h: usize) -> anyhow::Result<C
 
     let feat_dist: Vec<f32> = feats
         .par_chunks_exact(h)
-        .map(|row| l2_sq(row, &cloud.centre).sqrt())
+        .map(|row| l2_simd(row, &cloud.centre))
         .collect();
 
     let mut sorted = cloud.dist.clone();
     sorted.sort_unstable_by(f32::total_cmp);
-    // Share of cells strictly closer to the centre than `x`, in percent.
-    let pct = |x: f32| sorted.partition_point(|&c| c < x) as f32 / n as f32 * 100.0;
+    // Percentile of `x` among the cells' distances, ties at the middle of their range.
+    let pct = |x: f32| {
+        let below = sorted.partition_point(|&c| c < x);
+        let up_to = sorted.partition_point(|&c| c <= x);
+        (below + up_to) as f32 / 2.0 / n as f32 * 100.0
+    };
 
     let p99 = quantile_sorted(&sorted, 0.99);
     // A NaN row counts as beyond: it is not on the cloud.
@@ -221,10 +225,14 @@ fn placement_of_rows(cells: &[f32], feats: &[f32], h: usize) -> anyhow::Result<C
         .filter(|x| x.is_finite())
         .collect();
     finite_dist.sort_unstable_by(f32::total_cmp);
-    // `pct` is monotone, so the percentiles of sorted distances come out sorted.
-    let finite_pct: Vec<f32> = finite_dist.iter().map(|&x| pct(x)).collect();
-    let dist_x_r = quantile_sorted(&finite_dist, 0.5) / radius;
-    let dist_pct = quantile_sorted(&finite_pct, 0.5);
+    let median_dist = quantile_sorted(&finite_dist, 0.5);
+    let dist_x_r = median_dist / radius;
+    // `pct` is monotone, so the median feature's percentile is the percentile of the median.
+    let dist_pct = if median_dist.is_nan() {
+        f32::NAN
+    } else {
+        pct(median_dist)
+    };
 
     // Nearest cells, on strided subsamples of both sides, finite feature rows only.
     let cell_idx = super::strided_indices(n, MAX_NN_CELLS);
@@ -255,7 +263,10 @@ fn placement_of_rows(cells: &[f32], feats: &[f32], h: usize) -> anyhow::Result<C
         dist_x_r,
         dist_pct,
         beyond_p99,
-        non_finite: feat_dist.iter().filter(|x| !x.is_finite()).count(),
+        non_finite: feats
+            .chunks_exact(h)
+            .filter(|row| row.iter().any(|x| !x.is_finite()))
+            .count(),
         // An empty `per_feat` gives 0/0 = NaN, which fails every gate.
         nn_norm_pct: per_feat.iter().sum::<f32>() / per_feat.len() as f32,
         nn_norm_pct_q25: quantile_sorted(&per_feat, 0.25),

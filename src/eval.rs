@@ -243,6 +243,11 @@ pub fn write_feature_coembedding(
     // The check only reports: a co-embedding it cannot measure is still written.
     match crate::postprocess::coembed_placement_of_tensors(e_cell, &coembed) {
         Ok(p) if p.on_manifold() => info!("co-embedding placement: {p}"),
+        Ok(p) if p.non_finite > 0 => warn!(
+            "co-embedding placement: {p} — the co-embedding has {} non-finite rows; the fit \
+             diverged",
+            p.non_finite
+        ),
         Ok(p) => warn!(
             "co-embedding placement: {p} — features sit outside the cell cloud or track cell \
              norm (want {})",
