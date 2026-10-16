@@ -14,7 +14,7 @@
 //! measures exactly that, and `write_feature_coembedding` logs it on every write.
 //!
 //! ```text
-//!   ê_cell   = e_cell / ‖e_cell‖ (per row)         [N, H]   (per-CELL unit norm)
+//!   ê_cell   = (e_cell − μ) / ‖e_cell − μ‖         [N, H]   (per-CELL unit norm, from the centre μ)
 //!   S        = ê_cell · e_featᵀ                   [N, D]
 //!   S̃[:,f]   = S[:,f] / sd_c(S[:,f])              [N, D]   (per-FEATURE unit scale)
 //!   P[:,f]   = softmax_over_cells( S̃[:,f] / T )    [N, D]   (column-stochastic)
@@ -292,7 +292,8 @@ fn standardize_columns(scores: &Tensor) -> Result<Tensor> {
     scores.broadcast_div(&sd)
 }
 
-/// The cells as the calibrated softmax sees them: each row scaled to unit norm.
+/// The cells as the calibrated softmax sees them: each cell's offset from the
+/// cloud centre, scaled to unit norm.
 /// The ONE place scores are made on the calibrated path — the temperature
 /// calibration and [`coembed_block`] both go through [`ScoreKeys::scores`], so
 /// `T` cannot be calibrated in one set of units and applied in another.
@@ -306,12 +307,20 @@ fn standardize_columns(scores: &Tensor) -> Result<Tensor> {
 /// placement bias tracked max/median cell norm (Spearman +0.9), not `N`. Scoring on
 /// direction alone removes the norm from the softmax; the AVERAGE stays over the raw
 /// cells, so the coordinate is still in the cells' own units.
+///
+/// Why from the centre. Directions from the origin depend on where the origin
+/// happens to sit: for a cloud off it (`Z = θ·α` with `θ` on the simplex is off it
+/// by construction) the shared part `⟨μ, e_f⟩ / ‖e_cell‖` becomes a per-cell term
+/// and placement tracks cell norm again. From the centre, translating the cells
+/// translates the co-embedding and leaves `T` alone. bge's cell embeddings are
+/// already centred, so there this is a no-op.
 struct ScoreKeys(Tensor);
 
 impl ScoreKeys {
     fn new(e_cell: &Tensor) -> Result<Self> {
-        let norm = e_cell.sqr()?.sum_keepdim(1)?.sqrt()?.maximum(NORM_FLOOR)?; // [N, 1]
-        Ok(Self(e_cell.broadcast_div(&norm)?))
+        let centred = e_cell.broadcast_sub(&e_cell.mean_keepdim(0)?)?; // [N, H]
+        let norm = centred.sqr()?.sum_keepdim(1)?.sqrt()?.maximum(NORM_FLOOR)?; // [N, 1]
+        Ok(Self(centred.broadcast_div(&norm)?))
     }
 
     /// `standardize(ê_cell · e_fᵀ)` for one `[B, H]` feature block → `[N, B]`.
