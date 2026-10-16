@@ -9,17 +9,41 @@
 //! `senna annotate-ontology` / `-by-enrichment` (which delegate to it), so the
 //! OBO glue is written once.
 
-use anyhow::Result;
+use super::markers::{split_tab_first, type_key};
+use anyhow::{ensure, Context, Result};
 use data_beans::aux::ontology::Ontology;
-use enrichment::{
-    annotate_ontology_core, parse_label_map, Mat, OntologyAccess, OntologyParams, OntologyScore,
-};
+use enrichment::{annotate_ontology_core, Mat, OntologyAccess, OntologyParams, OntologyScore};
 use log::info;
 use rustc_hash::FxHashMap;
 
-/// Read the curated `label<TAB>CL:id` map, keyed the way panel type names are.
+/// Read the curated `label<TAB>CL:id` map, keyed the way panel type names are: lines split by
+/// [`split_tab_first`], labels mapped by [`type_key`]. Blank lines, `#` comments and rows whose
+/// id is not a `CL:` id (a header) are skipped; one label with two ids is an error.
 pub(super) fn read_label_map(path: &str) -> Result<FxHashMap<Box<str>, Box<str>>> {
-    parse_label_map(path, |id| id.starts_with("CL:"))
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading label→id map {path}"))?;
+    let mut map: FxHashMap<Box<str>, Box<str>> = FxHashMap::default();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = split_tab_first(line);
+        let (Some(&label), Some(&id)) = (fields.first(), fields.get(1)) else {
+            continue;
+        };
+        if label.is_empty() || !id.starts_with("CL:") {
+            continue;
+        }
+        let key = type_key(label);
+        if let Some(prev) = map.insert(key.clone(), Box::from(id)) {
+            ensure!(
+                prev.as_ref() == id,
+                "label {key:?} mapped to two different ids in {path}: {prev} vs {id}"
+            );
+        }
+    }
+    ensure!(!map.is_empty(), "no `label<TAB>id` rows parsed from {path}");
+    Ok(map)
 }
 
 /// Load the Cell Ontology + curated `label<TAB>CL:id` map, inject them into the

@@ -312,25 +312,34 @@ fn report_panel_coverage(
     Ok(())
 }
 
+/// Split one panel or label-map line: on the tab only if it has one, so a label keeps its
+/// commas (a Cell Ontology name such as `CD4-positive, alpha-beta T cell`); else on commas.
+/// Fields are trimmed and unquoted.
+pub(super) fn split_tab_first(line: &str) -> Vec<&str> {
+    use legume_numeric::matrix::table::Delimiter;
+    let delim = if line.contains('\t') {
+        Delimiter::Tab
+    } else {
+        Delimiter::Comma
+    };
+    delim.split(line)
+}
+
+/// A panel label as a type name: spaces → `_`. The label→CL map keys the same way.
+pub(super) fn type_key(label: &str) -> Box<str> {
+    Box::from(label.replace(' ', "_"))
+}
+
 /// Parse a marker TSV/CSV into `(gene, celltype)` pairs (the first two fields; blank, `#`
-/// and `gene`/`symbol` header rows skipped), mapping spaces in cell-type names → `_`.
-///
-/// A line with a tab splits on the tab only, so a label keeps its commas (a Cell Ontology
-/// name such as `CD4-positive, alpha-beta T cell`); a line with no tab is CSV.
+/// and `gene`/`symbol` header rows skipped). Lines split by [`split_tab_first`]; type names
+/// are [`type_key`]s.
 ///
 /// TODO: go back to `data_beans::aux::gene_sets::read_membership_pairs` once it splits a
 /// tab-bearing line on the tab only; today it splits on commas too.
 pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
     use legume_numeric::matrix::common_io::read_lines_of_words_generic;
-    use legume_numeric::matrix::table::Delimiter;
     let split = |line: &str| -> Vec<Box<str>> {
-        let delim = if line.contains('\t') {
-            Delimiter::Tab
-        } else {
-            Delimiter::Comma
-        };
-        delim
-            .split(line)
+        split_tab_first(line)
             .into_iter()
             .take(2)
             .map(Box::from)
@@ -346,8 +355,8 @@ pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
             let header = ["gene", "symbol"]
                 .iter()
                 .any(|h| gene.eq_ignore_ascii_case(h));
-            (!gene.is_empty() && !label.is_empty() && !header)
-                .then(|| (gene, Box::from(label.replace(' ', "_"))))
+            (!gene.is_empty() && !gene.starts_with('#') && !label.is_empty() && !header)
+                .then(|| (gene, type_key(&label)))
         })
         .collect();
     anyhow::ensure!(!out.is_empty(), "no marker pairs parsed from {path}");
