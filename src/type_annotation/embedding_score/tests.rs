@@ -198,3 +198,39 @@ fn the_balanced_centre_weights_clusters_equally() {
     let centre = balanced_centre(&cells, &groups).unwrap();
     assert!((centre[0] - 5.0).abs() < 1e-12, "{centre}");
 }
+
+/// The marker floor counts live markers: a type with three matches, two of them dead rows,
+/// would score on one gene, so it is dropped. Dead rows leave after IDF, so `C` still counts
+/// every panel type and the survivors' weights are unchanged.
+#[test]
+fn the_marker_floor_counts_live_markers() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("geu_embedding_score_live_floor");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("markers.tsv");
+    let mut file = std::fs::File::create(&path).unwrap();
+    for (genes, ty) in [
+        (["g00", "g01", "g02"], "Live"),
+        (["g12", "g13", "g14"], "Thin"),
+        (["g03", "g04", "g05"], "Other"),
+    ] {
+        for g in genes {
+            writeln!(file, "{g}\t{ty}").unwrap();
+        }
+    }
+    drop(file);
+
+    let mut f = fixture(7);
+    f.rho.row_mut(13).fill(0.0);
+    f.rho.row_mut(14).fill(0.0);
+    let panel = f.space().marker_sets(path.to_str().unwrap(), 0.0).unwrap();
+    let names: Vec<&str> = panel.type_names.iter().map(AsRef::as_ref).collect();
+    assert_eq!(names, ["Live", "Other"]);
+    for set in &panel.sets {
+        assert_eq!(set.len(), 3, "{set:?}");
+        assert!(
+            set.iter().all(|&(_, w)| (w - 3f64.ln()).abs() < 1e-12),
+            "{set:?}"
+        );
+    }
+}
