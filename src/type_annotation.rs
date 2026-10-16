@@ -80,7 +80,7 @@ use score::*;
 
 /// The shared per-cell label-file writer (`argmax.tsv` + `membership.tsv`),
 /// used by BOTH annotation methods so their per-cell I/O is identical.
-pub use output::write_label_tsvs;
+pub use output::{write_cell_labels, write_label_tsvs, CELL_LABELS_SUFFIX};
 
 /// The shared marker-panel reader: parse `gene<TAB>celltype`, match its genes against a caller's
 /// feature axis (exact → symbol → flexible), IDF-weight them, gate on panel coverage, and drop
