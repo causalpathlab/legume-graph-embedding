@@ -50,18 +50,21 @@ pub fn parse_and_match_markers(
 }
 
 /// [`parse_and_match_markers`]'s matching and IDF, weighted in `f64` and with each set sorted
-/// by gene index: `ln(C / df_gene)` over every panel type `C`, IDF-0 genes dropped, and a
-/// type left with fewer than `min_markers` markers dropped.
+/// by gene index: `ln(C / df_gene)` over every panel type `C`, IDF-0 genes dropped. Genes
+/// that are not `live` leave after weighting, so they still count in `df` and `C`; a type
+/// left with fewer than `min_markers` live markers is then dropped.
 pub(super) fn parse_and_match_idf_sets(
     markers_path: &str,
     gene_names: &[Box<str>],
     min_coverage: f32,
     min_markers: usize,
+    live: impl Fn(u32) -> bool,
 ) -> Result<TypedSets<f64>> {
     let panel = match_panel(markers_path, gene_names, min_coverage)?;
     let c = panel.type_names.len() as f64;
     let mut sets = panel.weigh(|df| Some((c / df as f64).ln()).filter(|&w| w > 0.0));
     for set in &mut sets {
+        set.retain(|&(gi, _)| live(gi));
         set.sort_unstable_by_key(|&(gi, _)| gi);
     }
     drop_thin_types(&panel.type_names, sets, min_markers)

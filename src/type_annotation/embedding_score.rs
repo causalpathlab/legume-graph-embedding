@@ -44,7 +44,8 @@
 //! [`FeatureSpace::marker_sets`] matches a panel through the crate's shared marker reader
 //! (the one behind [`parse_and_match_markers`](super::parse_and_match_markers)). Weights are
 //! IDF, `ln(C / #types holding the gene)`, where `C` counts every panel type. IDF-0 genes are
-//! dropped, and so is a type left with fewer than [`MIN_MARKERS`] markers.
+//! dropped, and so is a type left with fewer than [`MIN_MARKERS`] live markers (dead rows,
+//! below, leave after the weights are set).
 //!
 //! [`calls`] gives each cell its best **live** type, one whose direction is not the zero
 //! row, and the margin over the runner-up. There is no null and no abstention: a call is the
@@ -68,7 +69,7 @@ use legume_numeric::matrix::traits::MatOps;
 use nalgebra::{DMatrix, DVector, RowDVector};
 use std::collections::BTreeMap;
 
-/// A type left with fewer markers than this (after matching and IDF) is dropped.
+/// A type left with fewer live markers than this (after matching and IDF) is dropped.
 pub const MIN_MARKERS: usize = 3;
 
 /// One type's markers: `(feature index, weight)`.
@@ -132,8 +133,13 @@ impl FeatureSpace {
 
     /// Read a `gene<TAB>celltype` panel and match it to this space's genes.
     pub fn marker_sets(&self, markers_path: &str, min_coverage: f32) -> Result<PanelSets> {
-        let (type_names, sets) =
-            parse_and_match_idf_sets(markers_path, &self.gene_names, min_coverage, MIN_MARKERS)?;
+        let (type_names, sets) = parse_and_match_idf_sets(
+            markers_path,
+            &self.gene_names,
+            min_coverage,
+            MIN_MARKERS,
+            |g| self.sigma[g as usize] > 0.0,
+        )?;
         Ok(PanelSets { type_names, sets })
     }
 
