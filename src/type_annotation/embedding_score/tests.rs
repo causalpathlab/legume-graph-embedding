@@ -199,36 +199,55 @@ fn the_balanced_centre_weights_clusters_equally() {
     assert!((centre[0] - 5.0).abs() < 1e-12, "{centre}");
 }
 
+/// Read `panel` (`(type, genes)` rows) through `space.marker_sets`, from a file under a
+/// per-process directory removed afterwards.
+fn read_panel(
+    space: &FeatureSpace,
+    tag: &str,
+    panel: &[(&str, &[&str])],
+    min_coverage: f32,
+) -> Result<PanelSets> {
+    use std::io::Write;
+    let dir =
+        std::env::temp_dir().join(format!("geu_embedding_score_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("markers.tsv");
+    let mut file = std::fs::File::create(&path).unwrap();
+    for (ty, genes) in panel {
+        for g in *genes {
+            writeln!(file, "{g}\t{ty}").unwrap();
+        }
+    }
+    drop(file);
+    let got = space.marker_sets(path.to_str().unwrap(), min_coverage);
+    std::fs::remove_dir_all(&dir).unwrap();
+    got
+}
+
+/// `fixture(seed)` with rows 13 and 14 zeroed.
+fn space_with_dead_rows(seed: u64) -> FeatureSpace {
+    let mut f = fixture(seed);
+    f.rho.row_mut(13).fill(0.0);
+    f.rho.row_mut(14).fill(0.0);
+    f.space()
+}
+
 /// The marker floor counts live markers: a type with three matches, two of them dead rows,
 /// would score on one gene, so it is dropped. Dead rows leave after IDF, so `C` still counts
 /// every panel type and the survivors' weights are unchanged.
 #[test]
 fn the_marker_floor_counts_live_markers() {
-    use std::io::Write;
-    let dir = std::env::temp_dir().join(format!(
-        "geu_embedding_score_live_floor_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("markers.tsv");
-    let mut file = std::fs::File::create(&path).unwrap();
-    for (genes, ty) in [
-        (["g00", "g01", "g02"], "Live"),
-        (["g12", "g13", "g14"], "Thin"),
-        (["g03", "g04", "g05"], "Other"),
-    ] {
-        for g in genes {
-            writeln!(file, "{g}\t{ty}").unwrap();
-        }
-    }
-    drop(file);
-
-    let mut f = fixture(7);
-    f.rho.row_mut(13).fill(0.0);
-    f.rho.row_mut(14).fill(0.0);
-    let panel = f.space().marker_sets(path.to_str().unwrap(), 0.0);
-    std::fs::remove_dir_all(&dir).unwrap();
-    let panel = panel.unwrap();
+    let panel = read_panel(
+        &space_with_dead_rows(7),
+        "live_floor",
+        &[
+            ("Live", &["g00", "g01", "g02"]),
+            ("Thin", &["g12", "g13", "g14"]),
+            ("Other", &["g03", "g04", "g05"]),
+        ],
+        0.0,
+    )
+    .unwrap();
     let names: Vec<&str> = panel.type_names.iter().map(AsRef::as_ref).collect();
     assert_eq!(names, ["Live", "Other"]);
     for set in &panel.sets {
@@ -238,6 +257,45 @@ fn the_marker_floor_counts_live_markers() {
             "{set:?}"
         );
     }
+}
+
+/// A call needs a rival: fewer than two live types is an error that names the types lost.
+/// A one-type panel is one such case (every gene is held by every type: IDF 0).
+#[test]
+fn fewer_than_two_live_types_is_an_error() {
+    let space = space_with_dead_rows(9);
+    let err = read_panel(
+        &space,
+        "one_live",
+        &[
+            ("Live", &["g00", "g01", "g02"]),
+            ("Thin", &["g12", "g13", "g14"]),
+        ],
+        0.0,
+    )
+    .map(|p| p.type_names)
+    .expect_err("one live type must not be scored");
+    assert!(format!("{err:#}").contains("Thin"), "{err:#}");
+
+    let err = read_panel(&space, "one_type", &[("Only", &["g00", "g01", "g02"])], 0.0)
+        .map(|p| p.type_names)
+        .expect_err("a one-type panel must not be scored");
+    assert!(format!("{err:#}").contains("Only"), "{err:#}");
+}
+
+/// Panel coverage counts live markers: a dead row is on the axis but carries nothing, so it
+/// must not count toward `min_coverage`.
+#[test]
+fn panel_coverage_counts_live_markers() {
+    let panel: &[(&str, &[&str])] = &[
+        ("A", &["g00", "g01", "g02", "g13"]),
+        ("B", &["g03", "g04", "g05"]),
+        ("C", &["g06", "g07", "g08"]),
+    ];
+    let space = space_with_dead_rows(10);
+    // 9 of 10 markers are live.
+    assert!(read_panel(&space, "coverage_ok", panel, 0.9).is_ok());
+    assert!(read_panel(&space, "coverage_low", panel, 0.95).is_err());
 }
 
 /// A centre from another embedding (wrong length) is a caller error, not a silent shift.
