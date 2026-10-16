@@ -96,16 +96,26 @@ fn a_constant_column_stays_finite() {
     );
 }
 
-/// Each cell row scaled to unit norm, by hand — the units the softmax is meant to score in.
-fn unit_rows(cells: &Tensor) -> Tensor {
-    let norm = cells.sqr().unwrap().sum_keepdim(1).unwrap().sqrt().unwrap();
-    cells.broadcast_div(&norm).unwrap()
+/// Each cell's offset from the cloud centre, scaled to unit norm, by hand — the units the
+/// softmax is meant to score in.
+fn centred_unit_rows(cells: &Tensor) -> Tensor {
+    let centred = cells
+        .broadcast_sub(&cells.mean_keepdim(0).unwrap())
+        .unwrap();
+    let norm = centred
+        .sqr()
+        .unwrap()
+        .sum_keepdim(1)
+        .unwrap()
+        .sqrt()
+        .unwrap();
+    centred.broadcast_div(&norm).unwrap()
 }
 
-/// Direction-only scores, by hand: `standardize(ê_cell · e_fᵀ)`.
+/// Direction-only scores, by hand: `standardize(ê_cell · e_fᵀ)`, `ê` taken from the centre.
 fn direction_scores(cells: &Tensor, feats: &Tensor) -> Tensor {
     standardize_columns(
-        &unit_rows(cells)
+        &centred_unit_rows(cells)
             .matmul(&feats.t().unwrap().contiguous().unwrap())
             .unwrap(),
     )
@@ -135,14 +145,18 @@ fn the_calibrated_temperature_hits_its_eff_target() {
     }
 }
 
-/// The temperature is a property of the cells' directions: rescaling every cell row by its
-/// own factor (three orders of magnitude) must not move it.
+/// The temperature is a property of the cells' directions from the cloud centre: rescaling
+/// every cell's offset by its own factor (three orders of magnitude) must not move it. The
+/// cells come in `±` pairs with a shared factor, so the centre stays exactly at the origin.
 #[test]
 fn the_temperature_ignores_cell_norm() {
-    let (cells, feats) = fixture(32);
-    let factors: Vec<f32> = (0..N).map(|i| 10f32.powf((i % 4) as f32 - 1.5)).collect();
+    let (half, feats) = fixture(32);
+    let cells = Tensor::cat(&[&half, &half.neg().unwrap()], 0).unwrap();
+    let factors: Vec<f32> = (0..2 * N)
+        .map(|i| 10f32.powf(((i % N) % 4) as f32 - 1.5))
+        .collect();
     let scaled = cells
-        .broadcast_mul(&Tensor::from_vec(factors, (N, 1), &Device::Cpu).unwrap())
+        .broadcast_mul(&Tensor::from_vec(factors, (2 * N, 1), &Device::Cpu).unwrap())
         .unwrap();
     let (_, t) = feature_coembedding(&cells, &feats, 40.0).unwrap();
     let (_, t_scaled) = feature_coembedding(&scaled, &feats, 40.0).unwrap();
@@ -249,6 +263,101 @@ fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
         assert!(
             (got.nn_norm_pct - 50.0).abs() <= 10.0 && got.beyond_p99 < 0.15 && got.on_manifold(),
             "seed {seed}: features must sit on the manifold, got {got}"
+        );
+    }
+}
+
+/// The same contract when the cloud does not sit at the origin. Scoring each cell's direction
+/// from the origin leaves a per-cell term `⟨μ, e_f⟩ / ‖e_cell‖` in the softmax, so placement
+/// tracks cell norm again; directions must be taken from the cloud's own centre.
+#[test]
+fn a_cloud_off_the_origin_stays_on_the_manifold() {
+    let target = 40.0;
+    let (cells, feats) = heavy_tailed_cloud(0);
+    let n = cells.dim(0).unwrap();
+    let norms: Vec<f32> = cells
+        .sqr()
+        .unwrap()
+        .sum(1)
+        .unwrap()
+        .sqrt()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let median_radius = {
+        let mut v = norms;
+        v.sort_by(f32::total_cmp);
+        v[n / 2]
+    };
+    let dir: Vec<f32> = (0..H).map(|j| if j == 0 { 1.0 } else { 0.0 }).collect();
+    for k in [1.0f32, 2.0, 4.0] {
+        let offset: Vec<f32> = dir.iter().map(|&x| k * median_radius * x).collect();
+        let shifted = cells
+            .broadcast_add(&Tensor::from_vec(offset, (1, H), &Device::Cpu).unwrap())
+            .unwrap();
+        let (co, _) = feature_coembedding(&shifted, &feats, target).unwrap();
+        let got = placement(&shifted, &co);
+        assert!(
+            got.on_manifold(),
+            "cloud shifted {k}× its median radius: features must sit on the manifold, got {got}"
+        );
+    }
+}
+
+/// A topic-mixture cloud, `Z = θ·α` with `θ` on the simplex (Dirichlet) and `α` a `K × H`
+/// dictionary — off the origin by construction, as `senna rest` writes it.
+fn topic_mixture_cloud(seed: u64) -> (Tensor, Tensor) {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rand_distr::multi::Dirichlet;
+    use rand_distr::{Distribution, Normal};
+    const N_CELLS: usize = 1500;
+    const N_FEATS: usize = 120;
+    const K: usize = 6;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let normal = Normal::new(0f32, 1.0).unwrap();
+    let alpha: Vec<f32> = (0..K * H).map(|_| normal.sample(&mut rng)).collect();
+    let dirichlet = Dirichlet::new(&[0.3f32; K]).unwrap();
+    let mut cells = Vec::with_capacity(N_CELLS * H);
+    for _ in 0..N_CELLS {
+        let theta: Vec<f32> = dirichlet.sample(&mut rng);
+        cells.extend((0..H).map(|j| (0..K).map(|k| theta[k] * alpha[k * H + j]).sum::<f32>()));
+    }
+    let feats: Vec<f32> = (0..N_FEATS * H).map(|_| normal.sample(&mut rng)).collect();
+    let dev = Device::Cpu;
+    (
+        Tensor::from_vec(cells, (N_CELLS, H), &dev).unwrap(),
+        Tensor::from_vec(feats, (N_FEATS, H), &dev).unwrap(),
+    )
+}
+
+/// Where the origin sits is a coordinate choice, not a property of the cells: translating
+/// a topic-mixture cloud must translate its co-embedding by the same vector and leave `T`
+/// alone. Directions taken from the origin break this — the further the cloud sits from it,
+/// the more the scores track each cell's norm.
+#[test]
+fn the_coembedding_moves_with_a_topic_mixture_cloud() {
+    for seed in 0..3 {
+        let (cells, feats) = topic_mixture_cloud(seed);
+        let shift = Tensor::from_vec(vec![3f32; H], (1, H), &Device::Cpu).unwrap();
+        let moved = cells.broadcast_add(&shift).unwrap();
+        let (co, t) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+        let (co_moved, t_moved) = feature_coembedding(&moved, &feats, 40.0).unwrap();
+        let gap = co
+            .broadcast_add(&shift)
+            .unwrap()
+            .sub(&co_moved)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            (t - t_moved).abs() < 1e-3 * t && gap < 1e-3,
+            "seed {seed}: translating the cells by 3·1 moved T {t} → {t_moved} and left the \
+             co-embedding off by {gap}"
         );
     }
 }
