@@ -5,9 +5,9 @@
 #![allow(deprecated)]
 
 use graph_embedding_util::type_annotation::{
-    annotate_embeddings, annotate_embeddings_ora, write_cell_labels, AnnotateProjConfig,
-    InputEmbeddings, TermOraConfig, CELL_LABELS_SUFFIX, CELL_LABEL_FILE_SUFFIXES,
-    TERM_ORA_OUTPUT_SUFFIXES,
+    annotate_embeddings, annotate_embeddings_ora, write_cell_labels, write_label_tsvs,
+    AnnotateProjConfig, InputEmbeddings, TermOraConfig, CELL_LABELS_SUFFIX,
+    CELL_LABEL_FILE_SUFFIXES, TERM_ORA_OUTPUT_SUFFIXES,
 };
 use legume_numeric::matrix::dmatrix_io::DMatrix;
 use legume_numeric::matrix::parquet::read_table_columns;
@@ -81,6 +81,33 @@ fn writes_argmax_parquet_beside_the_tsvs() {
         .map(|s| format!("run{s}"))
         .collect();
     assert_eq!(written, listed, "CELL_LABEL_FILE_SUFFIXES lists every file");
+
+    // The TSV pair keeps its format for the readers that have not moved.
+    assert_eq!(
+        fs::read_to_string(format!("{prefix}.argmax.tsv")).unwrap(),
+        "cell\tcell_type\tprobability\nc0\tT cell\t0.1235\nc1\tB cell\t1.0000\nc2\tT cell\tNaN\n"
+    );
+    assert_eq!(
+        fs::read_to_string(format!("{prefix}.membership.tsv")).unwrap(),
+        "c0\tT cell\nc1\tB cell\nc2\tT cell\n",
+        "no header"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tsv_writer_rejects_mismatched_lengths() {
+    let dir = fresh_dir("tsv_lengths");
+    let prefix = dir.join("run");
+    let prefix = prefix.to_str().unwrap();
+
+    let cells = names(&["c0", "c1", "c2"]);
+    let labels = names(&["T cell", "B cell", "T cell"]);
+    let err = write_label_tsvs(prefix, &cells, &labels, &[0.5, 0.5]).unwrap_err();
+    assert!(err.to_string().contains("for 3 cells"), "{err}");
+    let err = write_label_tsvs(prefix, &cells, &labels[..2], &[0.5; 3]).unwrap_err();
+    assert!(err.to_string().contains("for 3 cells"), "{err}");
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "no file written");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -115,7 +142,7 @@ fn term_ora_cleans_every_label_file() {
 fn check_path(
     tag: &str,
     annotate: impl FnOnce(&InputEmbeddings<'_>, &str, &str) -> anyhow::Result<()>,
-) {
+) -> BTreeSet<String> {
     let dir = fresh_dir(tag);
     let feature_emb = DMatrix::<f32>::from_row_slice(
         6,
@@ -148,7 +175,13 @@ fn check_path(
     };
     annotate(&input, markers.to_str().unwrap(), prefix).unwrap();
     assert_cell_labels(prefix, &cell_names);
+    let outputs = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter_map(|f| f.strip_prefix("run").map(str::to_owned))
+        .collect();
     let _ = fs::remove_dir_all(&dir);
+    outputs
 }
 
 #[test]
@@ -158,9 +191,15 @@ fn term_ora_writes_cell_labels() {
         n_perm: 20,
         ..TermOraConfig::default()
     };
-    check_path("ora", |input, markers, prefix| {
+    let outputs = check_path("ora", |input, markers, prefix| {
         annotate_embeddings_ora(input, markers, prefix, true, &cfg)
     });
+    for suffix in &outputs {
+        assert!(
+            TERM_ORA_OUTPUT_SUFFIXES.contains(&suffix.as_str()),
+            "{suffix} is written but missing from TERM_ORA_OUTPUT_SUFFIXES"
+        );
+    }
 }
 
 #[test]
