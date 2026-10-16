@@ -355,6 +355,33 @@ fn an_unmeasurable_placement_does_not_fail_the_write() {
     assert!(res.is_ok(), "the write failed on the diagnostic: {res:?}");
 }
 
+/// A cell exactly at the cloud centre has no direction; its key must be the floor's zero,
+/// not 0/0. Integer-valued `±` pairs plus a zero row put the centre exactly at the origin.
+#[test]
+fn a_cell_at_the_centre_stays_finite() {
+    let half: Vec<f32> = (0..64 * H).map(|i| ((i * 7) % 11) as f32 - 5.0).collect();
+    let half = Tensor::from_vec(half, (64, H), &Device::Cpu).unwrap();
+    let zero = Tensor::zeros((1, H), DType::F32, &Device::Cpu).unwrap();
+    let cells = Tensor::cat(&[&half, &half.neg().unwrap(), &zero], 0).unwrap();
+    let centre: Vec<f32> = cells.mean(0).unwrap().to_vec1().unwrap();
+    assert!(
+        centre.iter().all(|&c| c == 0.0),
+        "fixture centre {centre:?}"
+    );
+    let (_, feats) = fixture(8);
+    let (co, _) = feature_coembedding(&cells, &feats, 20.0).unwrap();
+    assert!(all_finite(&co));
+}
+
+/// The diagnostic reads whatever float type the co-embedding was written in.
+#[test]
+fn placement_reads_non_f32_tensors() {
+    let (cells, feats) = heavy_tailed_cloud(0);
+    let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    let as64 = |t: &Tensor| t.to_dtype(DType::F64).unwrap();
+    assert!(coembed_placement_of_tensors(&as64(&cells), &as64(&co)).is_ok());
+}
+
 /// The clamp that keeps a big-cluster dataset off the far tail of the curve,
 /// where the barycentre collapses toward the global centroid.
 #[test]

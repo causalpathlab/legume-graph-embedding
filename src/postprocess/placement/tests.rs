@@ -80,3 +80,38 @@ fn features_among_ordinary_cells_pass() {
     let got = coembed_placement(&cells, &feats).unwrap();
     assert!(got.on_manifold(), "{got}");
 }
+
+/// Cells at tied distances share a rank: a feature among a tied group reads the middle of
+/// the group's percentile range, not its bottom. Here half the cells sit at radius 1 and half
+/// at radius 3, and every feature sits among the inner half: its percentile is 25, not 0.
+#[test]
+fn tied_cells_rank_at_their_midpoint() {
+    let n = 200;
+    let cells = DMatrix::from_fn(n, H, |i, j| {
+        let r = if i < n / 2 { 1.0 } else { 3.0 };
+        let sign = if (i / 2) % 2 == 0 { 1.0 } else { -1.0 };
+        if j == i % 2 {
+            sign * r
+        } else {
+            0.0
+        }
+    });
+    let feats = DMatrix::from_fn(10, H, |g, j| cells[(g * 4, j)]);
+    let got = coembed_placement(&cells, &feats).unwrap();
+    assert!(
+        (got.nn_norm_pct - 25.0).abs() < 5.0,
+        "features among the tied inner half should read ~25, got {got}"
+    );
+}
+
+/// A finite row far out is off the cloud, not "non-finite": only a NaN or infinite
+/// coordinate counts as a diverged row.
+#[test]
+fn a_huge_finite_row_is_not_counted_as_non_finite() {
+    let cells = spokes(400);
+    let mut feats = DMatrix::from_fn(10, H, |i, j| cells[(i * 40, j)]);
+    feats.row_mut(0).fill(1e20);
+    let got = coembed_placement(&cells, &feats).unwrap();
+    assert_eq!(got.non_finite, 0, "{got}");
+    assert!(got.beyond_p99 >= 0.1, "{got}");
+}
