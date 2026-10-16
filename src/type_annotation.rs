@@ -78,8 +78,8 @@ use markers::*;
 use output::*;
 use score::*;
 
-/// The shared per-cell label writer (`argmax.parquet`, plus the TSV pair until 0.10), used
-/// by every annotation method so their per-cell I/O is identical.
+// The shared per-cell label writer, used by every annotation method so their per-cell I/O
+// is identical.
 pub use output::{
     write_cell_labels, write_label_tsvs, CELL_LABELS_SUFFIX, CELL_LABEL_FILE_SUFFIXES,
 };

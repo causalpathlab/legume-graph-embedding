@@ -16,9 +16,24 @@ fn softmax_prob_at(row: &[f32], idx: usize) -> f32 {
 /// The file-name suffix of the per-cell label table [`write_cell_labels`] writes.
 pub const CELL_LABELS_SUFFIX: &str = ".argmax.parquet";
 
-/// Every file [`write_cell_labels`] writes, for a caller's cleanup list. The TSVs leave in 0.10.
+pub(super) const ARGMAX_TSV_SUFFIX: &str = ".argmax.tsv";
+pub(super) const MEMBERSHIP_TSV_SUFFIX: &str = ".membership.tsv";
+
+/// Every per-cell label file this crate writes or has written, for a caller's cleanup list. A
+/// retired name stays listed, so a rerun still erases it.
 pub const CELL_LABEL_FILE_SUFFIXES: &[&str] =
-    &[CELL_LABELS_SUFFIX, ".argmax.tsv", ".membership.tsv"];
+    &[CELL_LABELS_SUFFIX, ARGMAX_TSV_SUFFIX, MEMBERSHIP_TSV_SUFFIX];
+
+/// `labels` and `probs` must have one entry per cell.
+fn check_label_lengths(n: usize, labels: &[Box<str>], probs: &[f32]) -> Result<()> {
+    anyhow::ensure!(
+        labels.len() == n && probs.len() == n,
+        "{} labels and {} probabilities for {n} cells",
+        labels.len(),
+        probs.len()
+    );
+    Ok(())
+}
 
 /// Write the per-cell label table shared by every annotation method, so a downstream
 /// consumer never has to know which produced it: `{prefix}.argmax.parquet` with columns
@@ -32,13 +47,7 @@ pub fn write_cell_labels(
     labels: &[Box<str>],
     probs: &[f32],
 ) -> Result<()> {
-    let n = cell_names.len();
-    anyhow::ensure!(
-        labels.len() == n && probs.len() == n,
-        "{} labels and {} probabilities for {n} cells",
-        labels.len(),
-        probs.len()
-    );
+    check_label_lengths(cell_names.len(), labels, probs)?;
     let path = format!("{prefix}{CELL_LABELS_SUFFIX}");
     write_named_table(
         &path,
@@ -58,6 +67,8 @@ pub fn write_cell_labels(
 /// * `{prefix}.argmax.tsv` — `cell⇥cell_type⇥probability` (with header).
 /// * `{prefix}.membership.tsv` — `cell⇥cell_type` (no header), for
 ///   `data-beans stat -g` / `senna gem-summary` grouping.
+///
+/// It writes no parquet: new callers want [`write_cell_labels`].
 pub fn write_label_tsvs(
     prefix: &str,
     cell_names: &[Box<str>],
@@ -65,6 +76,7 @@ pub fn write_label_tsvs(
     probs: &[f32],
 ) -> Result<()> {
     let n = cell_names.len();
+    check_label_lengths(n, labels, probs)?;
     let mut argmax = Vec::with_capacity(n + 1);
     argmax.push(Box::from("cell\tcell_type\tprobability"));
     argmax.par_extend(
@@ -72,7 +84,7 @@ pub fn write_label_tsvs(
             .into_par_iter()
             .map(|i| format!("{}\t{}\t{:.4}", cell_names[i], labels[i], probs[i]).into_boxed_str()),
     );
-    let argmax_path = format!("{prefix}.argmax.tsv");
+    let argmax_path = format!("{prefix}{ARGMAX_TSV_SUFFIX}");
     write_lines(&argmax, &argmax_path).with_context(|| format!("writing {argmax_path}"))?;
     info!("wrote {argmax_path}");
 
@@ -81,7 +93,7 @@ pub fn write_label_tsvs(
         .zip(labels)
         .map(|(cell, label)| format!("{cell}\t{label}").into_boxed_str())
         .collect();
-    let membership_path = format!("{prefix}.membership.tsv");
+    let membership_path = format!("{prefix}{MEMBERSHIP_TSV_SUFFIX}");
     write_lines(&membership, &membership_path)
         .with_context(|| format!("writing {membership_path}"))?;
     info!("wrote {membership_path}");

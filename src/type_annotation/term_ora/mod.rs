@@ -56,7 +56,10 @@ mod output;
 
 use super::marker_bootstrap::{run_marker_bootstrap, CoarseConsensus, MarkerBootstrapConfig};
 use super::markers::parse_and_match_markers;
-use super::output::{write_cell_labels, write_marker_embeddings, CELL_LABELS_SUFFIX};
+use super::output::{
+    write_cell_labels, write_marker_embeddings, ARGMAX_TSV_SUFFIX, CELL_LABELS_SUFFIX,
+    MEMBERSHIP_TSV_SUFFIX,
+};
 use super::score::row_major;
 use super::{n_communities, InputEmbeddings, UNASSIGNED};
 use anyhow::Result;
@@ -90,8 +93,8 @@ use ora::{OraResult, MAX_NULL_POOL};
 pub const TERM_ORA_OUTPUT_SUFFIXES: &[&str] = &[
     ".annot.parquet",
     CELL_LABELS_SUFFIX,
-    ".membership.tsv",
-    ".argmax.tsv",
+    MEMBERSHIP_TSV_SUFFIX,
+    ARGMAX_TSV_SUFFIX,
     ".marker_embedding.parquet",
     ".cluster_term_p.parquet",
     ".cluster_term_q.parquet",
