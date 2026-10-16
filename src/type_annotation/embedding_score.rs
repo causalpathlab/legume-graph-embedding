@@ -46,8 +46,8 @@
 //! IDF, `ln(C / #types holding the gene)`, where `C` counts every panel type. IDF-0 genes are
 //! dropped, and so is a type left with fewer than [`MIN_MARKERS`] live markers (dead rows,
 //! below, leave after the weights are set, and do not count as panel coverage). Fewer than
-//! two surviving types is an error naming the types lost: a call needs a rival, and a
-//! one-type panel has none (every gene is IDF 0).
+//! [`MIN_TYPES`] surviving types is an error naming the types lost: a call needs a rival, and
+//! a one-type panel has none (every gene is IDF 0).
 //!
 //! [`calls`] gives each cell its best **live** type, one whose direction is not the zero
 //! row, and the margin over the runner-up. There is no null and no abstention: a call is the
@@ -75,7 +75,7 @@ use std::collections::BTreeMap;
 pub const MIN_MARKERS: usize = 3;
 
 /// Fewer surviving types than this is an error: a call needs a rival.
-const MIN_TYPES: usize = 2;
+pub const MIN_TYPES: usize = 2;
 
 /// One type's markers: `(feature index, weight)`.
 pub type WeightedSet = Vec<(u32, f64)>;
@@ -115,6 +115,10 @@ impl FeatureSpace {
             "{} gene names for {g} feature rows",
             gene_names.len()
         );
+        ensure!(
+            rho.iter().chain(cell_cov.iter()).all(|x| x.is_finite()),
+            "the feature embedding or the cell covariance has a non-finite entry"
+        );
         let mut quad = rho * cell_cov;
         quad.component_mul_assign(rho);
         let sigma = quad.column_sum().map(|v| v.max(0.0).sqrt());
@@ -136,8 +140,8 @@ impl FeatureSpace {
         &self.gene_names
     }
 
-    /// Read a `gene<TAB>celltype` panel and match it to this space's genes. Fewer than two
-    /// surviving types is an error.
+    /// Read a `gene<TAB>celltype` panel and match it to this space's genes. Fewer than
+    /// [`MIN_TYPES`] surviving types is an error.
     pub fn marker_sets(&self, markers_path: &str, min_coverage: f32) -> Result<PanelSets> {
         let (type_names, sets) = parse_and_match_idf_sets(
             markers_path,
@@ -180,6 +184,10 @@ impl FeatureSpace {
 pub fn cell_covariance(cells: &DMatrix<f64>) -> Result<DMatrix<f64>> {
     let n = cells.nrows();
     ensure!(n >= 2, "a covariance needs at least 2 cells, got {n}");
+    ensure!(
+        cells.iter().all(|x| x.is_finite()),
+        "the cell embedding has a non-finite entry"
+    );
     let c = cells.centre_columns();
     Ok(c.tr_mul(&c) / (n - 1) as f64)
 }
@@ -195,8 +203,12 @@ pub fn balanced_centre(cells: &DMatrix<f64>, groups: &[usize]) -> Result<DVector
     );
     let h = cells.ncols();
     let mut sums: BTreeMap<usize, (RowDVector<f64>, usize)> = BTreeMap::new();
-    for (row, &k) in cells.row_iter().zip(groups) {
+    for (i, (row, &k)) in cells.row_iter().zip(groups).enumerate() {
         if k != UNASSIGNED {
+            ensure!(
+                row.iter().all(|x| x.is_finite()),
+                "cell {i} has a non-finite coordinate"
+            );
             let (sum, count) = sums.entry(k).or_insert_with(|| (RowDVector::zeros(h), 0));
             *sum += row;
             *count += 1;

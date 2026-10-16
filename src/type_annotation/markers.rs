@@ -179,32 +179,32 @@ fn drop_thin_types<W>(
     min_markers: usize,
     min_types: usize,
 ) -> Result<TypedSets<W>> {
+    debug_assert!(min_markers >= 1 && min_types >= 1);
     let c = type_names.len();
     let (kept, lost): (Vec<_>, Vec<_>) = type_names
         .iter()
         .zip(sets)
         .partition(|(_, m)| m.len() >= min_markers);
     let lost: Vec<&str> = lost.iter().map(|(n, _)| n.as_ref()).collect();
+    anyhow::ensure!(
+        kept.len() >= min_types,
+        "{} marker type(s) kept {min_markers} or more usable marker gene(s) in the embedding; \
+         {min_types} needed. Lost: {}. A marker is lost when no row name matches it, when every \
+         type holds it (IDF 0), or when its row is dead — check the marker file's gene naming \
+         against the dictionary's row names",
+        kept.len(),
+        listed(&lost)
+    );
     if !lost.is_empty() {
         warn!(
-            "{} of {c} marker type(s) kept fewer than {min_markers} marker gene(s) in the \
+            "{} of {c} marker type(s) kept fewer than {min_markers} usable marker gene(s) in the \
              embedding and were DROPPED: {}. Their cells will be assigned among the remaining \
              types. If you need them, widen the feature axis (raise `--n-hvg`) or force the \
              panel into training with `--must-train-features <the marker file>`.",
             lost.len(),
-            lost.join(", ")
+            listed(&lost)
         );
     }
-    anyhow::ensure!(
-        kept.len() >= min_types,
-        "{} marker type(s) kept {min_markers} or more usable marker gene(s) in the embedding; \
-         {} needed. Lost: {}. A marker must match a row name, must not be held by every type \
-         (IDF 0, so a one-type panel has none), and must be live — check the marker file's \
-         gene naming against the dictionary's row names",
-        kept.len(),
-        min_types,
-        lost.join(", ")
-    );
 
     Ok(kept.into_iter().map(|(n, m)| (n.clone(), m)).unzip())
 }
@@ -217,6 +217,15 @@ use data_beans::aux::gene_sets::COVERAGE_WARN_FRAC as WARN_COVERAGE;
 
 /// How many under-covered types to name before truncating the warning.
 const MAX_LISTED: usize = 10;
+
+/// `names` joined, truncated after [`MAX_LISTED`].
+fn listed(names: &[&str]) -> String {
+    let shown = names[..names.len().min(MAX_LISTED)].join(", ");
+    match names.len().saturating_sub(MAX_LISTED) {
+        0 => shown,
+        more => format!("{shown}, … and {more} more"),
+    }
+}
 
 /// Report what fraction of the marker panel actually reached the embedding, overall and per
 /// type — and fail when it falls under `min_coverage`.
@@ -260,7 +269,7 @@ fn report_panel_coverage(
     thin.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     info!(
-        "marker panel: {n_hit}/{n_req} genes ({:.0}%) are on the embedding's feature axis, \
+        "marker panel: {n_hit}/{n_req} genes ({:.0}%) are usable on the embedding's feature axis, \
          across {} type(s)",
         overall * 100.0,
         type_names.len()
@@ -293,8 +302,8 @@ fn report_panel_coverage(
 
     anyhow::ensure!(
         overall >= min_coverage,
-        "marker panel coverage {:.0}% is below the required {:.0}% ({n_hit}/{n_req} genes on \
-         the embedding's feature axis). The panel the calls would be built on is mostly \
+        "marker panel coverage {:.0}% is below the required {:.0}% ({n_hit}/{n_req} genes usable \
+         on the embedding's feature axis). The panel the calls would be built on is mostly \
          missing. Widen the feature axis (raise `--n-hvg`) or force the panel into training \
          with `--must-train-features <the marker file>` (in faba, `gem --markers` does this).",
         overall * 100.0,
