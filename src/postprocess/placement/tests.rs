@@ -2,18 +2,22 @@ use super::*;
 
 const H: usize = 4;
 
-/// Cells on four spokes (`±x`, `±y`) at radii `1..=n`, so distance-from-centre percentiles
-/// are known and a cell's nearest neighbours lie on its own spoke, at similar norm.
-fn spokes(n: usize) -> DMatrix<f32> {
+/// Cells on four spokes (`±x`, `±y`), cell `i` at radius `r(i)`, so distance-from-centre
+/// percentiles are known and a cell's nearest neighbours lie on its own spoke.
+fn spokes_with(n: usize, r: impl Fn(usize) -> f32) -> DMatrix<f32> {
     DMatrix::from_fn(n, H, |i, j| {
-        let r = 1.0 + i as f32;
         let sign = if (i / 2) % 2 == 0 { 1.0 } else { -1.0 };
         if j == i % 2 {
-            sign * r
+            sign * r(i)
         } else {
             0.0
         }
     })
+}
+
+/// Spokes at radii `1..=n`.
+fn spokes(n: usize) -> DMatrix<f32> {
+    spokes_with(n, |i| 1.0 + i as f32)
 }
 
 /// A diverged fit leaves NaN in the co-embedding. NaN rows must not read as placed.
@@ -87,15 +91,7 @@ fn features_among_ordinary_cells_pass() {
 #[test]
 fn tied_cells_rank_at_their_midpoint() {
     let n = 200;
-    let cells = DMatrix::from_fn(n, H, |i, j| {
-        let r = if i < n / 2 { 1.0 } else { 3.0 };
-        let sign = if (i / 2) % 2 == 0 { 1.0 } else { -1.0 };
-        if j == i % 2 {
-            sign * r
-        } else {
-            0.0
-        }
-    });
+    let cells = spokes_with(n, |i| if i < n / 2 { 1.0 } else { 3.0 });
     let feats = DMatrix::from_fn(10, H, |g, j| cells[(g * 4, j)]);
     let got = coembed_placement(&cells, &feats).unwrap();
     assert!(

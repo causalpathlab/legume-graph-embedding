@@ -61,7 +61,7 @@ pub use multiome_plan::{
 };
 pub use postprocess::{
     cell_clusters, coembed_placement, feature_coembedding, feature_coembedding_fixed_t,
-    CoembedPlacement,
+    CoembedPlacement, PlacementViolation,
 };
 pub use preset_mode::{LoraArgs, LoraSpec, PresetMode, PresetOffsets, PresetRows};
 

@@ -103,7 +103,7 @@ const SD_FLOOR: f64 = 1e-6;
 const NORM_FLOOR: f64 = 1e-12;
 
 mod placement;
-pub use placement::{coembed_placement, CoembedPlacement};
+pub use placement::{coembed_placement, CoembedPlacement, PlacementViolation};
 pub(crate) use placement::{coembed_placement_of_tensors, CellCloud};
 
 /// Leiden-cluster the cell embedding once. Returns `(labels, target_eff)` where

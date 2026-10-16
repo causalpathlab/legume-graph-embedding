@@ -6,6 +6,9 @@
 
 use super::*;
 use legume_numeric::candle::candle_core::{DType, Device};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, Normal, Uniform};
 
 const N: usize = 256;
 const H: usize = 8;
@@ -192,9 +195,7 @@ fn to_tensors(cells: Vec<f32>, feats: Vec<f32>) -> (Tensor, Tensor) {
 /// max/median cell norm ~15, the regime the real runs sit in — and features of
 /// mixed norm.
 fn heavy_tailed_cloud(seed: u64) -> (Tensor, Tensor) {
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
-    use rand_distr::{Distribution, Normal, StudentT, Uniform};
+    use rand_distr::StudentT;
     let mut rng = StdRng::seed_from_u64(seed);
     let normal = Normal::new(0f32, 1.0).unwrap();
     let unit = |v: Vec<f32>| -> Vec<f32> {
@@ -216,17 +217,34 @@ fn heavy_tailed_cloud(seed: u64) -> (Tensor, Tensor) {
         let r = radius.sample(&mut rng).abs() + 0.2;
         cells.extend(dir.iter().map(|&x| r * x));
     }
+    let feats = mixed_norm_feats(&mut rng, &normal);
+    to_tensors(cells, feats)
+}
+
+/// `N_FEATS` features of random direction and norm spread over 0.1–3.
+fn mixed_norm_feats(rng: &mut StdRng, normal: &Normal<f32>) -> Vec<f32> {
     let scale = Uniform::new(0.1f32, 3.0).unwrap();
     let mut feats = Vec::with_capacity(N_FEATS * H);
     for _ in 0..N_FEATS {
-        let s = scale.sample(&mut rng);
-        feats.extend((0..H).map(|_| s * normal.sample(&mut rng)));
+        let s = scale.sample(rng);
+        feats.extend((0..H).map(|_| s * normal.sample(rng)));
     }
-    to_tensors(cells, feats)
+    feats
 }
 
 fn placement(cells: &Tensor, coembed: &Tensor) -> CoembedPlacement {
     coembed_placement_of_tensors(cells, coembed).unwrap()
+}
+
+/// Co-embed at an eff target of 40 and assert the placement contract holds.
+fn assert_placed(cells: &Tensor, feats: &Tensor, label: &str) {
+    let (co, _) = feature_coembedding(cells, feats, 40.0).unwrap();
+    let got = placement(cells, &co);
+    assert!(
+        got.on_manifold(),
+        "{label}: features must sit on the manifold, got {got}: {:?}",
+        got.violations()
+    );
 }
 
 /// The placement contract on a heavy-tailed cloud. Scoring on raw cells (rebuilt here by
@@ -247,13 +265,7 @@ fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
             "seed {seed}: the fixture must reproduce the bias on raw-cell scores, got {on_raw}"
         );
 
-        let (co, _) = feature_coembedding(&cells, &feats, target).unwrap();
-        let got = placement(&cells, &co);
-        assert!(
-            got.on_manifold(),
-            "seed {seed}: features must sit on the manifold ({}), got {got}",
-            CoembedPlacement::contract()
-        );
+        assert_placed(&cells, &feats, &format!("seed {seed}"));
     }
 }
 
@@ -262,7 +274,6 @@ fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
 /// tracks cell norm again; directions must be taken from the cloud's own centre.
 #[test]
 fn a_cloud_off_the_origin_stays_on_the_manifold() {
-    let target = 40.0;
     let (cells, feats) = heavy_tailed_cloud(0);
     let norms: Vec<f32> = cells
         .sqr()
@@ -280,31 +291,22 @@ fn a_cloud_off_the_origin_stays_on_the_manifold() {
         let shifted = cells
             .broadcast_add(&Tensor::from_vec(offset, (1, H), &Device::Cpu).unwrap())
             .unwrap();
-        let (co, _) = feature_coembedding(&shifted, &feats, target).unwrap();
-        let got = placement(&shifted, &co);
-        assert!(
-            got.on_manifold(),
-            "cloud shifted {k}× its median radius: features must sit on the manifold, got {got}"
+        assert_placed(
+            &shifted,
+            &feats,
+            &format!("cloud shifted {k}× its median radius"),
         );
     }
 }
 
 /// An elongated Gaussian cloud (one axis 6× the others) with no cluster structure.
 fn elongated_cloud(seed: u64) -> (Tensor, Tensor) {
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
-    use rand_distr::{Distribution, Normal, Uniform};
     let mut rng = StdRng::seed_from_u64(seed);
     let normal = Normal::new(0f32, 1.0).unwrap();
     let cells: Vec<f32> = (0..N_CELLS * H)
         .map(|i| normal.sample(&mut rng) * if i % H == 0 { 6.0 } else { 1.0 })
         .collect();
-    let scale = Uniform::new(0.1f32, 3.0).unwrap();
-    let mut feats = Vec::with_capacity(N_FEATS * H);
-    for _ in 0..N_FEATS {
-        let s = scale.sample(&mut rng);
-        feats.extend((0..H).map(|_| s * normal.sample(&mut rng)));
-    }
+    let feats = mixed_norm_feats(&mut rng, &normal);
     to_tensors(cells, feats)
 }
 
@@ -316,13 +318,7 @@ fn elongated_cloud(seed: u64) -> (Tensor, Tensor) {
 fn an_elongated_cloud_stays_on_the_manifold() {
     for seed in 0..2 {
         let (cells, feats) = elongated_cloud(seed);
-        let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
-        let got = placement(&cells, &co);
-        assert!(
-            got.on_manifold(),
-            "seed {seed}: features must sit on the manifold ({}), got {got}",
-            CoembedPlacement::contract()
-        );
+        assert_placed(&cells, &feats, &format!("seed {seed}"));
     }
 }
 
@@ -338,10 +334,7 @@ fn a_hub_collapse_is_not_on_the_manifold() {
 /// A topic-mixture cloud, `Z = θ·α` with `θ` on the simplex (Dirichlet) and `α` a `K × H`
 /// dictionary — off the origin by construction, as `senna rest` writes it.
 fn topic_mixture_cloud(seed: u64) -> (Tensor, Tensor) {
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
     use rand_distr::multi::Dirichlet;
-    use rand_distr::{Distribution, Normal};
     let mut rng = StdRng::seed_from_u64(seed);
     let normal = Normal::new(0f32, 1.0).unwrap();
     let alpha: Vec<f32> = (0..K * H).map(|_| normal.sample(&mut rng)).collect();
@@ -356,20 +349,20 @@ fn topic_mixture_cloud(seed: u64) -> (Tensor, Tensor) {
 }
 
 /// On a topic-mixture cloud the features must not sit beside the longest cells: the outward
-/// half of the contract holds. The inward tail is left unasserted — the cloud is sparse in
-/// its interior, a feature averaged across it lands there, and on two of these three seeds
-/// its lower quartile falls 1–4 points under the cells' local-average 10th percentile.
+/// half of the contract holds. The inward tail is left unasserted: the cloud is sparse in its
+/// interior, a feature averaged across it lands there, and its lower quartile can fall just
+/// under the cells' local-average 10th percentile.
 #[test]
 fn a_topic_mixture_cloud_does_not_track_cell_norm() {
     for seed in 0..3 {
         let (cells, feats) = topic_mixture_cloud(seed);
         let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
         let got = placement(&cells, &co);
-        let [_, q50, q75] = got.nn_norm_pct_quartiles;
-        let [_, _, b75, b90] = got.cell_baseline;
+        let v = got.violations();
         assert!(
-            got.beyond_p99 < 0.15 && q50 <= b75 && q75 <= b90,
-            "seed {seed}: features sit beside the longest cells: {got}"
+            !v.contains(&PlacementViolation::Outward)
+                && !v.contains(&PlacementViolation::BeyondCloud),
+            "seed {seed}: features sit beside the longest cells: {got}: {v:?}"
         );
     }
 }

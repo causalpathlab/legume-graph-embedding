@@ -22,16 +22,7 @@
 //! **The two directions are not symmetric.** An average can be pulled inward of the cells
 //! it averages but never pushed outward, and a feature averages a whole cone of cells, so it
 //! sits further in than a local average does. Outward is therefore judged strictly and inward
-//! only at the tail. **Contract: the features' median is at most the local averages' 75th
-//! percentile and their 75th at most the 90th (not beside the longest cells), and the
-//! features' 25th percentile is at least the local averages' 10th (not collapsed to the
-//! hub, and not split between hub and edge).**
-//!
-//! Measured on 23 real runs, the contract fails 19 of 22 shipped co-embeddings and 9 of 23
-//! after direction scoring: every dentate gyrus run and a 263k-cell bge run (still outward),
-//! one AML bge run and BMM (a quarter of the features in hub territory). Erythroid, pancreas
-//! and the off-origin `rest` run pass. A fixed `50 ± 10` fired on 16 of 23 after the fix,
-//! healthy elongated runs included.
+//! only at the tail; [`PlacementViolation`] states each clause.
 //!
 //! A non-finite feature row fails the contract outright, counts as beyond p99, and is left
 //! out of the nearest-cell statistics.
@@ -109,55 +100,93 @@ pub struct CoembedPlacement {
     pub nn_norm_pct: f32,
     /// Quartiles (25th, 50th, 75th) of the per-feature nearest-cell percentile.
     pub nn_norm_pct_quartiles: [f32; 3],
-    /// The same statistic for the cells' own local averages: its 10th, 25th, 75th and 90th
+    /// The same statistic for the cells' own local averages: its 10th, 75th and 90th
     /// percentiles. The yardstick for `nn_norm_pct_quartiles`.
-    pub cell_baseline: [f32; 4],
+    pub cell_baseline: [f32; 3],
+}
+
+/// A clause of the placement contract that a co-embedding fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementViolation {
+    /// Some feature rows are NaN or infinite: the fit diverged.
+    NonFinite,
+    /// `beyond_p99` is at or above its bound: features sit outside the cell cloud.
+    BeyondCloud,
+    /// The features' median is above the local averages' 75th percentile, or their 75th above
+    /// the 90th: features sit beside longer cells than an average of cells can.
+    Outward,
+    /// The features' 25th percentile is below the local averages' 10th: a quarter of the
+    /// features sit nearer the hub than the cells' own averages reach.
+    Inward,
+}
+
+impl std::fmt::Display for PlacementViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite => write!(f, "non-finite rows, the fit diverged"),
+            Self::BeyondCloud => write!(
+                f,
+                "beyond_p99 ≥ {MAX_BEYOND_P99}, features sit outside the cell cloud"
+            ),
+            Self::Outward => write!(
+                f,
+                "features sit beside longer cells than the cells' own local averages (median > \
+                 their q75 or q75 > their q90)"
+            ),
+            Self::Inward => write!(
+                f,
+                "features sit nearer the hub than the cells' own local averages (q25 < their q10)"
+            ),
+        }
+    }
 }
 
 impl CoembedPlacement {
-    /// Finite, inside the cloud, and sitting among the cells the way the cells' own local
-    /// averages do. See [`CoembedPlacement::contract`].
+    /// The clauses of the contract this placement fails (NaN statistics fail them too).
     #[must_use]
-    pub fn on_manifold(&self) -> bool {
+    pub fn violations(&self) -> Vec<PlacementViolation> {
         let [q25, q50, q75] = self.nn_norm_pct_quartiles;
-        let [b10, _, b75, b90] = self.cell_baseline;
-        self.non_finite == 0
-            && self.beyond_p99 < MAX_BEYOND_P99
-            && q50 <= b75
-            && q75 <= b90
-            && q25 >= b10
+        let [b10, b75, b90] = self.cell_baseline;
+        // Each clause is written as the passing condition, so a NaN statistic fails it.
+        let inside = self.beyond_p99 < MAX_BEYOND_P99;
+        let not_outward = q50 <= b75 && q75 <= b90;
+        let not_inward = q25 >= b10;
+        [
+            (self.non_finite == 0, PlacementViolation::NonFinite),
+            (inside, PlacementViolation::BeyondCloud),
+            (not_outward, PlacementViolation::Outward),
+            (not_inward, PlacementViolation::Inward),
+        ]
+        .into_iter()
+        .filter_map(|(ok, v)| (!ok).then_some(v))
+        .collect()
     }
 
-    /// The contract [`CoembedPlacement::on_manifold`] checks, in words.
+    /// Finite, inside the cloud, and sitting among the cells the way the cells' own local
+    /// averages do: no [`PlacementViolation`].
     #[must_use]
-    pub fn contract() -> String {
-        format!(
-            "no non-finite rows, beyond_p99 < {MAX_BEYOND_P99}, and the features' nearest-cell \
-             percentiles against the cells' own local averages: median ≤ their q75, q75 ≤ their \
-             q90, q25 ≥ their q10"
-        )
+    pub fn on_manifold(&self) -> bool {
+        self.violations().is_empty()
     }
 }
 
 impl std::fmt::Display for CoembedPlacement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            radius,
+            dist_x_r,
+            dist_pct,
+            beyond_p99,
+            nn_norm_pct,
+            ..
+        } = self;
+        let [q25, q50, q75] = self.nn_norm_pct_quartiles;
+        let [b10, b75, b90] = self.cell_baseline;
         write!(
             f,
-            "dist {:.2}×R (R={:.3}), dist_pct {:.1}, beyond_p99 {:.3}, nn_norm_pct {:.1} \
-             (quartiles {:.1} / {:.1} / {:.1}; cells' local averages q10–q90 {:.1} / {:.1} / \
-             {:.1} / {:.1})",
-            self.dist_x_r,
-            self.radius,
-            self.dist_pct,
-            self.beyond_p99,
-            self.nn_norm_pct,
-            self.nn_norm_pct_quartiles[0],
-            self.nn_norm_pct_quartiles[1],
-            self.nn_norm_pct_quartiles[2],
-            self.cell_baseline[0],
-            self.cell_baseline[1],
-            self.cell_baseline[2],
-            self.cell_baseline[3],
+            "dist {dist_x_r:.2}×R (R={radius:.3}), dist_pct {dist_pct:.1}, beyond_p99 \
+             {beyond_p99:.3}, nn_norm_pct {nn_norm_pct:.1} (quartiles {q25:.1} / {q50:.1} / \
+             {q75:.1}; cells' local averages q10 / q75 / q90 {b10:.1} / {b75:.1} / {b90:.1})"
         )?;
         if self.non_finite > 0 {
             write!(f, ", {} non-finite rows", self.non_finite)?;
@@ -303,14 +332,16 @@ fn placement_of_rows(cells: &[f32], feats: &[f32], h: usize) -> anyhow::Result<C
         dist_x_r,
         dist_pct,
         beyond_p99,
-        non_finite: feats
-            .chunks_exact(h)
-            .filter(|row| row.iter().any(|x| !x.is_finite()))
+        // A row with a NaN or infinite coordinate has a non-finite distance, so only those
+        // rows need their coordinates checked.
+        non_finite: (0..d)
+            .filter(|&g| !feat_dist[g].is_finite())
+            .filter(|&g| feats[g * h..(g + 1) * h].iter().any(|x| !x.is_finite()))
             .count(),
         // An empty `per_feat` gives 0/0 = NaN, which fails every gate.
         nn_norm_pct: per_feat.iter().sum::<f32>() / per_feat.len() as f32,
         nn_norm_pct_quartiles: [0.25, 0.5, 0.75].map(|q| quantile_sorted(&per_feat, q)),
-        cell_baseline: [0.1, 0.25, 0.75, 0.9].map(|q| quantile_sorted(&baseline, q)),
+        cell_baseline: [0.1, 0.75, 0.9].map(|q| quantile_sorted(&baseline, q)),
     })
 }
 
