@@ -21,13 +21,9 @@
 //!   coembed  = Pᵀ · e_cell                         [D, H]   (gene = wtd avg of RAW cells)
 //! ```
 //!
-//! The two rescales fix the two axes of `S` separately — see `ScoreKeys`.
-//! The per-feature one is what makes a single `T` well-defined. `‖e_f‖` spans
-//! ~38× across genes, so on RAW scores one `T` saturates the long genes onto one
-//! cell and leaves the short ones spread over all of them — see
-//! [`standardize_columns`]. The per-cell one keeps placement from tracking cell
-//! norm: without it the softmax piles onto the longest cells and the gene lands
-//! outside the cell cloud.
+//! The two rescales fix the two axes of `S` separately: the per-cell one keeps
+//! placement from tracking cell norm (`ScoreKeys`), the per-feature one makes a
+//! single `T` mean the same thing for every gene ([`standardize_columns`]).
 //!
 //! The softmax temperature `T` is auto-calibrated (no user knob): bisected so
 //! the mean effective number of cells per gene (`1 / Σ_c P²`) equals the median
@@ -88,17 +84,12 @@ const MIN_TARGET_EFF: f64 = 20.0;
 /// A smaller target always sharpens the direction match (`top30_cos` rises as the
 /// target shrinks, on every run) and moves dentate gyrus and pancreas a little
 /// toward the middle, but it leaves erythroid flat or slightly worse, and on
-/// pancreas it puts several times more genes beyond the edge of the cloud. A
-/// pre-registered rule (50 must
-/// beat 100 on `nn_norm_pct` and `top30_cos` in a clear majority of runs without
-/// raising `beyond_p99`) held on 7 of 16, so the target stays at 100. The constant
-/// is also the clamp for the type-annotation anchors (`target_eff_from_labels`).
-///
-/// An earlier revision justified 100 by recall of the top cells by the raw dot
-/// `⟨e_f, e_cell⟩`. On raw-cell scores that metric rewarded the near-hard
-/// placement of a gene on the longest cells, which is the bias [`ScoreKeys`]
-/// removes; once genes are placed by direction it drops by design and no longer
-/// measures the goal.
+/// pancreas it puts several times more genes beyond the edge of the cloud. A rule
+/// fixed before the sweep (50 must beat 100 on `nn_norm_pct` and `top30_cos` in a
+/// clear majority of runs without raising `beyond_p99`) held on 7 of 16, so the
+/// target stays at 100. The constant is also the clamp for the type-annotation
+/// anchors (`target_eff_from_labels`). Recall of the top cells by the raw dot
+/// `⟨e_f, e_cell⟩` is not used: it rewards parking a gene on the longest cells.
 ///
 /// Why a CONSTANT and not a fraction of `n`: a gene attends to a fixed-size
 /// neighbourhood, not a fixed share of the dataset — on a 263k-cell run the
@@ -112,8 +103,8 @@ const SD_FLOOR: f64 = 1e-6;
 const NORM_FLOOR: f64 = 1e-12;
 
 mod placement;
-pub(crate) use placement::CellCloud;
 pub use placement::{coembed_placement, CoembedPlacement};
+pub(crate) use placement::{coembed_placement_of_tensors, CellCloud};
 
 /// Leiden-cluster the cell embedding once. Returns `(labels, target_eff)` where
 /// `labels[i]` is cell `i`'s cluster (dense `0..k`) and `target_eff` is the
@@ -164,7 +155,7 @@ pub fn target_eff_from_labels(labels: &[usize], n_clusters: usize) -> f64 {
 
 /// Re-embed every feature onto the cell manifold (SIMBA-style). The attention is
 /// keyed on the unit-norm cells (query = feature `β_f`, keys = `ê_cell`, see
-/// [`ScoreKeys`]): `P_f[c] = softmax_c(⟨ê_cell[c], β_f⟩ / sd / T)` places each
+/// `ScoreKeys`): `P_f[c] = softmax_c(⟨ê_cell[c], β_f⟩ / sd / T)` places each
 /// feature over the cells that express it, and the coordinate is the
 /// `P_f`-weighted mean of the raw cell rows. `target_eff` is the eff-cells target from [`cell_clusters`]. Returns
 /// `(coembed [D,H], calibrated_T)`; both inputs are 2-D `[*, H]` on the same
@@ -197,9 +188,6 @@ pub fn feature_coembedding(
     // only the softmax temperature changes — so compute it once and reuse it
     // across the whole bisection.
     let e_feat_sub = subsample_rows(&e_feat, CALIB_FEATS)?;
-    // Scored by the same `ScoreKeys` as the block pass below, so `T` is
-    // calibrated in the SAME units it is applied in. Calibrating on one scale
-    // and spending the result on another is shape-valid and silently wrong.
     let scores_sub = keys.scores(&e_feat_sub)?; // [N, B]
     let t = calibrate_t_for_eff(&scores_sub, target_eff)?;
     info!(
@@ -387,12 +375,23 @@ fn subsample_rows(x: &Tensor, k: usize) -> Result<Tensor> {
     if m <= k {
         return x.contiguous();
     }
-    let stride = m as f64 / k as f64;
-    let idx: Vec<u32> = (0..k)
-        .map(|i| (((i as f64) * stride) as usize).min(m - 1) as u32)
+    let idx: Vec<u32> = strided_indices(m, k)
+        .into_iter()
+        .map(|i| i as u32)
         .collect();
     let idx_t = Tensor::from_vec(idx, k, x.device())?;
     x.index_select(&idx_t, 0)
+}
+
+/// `min(m, k)` evenly strided indices into `0..m` — all of them when `m ≤ k`.
+fn strided_indices(m: usize, k: usize) -> Vec<usize> {
+    if m <= k {
+        return (0..m).collect();
+    }
+    let stride = m as f64 / k as f64;
+    (0..k)
+        .map(|i| (((i as f64) * stride) as usize).min(m - 1))
+        .collect()
 }
 
 #[cfg(test)]

@@ -43,15 +43,29 @@ fn col_sds(t: &Tensor) -> Vec<f32> {
         .collect()
 }
 
+/// `cells · featsᵀ`, the raw dot scores `[N, D]`.
+fn raw_scores(cells: &Tensor, feats: &Tensor) -> Tensor {
+    cells
+        .matmul(&feats.t().unwrap().contiguous().unwrap())
+        .unwrap()
+}
+
+fn all_finite(t: &Tensor) -> bool {
+    t.flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .iter()
+        .all(|x| x.is_finite())
+}
+
 /// Every feature column comes out at unit scale regardless of `‖e_f‖`. This is
 /// the whole mechanism: it is what lets one `T` mean the same thing for a long
 /// gene and a short one.
 #[test]
 fn every_feature_column_is_rescaled_to_unit_sd() {
     let (cells, feats) = fixture(32);
-    let raw = cells
-        .matmul(&feats.t().unwrap().contiguous().unwrap())
-        .unwrap();
+    let raw = raw_scores(&cells, &feats);
 
     let raw_sds = col_sds(&raw);
     let spread = raw_sds.iter().cloned().fold(f32::MIN, f32::max)
@@ -80,18 +94,9 @@ fn a_constant_column_stays_finite() {
     let dev = Device::Cpu;
     let (cells, _) = fixture(1);
     let zero_feat = Tensor::zeros((2, H), DType::F32, &dev).unwrap();
-    let raw = cells
-        .matmul(&zero_feat.t().unwrap().contiguous().unwrap())
-        .unwrap();
-
-    let out = standardize_columns(&raw).unwrap();
+    let out = standardize_columns(&raw_scores(&cells, &zero_feat)).unwrap();
     assert!(
-        out.flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap()
-            .iter()
-            .all(|x| x.is_finite()),
+        all_finite(&out),
         "a zero-embedding feature must not produce NaN/Inf"
     );
 }
@@ -114,12 +119,7 @@ fn centred_unit_rows(cells: &Tensor) -> Tensor {
 
 /// Direction-only scores, by hand: `standardize(ê_cell · e_fᵀ)`, `ê` taken from the centre.
 fn direction_scores(cells: &Tensor, feats: &Tensor) -> Tensor {
-    standardize_columns(
-        &centred_unit_rows(cells)
-            .matmul(&feats.t().unwrap().contiguous().unwrap())
-            .unwrap(),
-    )
-    .unwrap()
+    standardize_columns(&raw_scores(&centred_unit_rows(cells), feats)).unwrap()
 }
 
 /// The end-to-end contract: the `T` returned by [`feature_coembedding`], applied to
@@ -173,13 +173,19 @@ fn a_zero_cell_stays_finite() {
     let zero = Tensor::zeros((1, H), DType::F32, &Device::Cpu).unwrap();
     let cells = Tensor::cat(&[&cells, &zero], 0).unwrap();
     let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
-    assert!(co
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap()
-        .iter()
-        .all(|x| x.is_finite()));
+    assert!(all_finite(&co));
+}
+
+/// Sizes of the synthetic clouds: cells, features, and clusters (or topics).
+const N_CELLS: usize = 1500;
+const N_FEATS: usize = 120;
+const K: usize = 6;
+
+fn to_tensors(cells: Vec<f32>, feats: Vec<f32>) -> (Tensor, Tensor) {
+    (
+        Tensor::from_vec(cells, (N_CELLS, H), &Device::Cpu).unwrap(),
+        Tensor::from_vec(feats, (N_FEATS, H), &Device::Cpu).unwrap(),
+    )
 }
 
 /// Cells in a few angular clusters with a heavy-tailed (Student-t, 3 df) radius —
@@ -189,9 +195,6 @@ fn heavy_tailed_cloud(seed: u64) -> (Tensor, Tensor) {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
     use rand_distr::{Distribution, Normal, StudentT, Uniform};
-    const N_CELLS: usize = 1500;
-    const N_FEATS: usize = 120;
-    const K: usize = 6;
     let mut rng = StdRng::seed_from_u64(seed);
     let normal = Normal::new(0f32, 1.0).unwrap();
     let unit = |v: Vec<f32>| -> Vec<f32> {
@@ -219,20 +222,11 @@ fn heavy_tailed_cloud(seed: u64) -> (Tensor, Tensor) {
         let s = scale.sample(&mut rng);
         feats.extend((0..H).map(|_| s * normal.sample(&mut rng)));
     }
-    let dev = Device::Cpu;
-    (
-        Tensor::from_vec(cells, (N_CELLS, H), &dev).unwrap(),
-        Tensor::from_vec(feats, (N_FEATS, H), &dev).unwrap(),
-    )
+    to_tensors(cells, feats)
 }
 
 fn placement(cells: &Tensor, coembed: &Tensor) -> CoembedPlacement {
-    use legume_numeric::matrix::traits::ConvertMatOps;
-    coembed_placement(
-        &nalgebra::DMatrix::<f32>::from_tensor(cells).unwrap(),
-        &nalgebra::DMatrix::<f32>::from_tensor(coembed).unwrap(),
-    )
-    .unwrap()
+    coembed_placement_of_tensors(cells, coembed).unwrap()
 }
 
 /// The placement contract on a heavy-tailed cloud. Scoring on raw cells (rebuilt here by
@@ -245,12 +239,7 @@ fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
     for seed in 0..3 {
         let (cells, feats) = heavy_tailed_cloud(seed);
 
-        let raw = standardize_columns(
-            &cells
-                .matmul(&feats.t().unwrap().contiguous().unwrap())
-                .unwrap(),
-        )
-        .unwrap();
+        let raw = standardize_columns(&raw_scores(&cells, &feats)).unwrap();
         let t_raw = calibrate_t_for_eff(&raw, target).unwrap();
         let on_raw = placement(&cells, &coembed_from_scores(&raw, &cells, t_raw).unwrap());
         assert!(
@@ -275,7 +264,6 @@ fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
 fn a_cloud_off_the_origin_stays_on_the_manifold() {
     let target = 40.0;
     let (cells, feats) = heavy_tailed_cloud(0);
-    let n = cells.dim(0).unwrap();
     let norms: Vec<f32> = cells
         .sqr()
         .unwrap()
@@ -285,14 +273,10 @@ fn a_cloud_off_the_origin_stays_on_the_manifold() {
         .unwrap()
         .to_vec1()
         .unwrap();
-    let median_radius = {
-        let mut v = norms;
-        v.sort_by(f32::total_cmp);
-        v[n / 2]
-    };
-    let dir: Vec<f32> = (0..H).map(|j| if j == 0 { 1.0 } else { 0.0 }).collect();
+    let median_radius = legume_numeric::matrix::utils::median(&norms);
     for k in [1.0f32, 2.0, 4.0] {
-        let offset: Vec<f32> = dir.iter().map(|&x| k * median_radius * x).collect();
+        let mut offset = vec![0f32; H];
+        offset[0] = k * median_radius;
         let shifted = cells
             .broadcast_add(&Tensor::from_vec(offset, (1, H), &Device::Cpu).unwrap())
             .unwrap();
@@ -312,9 +296,6 @@ fn topic_mixture_cloud(seed: u64) -> (Tensor, Tensor) {
     use rand::SeedableRng;
     use rand_distr::multi::Dirichlet;
     use rand_distr::{Distribution, Normal};
-    const N_CELLS: usize = 1500;
-    const N_FEATS: usize = 120;
-    const K: usize = 6;
     let mut rng = StdRng::seed_from_u64(seed);
     let normal = Normal::new(0f32, 1.0).unwrap();
     let alpha: Vec<f32> = (0..K * H).map(|_| normal.sample(&mut rng)).collect();
@@ -325,11 +306,7 @@ fn topic_mixture_cloud(seed: u64) -> (Tensor, Tensor) {
         cells.extend((0..H).map(|j| (0..K).map(|k| theta[k] * alpha[k * H + j]).sum::<f32>()));
     }
     let feats: Vec<f32> = (0..N_FEATS * H).map(|_| normal.sample(&mut rng)).collect();
-    let dev = Device::Cpu;
-    (
-        Tensor::from_vec(cells, (N_CELLS, H), &dev).unwrap(),
-        Tensor::from_vec(feats, (N_FEATS, H), &dev).unwrap(),
-    )
+    to_tensors(cells, feats)
 }
 
 /// Where the origin sits is a coordinate choice, not a property of the cells: translating

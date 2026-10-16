@@ -240,18 +240,14 @@ pub fn write_feature_coembedding(
         "Feature co-embedding (SIMBA-style, T={t:.4}) → {out_prefix}.feature_coembedding.parquet"
     );
 
-    use legume_numeric::matrix::traits::ConvertMatOps;
-    let placement = crate::postprocess::coembed_placement(
-        &nalgebra::DMatrix::<f32>::from_tensor(e_cell)?,
-        &nalgebra::DMatrix::<f32>::from_tensor(&coembed)?,
-    )?;
+    let placement = crate::postprocess::coembed_placement_of_tensors(e_cell, &coembed)?;
     if placement.on_manifold() {
         info!("co-embedding placement: {placement}");
     } else {
         warn!(
             "co-embedding placement: {placement} — features sit outside the cell cloud or track \
              cell norm (want {})",
-            crate::CoembedPlacement::contract()
+            crate::postprocess::CoembedPlacement::contract()
         );
     }
     Ok(())

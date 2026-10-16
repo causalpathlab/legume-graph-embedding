@@ -17,8 +17,8 @@
 //! with `ê_i` cell `i`'s unit direction from the cloud centre. For a gene whose scores carry no
 //! spread across cells (a row the model never moved off a zero init, whose score SD falls under
 //! the floor), the softmax over cells is flat, and the weighted average collapses to the **plain
-//! mean of every cell** — the *hub* of the cell cloud. The row comes out with a healthy unit-ish norm and a perfectly plausible coordinate, and
-//! `live_row` cannot tell it from a real one.
+//! mean of every cell** — the *hub* of the cell cloud. The row comes out with a healthy unit-ish
+//! norm and a perfectly plausible coordinate, and `live_row` cannot tell it from a real one.
 //!
 //! This is not hypothetical. `senna bge` trains on the features that survive its null-QC refit and
 //! then **post-hoc projects the rest back in, so downstream tools get a full feature set** (which is
