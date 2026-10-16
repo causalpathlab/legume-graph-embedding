@@ -34,8 +34,11 @@ fn files_in(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// The label files a run writes in 0.9.x: the parquet, and the TSV pair until 0.10.
+const WRITTEN_LABEL_FILES: [&str; 3] = [".argmax.parquet", ".argmax.tsv", ".membership.tsv"];
+
 /// The parquet has one row per cell, in input order, with a non-empty label; every file in
-/// [`CELL_LABEL_FILE_SUFFIXES`] exists. Returns the labels and probabilities read back.
+/// [`WRITTEN_LABEL_FILES`] exists. Returns the labels and probabilities read back.
 fn assert_cell_labels(prefix: &str, cells: &[Box<str>]) -> (Vec<Box<str>>, Vec<f64>) {
     let (mut strings, mut numbers) = read_table_columns(
         &format!("{prefix}{CELL_LABELS_SUFFIX}"),
@@ -49,7 +52,7 @@ fn assert_cell_labels(prefix: &str, cells: &[Box<str>]) -> (Vec<Box<str>>, Vec<f
         "non-empty labels"
     );
     assert_eq!(numbers[0].len(), cells.len());
-    for suffix in CELL_LABEL_FILE_SUFFIXES {
+    for suffix in WRITTEN_LABEL_FILES {
         assert!(
             Path::new(&format!("{prefix}{suffix}")).exists(),
             "{suffix} not written"
@@ -80,14 +83,17 @@ fn writes_argmax_parquet_beside_the_tsvs() {
     assert_eq!(read_probs[1], 1.0);
     assert!(read_probs[2].is_nan(), "a NaN probability stays NaN");
 
-    let listed: BTreeSet<String> = CELL_LABEL_FILE_SUFFIXES
-        .iter()
-        .map(|s| format!("run{s}"))
-        .collect();
+    for file in files_in(&dir) {
+        let suffix = file.strip_prefix("run").unwrap();
+        assert!(
+            CELL_LABEL_FILE_SUFFIXES.contains(&suffix),
+            "{file} is written but missing from CELL_LABEL_FILE_SUFFIXES"
+        );
+    }
     assert_eq!(
-        files_in(&dir),
-        listed,
-        "CELL_LABEL_FILE_SUFFIXES lists every file"
+        files_in(&dir).len(),
+        WRITTEN_LABEL_FILES.len(),
+        "no other file"
     );
 
     // The TSV pair keeps its format for the readers that have not moved.
@@ -123,10 +129,16 @@ fn mismatched_lengths_are_an_error_before_any_file() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Without running anything: once a name retires (no longer written), this is what keeps it
-/// in the term-ORA cleanup list.
+/// Every label name this crate has written stays in both cleanup lists, retired or not, so a
+/// rerun still erases it.
 #[test]
 fn term_ora_cleans_every_label_file() {
+    for name in WRITTEN_LABEL_FILES {
+        assert!(
+            CELL_LABEL_FILE_SUFFIXES.contains(&name),
+            "{name} missing from CELL_LABEL_FILE_SUFFIXES"
+        );
+    }
     for suffix in CELL_LABEL_FILE_SUFFIXES {
         assert!(
             TERM_ORA_OUTPUT_SUFFIXES.contains(suffix),

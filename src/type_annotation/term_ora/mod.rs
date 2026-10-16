@@ -87,11 +87,11 @@ mod tests;
 #[cfg(test)]
 use ora::{OraResult, MAX_NULL_POOL};
 
-/// File-name suffixes (relative to `out_prefix`) the firm term-ORA path writes.
-/// Kept explicit (never a glob) so a caller can erase a prior run without
-/// touching sibling artifacts (the embedding, the manifest). It carries every name in
+/// File-name suffixes (relative to `out_prefix`) to erase before a rerun of the firm
+/// term-ORA path: everything it writes, plus every name in
 /// [`CELL_LABEL_FILE_SUFFIXES`](super::CELL_LABEL_FILE_SUFFIXES), retired ones included, so
-/// one list covers a rerun.
+/// it is a cleanup list, not a list of outputs. Kept explicit (never a glob) so a caller can
+/// erase a prior run without touching sibling artifacts (the embedding, the manifest).
 pub const TERM_ORA_OUTPUT_SUFFIXES: &[&str] = &[
     ".annot.parquet",
     CELL_LABELS_SUFFIX,
