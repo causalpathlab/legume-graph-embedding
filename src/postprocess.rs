@@ -9,16 +9,20 @@
 //! efficiency and the phase-2 per-cell projection are untouched.
 //!
 //! ```text
-//!   S        = e_cell · e_featᵀ                  [N, D]   (raw dot, no unit-norm)
+//!   ê_cell   = e_cell / ‖e_cell‖ (per row)         [N, H]   (per-CELL unit norm)
+//!   S        = ê_cell · e_featᵀ                   [N, D]
 //!   S̃[:,f]   = S[:,f] / sd_c(S[:,f])              [N, D]   (per-FEATURE unit scale)
 //!   P[:,f]   = softmax_over_cells( S̃[:,f] / T )    [N, D]   (column-stochastic)
-//!   coembed  = Pᵀ · e_cell                         [D, H]   (gene = wtd avg of cells)
+//!   coembed  = Pᵀ · e_cell                         [D, H]   (gene = wtd avg of RAW cells)
 //! ```
 //!
-//! The per-feature rescale is what makes a single `T` well-defined. `‖e_f‖`
-//! spans ~38× across genes, so on RAW scores one `T` saturates the long genes
-//! onto one cell and leaves the short ones spread over all of them — see
-//! [`standardize_columns`].
+//! The two rescales fix the two axes of `S` separately — see [`ScoreKeys`].
+//! The per-feature one is what makes a single `T` well-defined. `‖e_f‖` spans
+//! ~38× across genes, so on RAW scores one `T` saturates the long genes onto one
+//! cell and leaves the short ones spread over all of them — see
+//! [`standardize_columns`]. The per-cell one keeps placement from tracking cell
+//! norm: without it the softmax piles onto the longest cells and the gene lands
+//! outside the cell cloud.
 //!
 //! The softmax temperature `T` is auto-calibrated (no user knob): bisected so
 //! the mean effective number of cells per gene (`1 / Σ_c P²`) equals the median
@@ -91,6 +95,9 @@ const MAX_TARGET_EFF: f64 = 100.0;
 /// Floor on a feature's score SD, so a zero-embedding feature (constant score
 /// column) divides by a positive number instead of producing `NaN`.
 const SD_FLOOR: f64 = 1e-6;
+/// Floor on a cell's norm, so an all-zero cell row scores 0 against every
+/// feature instead of producing `NaN`.
+const NORM_FLOOR: f64 = 1e-12;
 
 mod placement;
 pub use placement::{coembed_placement, CoembedPlacement};
@@ -143,10 +150,10 @@ pub fn target_eff_from_labels(labels: &[usize], n_clusters: usize) -> f64 {
 }
 
 /// Re-embed every feature onto the cell manifold (SIMBA-style). The attention is
-/// keyed on the identity `e_cell` (query = feature `β_f`, keys = cells):
-/// `P_f[c] = softmax_c(⟨e_cell[c], β_f⟩ / T)` places each feature over the cells
-/// that express it, and the coordinate is the `P_f`-weighted mean of the cell
-/// rows. `target_eff` is the eff-cells target from [`cell_clusters`]. Returns
+/// keyed on the unit-norm cells (query = feature `β_f`, keys = `ê_cell`, see
+/// [`ScoreKeys`]): `P_f[c] = softmax_c(⟨ê_cell[c], β_f⟩ / sd / T)` places each
+/// feature over the cells that express it, and the coordinate is the
+/// `P_f`-weighted mean of the raw cell rows. `target_eff` is the eff-cells target from [`cell_clusters`]. Returns
 /// `(coembed [D,H], calibrated_T)`; both inputs are 2-D `[*, H]` on the same
 /// device and the output is on that device.
 pub fn feature_coembedding(
@@ -171,16 +178,16 @@ pub fn feature_coembedding(
     // there.
     let e_cell = e_cell.contiguous()?;
     let e_feat = e_feat.contiguous()?;
+    let keys = ScoreKeys::new(&e_cell)?;
 
     // Calibrate T on a feature subsample. The score matrix is invariant in T —
     // only the softmax temperature changes — so compute it once and reuse it
     // across the whole bisection.
     let e_feat_sub = subsample_rows(&e_feat, CALIB_FEATS)?;
-    // Standardized here so `T` is calibrated in the SAME units `coembed_block`
-    // applies it in. Calibrating on raw scores and spending the result on
-    // standardized ones is shape-valid and silently wrong, which is why the
-    // rescale lives in one named helper both paths call.
-    let scores_sub = standardize_columns(&e_cell.matmul(&e_feat_sub.t()?.contiguous()?)?)?; // [N, B]
+    // Scored by the same `ScoreKeys` that `coembed_block` uses, so `T` is
+    // calibrated in the SAME units it is applied in. Calibrating on one scale
+    // and spending the result on another is shape-valid and silently wrong.
+    let scores_sub = keys.scores(&e_feat_sub)?; // [N, B]
     let t = calibrate_t_for_eff(&scores_sub, target_eff)?;
     info!(
         "feature co-embedding: T={:.4} (eff-cells target {:.0}); mean eff-cells/gene={:.0}",
@@ -199,7 +206,7 @@ pub fn feature_coembedding(
     while start < d {
         let len = FEAT_BLOCK.min(d - start);
         let ef = e_feat.narrow(0, start, len)?;
-        blocks.push(coembed_block(&e_cell, &ef, t)?); // [len, H]
+        blocks.push(coembed_block(&keys, &e_cell, &ef, t)?); // [len, H]
         start += len;
         prog.inc(1);
     }
@@ -210,7 +217,8 @@ pub fn feature_coembedding(
 
 /// SIMBA's own `si.tl.embed`: the same softmax-over-cells average as
 /// [`feature_coembedding`], but on the RAW dot scores at a FIXED temperature
-/// (`T = 0.5` in SIMBA) — no per-feature rescale, no calibration, no biases.
+/// (`T = 0.5` in SIMBA) — no per-cell or per-feature rescale, no calibration,
+/// no biases.
 /// `senna simba` writes this as its `feature_embedding`, so the file holds
 /// SIMBA's co-embedding rather than bge's calibrated one.
 pub fn feature_coembedding_fixed_t(
@@ -279,7 +287,35 @@ fn standardize_columns(scores: &Tensor) -> Result<Tensor> {
     scores.broadcast_div(&sd)
 }
 
-/// One feature-block: `softmax_over_cells(standardize(e_cell·e_fᵀ) / T)ᵀ · e_cell`.
+/// The cells as the calibrated softmax sees them: each row scaled to unit norm.
+/// The ONE place scores are made on the calibrated path — the temperature
+/// calibration and [`coembed_block`] both go through [`ScoreKeys::scores`], so
+/// `T` cannot be calibrated in one set of units and applied in another.
+///
+/// Why unit cells. `⟨e_cell_c, e_f⟩` grows with `‖e_cell_c‖`, and the per-feature
+/// rescale in [`standardize_columns`] equalizes features, not cells. Cell norms are
+/// heavy-tailed (max/median up to ~16 on real runs), so at the calibrated `T` the
+/// softmax piles onto the longest cells along `e_f`, and the weighted mean lands at
+/// or beyond the edge of the cell cloud. Across 71 real runs the old scores put the
+/// median gene beyond 87–100% of cells, next to the top ~10% of cells by norm; the
+/// placement bias tracked max/median cell norm (Spearman +0.9), not `N`. Scoring on
+/// direction alone removes the norm from the softmax; the AVERAGE stays over the raw
+/// cells, so the coordinate is still in the cells' own units.
+struct ScoreKeys(Tensor);
+
+impl ScoreKeys {
+    fn new(e_cell: &Tensor) -> Result<Self> {
+        let norm = e_cell.sqr()?.sum_keepdim(1)?.sqrt()?.maximum(NORM_FLOOR)?; // [N, 1]
+        Ok(Self(e_cell.broadcast_div(&norm)?))
+    }
+
+    /// `standardize(ê_cell · e_fᵀ)` for one `[B, H]` feature block → `[N, B]`.
+    fn scores(&self, e_feat_block: &Tensor) -> Result<Tensor> {
+        standardize_columns(&self.0.matmul(&e_feat_block.t()?.contiguous()?)?)
+    }
+}
+
+/// One feature-block: `softmax_over_cells(keys.scores(e_f) / T)ᵀ · e_cell`.
 ///
 /// Biases are deliberately absent. `b_f` is constant down a column and cancels in
 /// the softmax; `b_c` does NOT cancel, but it is a per-cell depth offset shared by
@@ -287,9 +323,13 @@ fn standardize_columns(scores: &Tensor) -> Result<Tensor> {
 /// it halves fidelity (recall@100 0.387 → 0.162) and makes 43.6% of any gene's
 /// top-100 the same cells. The co-embedding wants the gene-SPECIFIC part of the
 /// score only.
-fn coembed_block(e_cell: &Tensor, e_feat_block: &Tensor, t: f64) -> Result<Tensor> {
-    let scores = standardize_columns(&e_cell.matmul(&e_feat_block.t()?.contiguous()?)?)?; // [N, B]
-    coembed_from_scores(&scores, e_cell, t)
+fn coembed_block(
+    keys: &ScoreKeys,
+    e_cell: &Tensor,
+    e_feat_block: &Tensor,
+    t: f64,
+) -> Result<Tensor> {
+    coembed_from_scores(&keys.scores(e_feat_block)?, e_cell, t)
 }
 
 /// `softmax_over_cells(scores / T)ᵀ · e_cell` for one `[N, B]` score block:
