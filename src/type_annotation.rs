@@ -60,6 +60,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 mod coarsen;
 mod consensus;
+pub mod embedding_score;
 mod gene_strata;
 mod hub_call;
 mod layout;
