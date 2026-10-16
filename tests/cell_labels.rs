@@ -26,6 +26,14 @@ fn fresh_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// The names of the files in `dir`.
+fn files_in(dir: &Path) -> BTreeSet<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect()
+}
+
 /// The parquet has one row per cell, in input order, with a non-empty label; every file in
 /// [`CELL_LABEL_FILE_SUFFIXES`] exists. Returns the labels and probabilities read back.
 fn assert_cell_labels(prefix: &str, cells: &[Box<str>]) -> (Vec<Box<str>>, Vec<f64>) {
@@ -72,15 +80,15 @@ fn writes_argmax_parquet_beside_the_tsvs() {
     assert_eq!(read_probs[1], 1.0);
     assert!(read_probs[2].is_nan(), "a NaN probability stays NaN");
 
-    let written: BTreeSet<String> = fs::read_dir(&dir)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
     let listed: BTreeSet<String> = CELL_LABEL_FILE_SUFFIXES
         .iter()
         .map(|s| format!("run{s}"))
         .collect();
-    assert_eq!(written, listed, "CELL_LABEL_FILE_SUFFIXES lists every file");
+    assert_eq!(
+        files_in(&dir),
+        listed,
+        "CELL_LABEL_FILE_SUFFIXES lists every file"
+    );
 
     // The TSV pair keeps its format for the readers that have not moved.
     assert_eq!(
@@ -95,21 +103,7 @@ fn writes_argmax_parquet_beside_the_tsvs() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn tsv_writer_rejects_mismatched_lengths() {
-    let dir = fresh_dir("tsv_lengths");
-    let prefix = dir.join("run");
-    let prefix = prefix.to_str().unwrap();
-
-    let cells = names(&["c0", "c1", "c2"]);
-    let labels = names(&["T cell", "B cell", "T cell"]);
-    let err = write_label_tsvs(prefix, &cells, &labels, &[0.5, 0.5]).unwrap_err();
-    assert!(err.to_string().contains("for 3 cells"), "{err}");
-    let err = write_label_tsvs(prefix, &cells, &labels[..2], &[0.5; 3]).unwrap_err();
-    assert!(err.to_string().contains("for 3 cells"), "{err}");
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "no file written");
-    let _ = fs::remove_dir_all(&dir);
-}
+type Writer = fn(&str, &[Box<str>], &[Box<str>], &[f32]) -> anyhow::Result<()>;
 
 #[test]
 fn mismatched_lengths_are_an_error_before_any_file() {
@@ -119,12 +113,18 @@ fn mismatched_lengths_are_an_error_before_any_file() {
 
     let cells = names(&["c0", "c1", "c2"]);
     let labels = names(&["T cell", "B cell", "T cell"]);
-    let err = write_cell_labels(prefix, &cells, &labels, &[0.5, 0.5]).unwrap_err();
-    assert!(err.to_string().contains("for 3 cells"), "{err}");
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "no file written");
+    for write in [write_cell_labels as Writer, write_label_tsvs] {
+        let err = write(prefix, &cells, &labels, &[0.5, 0.5]).unwrap_err();
+        assert!(err.to_string().contains("for 3 cells"), "{err}");
+        let err = write(prefix, &cells, &labels[..2], &[0.5; 3]).unwrap_err();
+        assert!(err.to_string().contains("for 3 cells"), "{err}");
+    }
+    assert!(files_in(&dir).is_empty(), "no file written");
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Without running anything: once a name retires (no longer written), this is what keeps it
+/// in the term-ORA cleanup list.
 #[test]
 fn term_ora_cleans_every_label_file() {
     for suffix in CELL_LABEL_FILE_SUFFIXES {
@@ -175,9 +175,8 @@ fn check_path(
     };
     annotate(&input, markers.to_str().unwrap(), prefix).unwrap();
     assert_cell_labels(prefix, &cell_names);
-    let outputs = fs::read_dir(&dir)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
+    let outputs = files_in(&dir)
+        .into_iter()
         .filter_map(|f| f.strip_prefix("run").map(str::to_owned))
         .collect();
     let _ = fs::remove_dir_all(&dir);

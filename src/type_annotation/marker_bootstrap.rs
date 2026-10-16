@@ -162,10 +162,10 @@ pub struct BootstrapResult {
     pub type_qc: Vec<TypeQc>,
 }
 
-/// The consensus over the **shipped**, cluster-driven label — the one that lands in
-/// the per-cell label files. Distinct from the nearest-centroid numbers on [`BootstrapResult`]: this
-/// one additionally absorbs the clustering's own stochasticity, so it is the stricter (and the
-/// operationally relevant) statement.
+/// The consensus over the **shipped**, cluster-driven label — the one that lands in the
+/// per-cell label files. Distinct from the nearest-centroid numbers on [`BootstrapResult`]:
+/// this one additionally absorbs the clustering's own stochasticity, so it is the stricter (and
+/// the operationally relevant) statement.
 pub struct CoarseConsensus {
     /// `[n × (c+1)]` row-major; the last column is `unassigned`.
     pub post: Vec<f32>,

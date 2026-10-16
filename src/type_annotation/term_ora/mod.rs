@@ -89,7 +89,9 @@ use ora::{OraResult, MAX_NULL_POOL};
 
 /// File-name suffixes (relative to `out_prefix`) the firm term-ORA path writes.
 /// Kept explicit (never a glob) so a caller can erase a prior run without
-/// touching sibling artifacts (the embedding, the manifest).
+/// touching sibling artifacts (the embedding, the manifest). It carries every name in
+/// [`CELL_LABEL_FILE_SUFFIXES`](super::CELL_LABEL_FILE_SUFFIXES), retired ones included, so
+/// one list covers a rerun.
 pub const TERM_ORA_OUTPUT_SUFFIXES: &[&str] = &[
     ".annot.parquet",
     CELL_LABELS_SUFFIX,
