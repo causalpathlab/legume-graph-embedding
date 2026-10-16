@@ -52,11 +52,12 @@ fn degenerate_inputs_are_errors() {
     assert!(coembed_placement(&empty, &DMatrix::zeros(3, 0)).is_err());
 }
 
-/// Half the features parked at the hub, half beside the outermost cells (still inside the
-/// 99th percentile): each half is misplaced, yet the mean nearest-cell percentile is ~50 and
-/// nothing is beyond p99. The split itself must fail the contract.
+/// Half the features near the hub, half beside the outermost cells (still inside the 99th
+/// percentile): each half is misplaced, yet the mean nearest-cell percentile is ~50 and nothing
+/// is beyond p99. Neither half is an unambiguous failure, so the contract does not gate it —
+/// but the split is visible in the reported quartiles, both in the tails.
 #[test]
-fn a_split_placement_is_not_on_the_manifold() {
+fn a_split_placement_is_visible_not_gated() {
     let n = 1000;
     let cells = spokes(n);
     let feats = DMatrix::from_fn(100, H, |g, j| {
@@ -68,11 +69,12 @@ fn a_split_placement_is_not_on_the_manifold() {
         cells[(src, j)]
     });
     let got = coembed_placement(&cells, &feats).unwrap();
+    assert!(got.on_manifold(), "{got}: {:?}", got.violations());
+    let [q25, _, q75] = got.nn_norm_pct_quartiles;
     assert!(
-        got.beyond_p99 < 0.15 && (got.nn_norm_pct - 50.0).abs() <= 10.0,
-        "the fixture must hide the split from the mean, got {got}"
+        q25 < 10.0 && q75 > 90.0,
+        "the split must show in the quartiles: {got}"
     );
-    assert!(!got.on_manifold(), "a hub/edge split passed: {got}");
 }
 
 /// Features sitting among cells of ordinary norm pass.
@@ -110,4 +112,30 @@ fn a_huge_finite_row_is_not_counted_as_non_finite() {
     let got = coembed_placement(&cells, &feats).unwrap();
     assert_eq!(got.non_finite, 0, "{got}");
     assert!(got.beyond_p99 >= 0.1, "{got}");
+}
+
+/// All-NaN features fail as non-finite and beyond the cloud — not also as "outward" and
+/// "inward" at once from NaN statistics.
+#[test]
+fn nan_features_report_only_unambiguous_failures() {
+    let cells = spokes(400);
+    let feats = DMatrix::from_element(10, H, f32::NAN);
+    let v = format!(
+        "{:?}",
+        coembed_placement(&cells, &feats).unwrap().violations()
+    );
+    assert_eq!(v, "[NonFinite, BeyondCloud]");
+}
+
+/// `dist_pct` is the median over features of each feature's distance percentile. With two
+/// features, one at the cells' median radius and one beyond every cell, it is 75.
+#[test]
+fn dist_pct_is_the_median_of_feature_percentiles() {
+    let n = 400;
+    let cells = spokes(n);
+    let mid = cells.row(n / 2).into_owned();
+    let mut feats = DMatrix::from_fn(2, H, |_, j| mid[j]);
+    feats[(1, 0)] = 1e4;
+    let got = coembed_placement(&cells, &feats).unwrap();
+    assert!((got.dist_pct - 75.0).abs() < 1.0, "{got}");
 }

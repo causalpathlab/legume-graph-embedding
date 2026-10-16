@@ -322,13 +322,18 @@ fn an_elongated_cloud_stays_on_the_manifold() {
     }
 }
 
-/// SIMBA's fixed-T path at a high temperature collapses every gene to the hub: it must fail.
+/// SIMBA's fixed-T path at a high temperature collapses every gene to the hub: it must fail,
+/// and name the collapse.
 #[test]
 fn a_hub_collapse_is_not_on_the_manifold() {
     let (cells, feats) = heavy_tailed_cloud(0);
     let co = feature_coembedding_fixed_t(&cells, &feats, 1e3).unwrap();
     let got = placement(&cells, &co);
-    assert!(!got.on_manifold(), "a hub collapse passed: {got}");
+    let v = format!("{:?}", got.violations());
+    assert!(
+        v.contains("HubCollapse"),
+        "a hub collapse was not named: {got}: {v}"
+    );
 }
 
 /// A topic-mixture cloud, `Z = θ·α` with `θ` on the simplex (Dirichlet) and `α` a `K × H`
@@ -348,21 +353,51 @@ fn topic_mixture_cloud(seed: u64) -> (Tensor, Tensor) {
     to_tensors(cells, feats)
 }
 
-/// On a topic-mixture cloud the features must not sit beside the longest cells: the outward
-/// half of the contract holds. The inward tail is left unasserted: the cloud is sparse in its
-/// interior, a feature averaged across it lands there, and its lower quartile can fall just
-/// under the cells' local-average 10th percentile.
+/// A healthy co-embedding of a topic-mixture cloud passes, on every seed. Its features sit
+/// inward of the cells (the cloud is sparse in its interior); that is the geometry, and the
+/// contract does not judge it.
 #[test]
-fn a_topic_mixture_cloud_does_not_track_cell_norm() {
-    for seed in 0..3 {
+fn a_topic_mixture_cloud_stays_on_the_manifold() {
+    for seed in 0..6 {
         let (cells, feats) = topic_mixture_cloud(seed);
-        let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
-        let got = placement(&cells, &co);
-        let v = got.violations();
+        assert_placed(&cells, &feats, &format!("seed {seed}"));
+    }
+}
+
+/// A single healthy gene, checked on its own, passes: the contract does not hinge on
+/// quantiles of a handful of features.
+#[test]
+fn a_single_healthy_feature_passes() {
+    let (cells, feats) = heavy_tailed_cloud(0);
+    let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    for g in 0..co.dim(0).unwrap() {
+        let one = co.narrow(0, g, 1).unwrap();
+        let got = placement(&cells, &one);
         assert!(
-            !v.contains(&PlacementViolation::Outward)
-                && !v.contains(&PlacementViolation::BeyondCloud),
-            "seed {seed}: features sit beside the longest cells: {got}: {v:?}"
+            got.on_manifold(),
+            "feature {g} alone: {got}: {:?}",
+            got.violations()
+        );
+    }
+}
+
+/// Fewer cells than a nearest-cell neighbourhood: the statistics are degenerate, so float
+/// rounding must not decide the verdict.
+#[test]
+fn a_tiny_cloud_is_not_judged_on_rounding() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let normal = Normal::new(0f32, 1.0).unwrap();
+    for trial in 0..100 {
+        let n = 5 + trial % 25;
+        let cells: Vec<f32> = (0..n * H).map(|_| normal.sample(&mut rng)).collect();
+        let feats: Vec<f32> = (0..10 * H).map(|_| 0.3 * normal.sample(&mut rng)).collect();
+        let cells = Tensor::from_vec(cells, (n, H), &Device::Cpu).unwrap();
+        let feats = Tensor::from_vec(feats, (10, H), &Device::Cpu).unwrap();
+        let got = placement(&cells, &feats);
+        assert!(
+            got.on_manifold(),
+            "trial {trial} ({n} cells): {got}: {:?}",
+            got.violations()
         );
     }
 }
