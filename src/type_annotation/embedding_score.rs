@@ -202,8 +202,19 @@ pub fn balanced_centre(cells: &DMatrix<f64>, groups: &[usize]) -> Result<DVector
 }
 
 /// `[N × C]` scores `(z_i − m) · u_T`.
+///
+/// # Panics
+///
+/// If `centre` or `dirs` is not as wide as `cells`.
 #[must_use]
 pub fn scores(cells: &DMatrix<f64>, centre: &DVector<f64>, dirs: &DMatrix<f64>) -> DMatrix<f64> {
+    assert_eq!(
+        centre.len(),
+        cells.ncols(),
+        "the centre has {} entries for H = {}",
+        centre.len(),
+        cells.ncols()
+    );
     let mut centred = cells.clone();
     for (mut col, &m) in centred.column_iter_mut().zip(centre.iter()) {
         col.add_scalar_mut(-m);
@@ -214,13 +225,14 @@ pub fn scores(cells: &DMatrix<f64>, centre: &DVector<f64>, dirs: &DMatrix<f64>) 
 /// One cell's call.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellCall {
-    /// The best live type, or `None` when no type is live.
+    /// The best live type, or `None` when no live type has a score.
     pub call: Option<usize>,
-    /// Best minus runner-up among live types; NaN when fewer than two are live.
+    /// Best minus runner-up among live types; NaN when fewer than two have a score.
     pub margin: f64,
 }
 
-/// Per cell, the argmax of `scores` over the live types (rows of `dirs` that are not zero).
+/// Per cell, the argmax of `scores` over the live types (rows of `dirs` that are not zero). A
+/// NaN score is not a candidate.
 #[must_use]
 pub fn calls(scores: &DMatrix<f64>, dirs: &DMatrix<f64>) -> Vec<CellCall> {
     let live: Vec<usize> = (0..dirs.nrows())
@@ -231,8 +243,13 @@ pub fn calls(scores: &DMatrix<f64>, dirs: &DMatrix<f64>) -> Vec<CellCall> {
         .map(|row| {
             let mut best: Option<(usize, f64)> = None;
             let mut runner_up = f64::NEG_INFINITY;
+            let mut candidates = 0;
             for &t in &live {
                 let s = row[t];
+                if s.is_nan() {
+                    continue;
+                }
+                candidates += 1;
                 match best {
                     Some((_, b)) if s <= b => runner_up = runner_up.max(s),
                     prev => {
@@ -244,7 +261,7 @@ pub fn calls(scores: &DMatrix<f64>, dirs: &DMatrix<f64>) -> Vec<CellCall> {
             CellCall {
                 call: best.map(|(t, _)| t),
                 margin: match best {
-                    Some((_, b)) if live.len() >= 2 => b - runner_up,
+                    Some((_, b)) if candidates >= 2 => b - runner_up,
                     _ => f64::NAN,
                 },
             }
