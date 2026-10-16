@@ -171,7 +171,8 @@ fn match_panel(
 /// Drop the types left with fewer than `min_markers` markers — none of their genes are in the
 /// embedding, or IDF zeroed them. See [`parse_and_match_markers`]: an empty type's zero
 /// signature out-competes every real one for any cell whose best cosine is below 0.5, so
-/// keeping it silently mislabels the majority of the data.
+/// keeping it silently mislabels the majority of the data. Fewer than `min_types` survivors
+/// is an error naming the types lost. Both bounds are at least 1.
 fn drop_thin_types<W>(
     type_names: &[Box<str>],
     sets: Vec<Vec<(u32, W)>>,
@@ -179,7 +180,6 @@ fn drop_thin_types<W>(
     min_types: usize,
 ) -> Result<TypedSets<W>> {
     let c = type_names.len();
-    let min_markers = min_markers.max(1);
     let (kept, lost): (Vec<_>, Vec<_>) = type_names
         .iter()
         .zip(sets)
@@ -196,13 +196,13 @@ fn drop_thin_types<W>(
         );
     }
     anyhow::ensure!(
-        kept.len() >= min_types.max(1),
+        kept.len() >= min_types,
         "{} marker type(s) kept {min_markers} or more usable marker gene(s) in the embedding; \
          {} needed. Lost: {}. A marker must match a row name, must not be held by every type \
          (IDF 0, so a one-type panel has none), and must be live — check the marker file's \
          gene naming against the dictionary's row names",
         kept.len(),
-        min_types.max(1),
+        min_types,
         lost.join(", ")
     );
 

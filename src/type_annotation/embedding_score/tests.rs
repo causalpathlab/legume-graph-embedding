@@ -273,12 +273,10 @@ fn fewer_than_two_live_types_is_an_error() {
         ],
         0.0,
     )
-    .map(|p| p.type_names)
     .expect_err("one live type must not be scored");
     assert!(format!("{err:#}").contains("Thin"), "{err:#}");
 
     let err = read_panel(&space, "one_type", &[("Only", &["g00", "g01", "g02"])], 0.0)
-        .map(|p| p.type_names)
         .expect_err("a one-type panel must not be scored");
     assert!(format!("{err:#}").contains("Only"), "{err:#}");
 }

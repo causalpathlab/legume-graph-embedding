@@ -81,6 +81,7 @@ const MIN_TYPES: usize = 2;
 pub type WeightedSet = Vec<(u32, f64)>;
 
 /// A matched marker panel: the surviving types, in sorted order, and their weighted sets.
+#[derive(Debug)]
 pub struct PanelSets {
     pub type_names: Vec<Box<str>>,
     pub sets: Vec<WeightedSet>,
