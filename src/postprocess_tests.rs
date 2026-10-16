@@ -268,6 +268,16 @@ fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
         );
 
         assert_placed(&cells, &feats, &format!("seed {seed}"));
+
+        // Not gated, but the point of the fix: the features no longer sit beside the longest
+        // cells. Their nearest cells sit at least 20 percentile points lower than on raw scores.
+        let (co, _) = feature_coembedding(&cells, &feats, target).unwrap();
+        let fixed = placement(&cells, &co).nearest.expect("measured").mean;
+        let raw = on_raw.nearest.expect("measured").mean;
+        assert!(
+            fixed < raw - 20.0,
+            "seed {seed}: nearest-cell percentile {fixed:.1} on direction scores vs {raw:.1} raw"
+        );
     }
 }
 
@@ -287,6 +297,8 @@ fn a_cloud_off_the_origin_stays_on_the_manifold() {
         .to_vec1()
         .unwrap();
     let median_radius = legume_numeric::matrix::utils::median(&norms);
+    let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    let at_origin = placement(&cells, &co).nearest.expect("measured").mean;
     for k in [1.0f32, 2.0, 4.0] {
         let mut offset = vec![0f32; H];
         offset[0] = k * median_radius;
@@ -297,6 +309,13 @@ fn a_cloud_off_the_origin_stays_on_the_manifold() {
             &shifted,
             &feats,
             &format!("cloud shifted {k}× its median radius"),
+        );
+        // And placement among the cells does not move with the origin.
+        let (co, _) = feature_coembedding(&shifted, &feats, 40.0).unwrap();
+        let moved = placement(&shifted, &co).nearest.expect("measured").mean;
+        assert!(
+            (moved - at_origin).abs() < 2.0,
+            "shifted {k}×: nearest-cell percentile {moved:.1} vs {at_origin:.1} at the origin"
         );
     }
 }
@@ -330,10 +349,10 @@ fn a_hub_collapse_is_not_on_the_manifold() {
     let (cells, feats) = heavy_tailed_cloud(0);
     let co = feature_coembedding_fixed_t(&cells, &feats, 1e3).unwrap();
     let got = placement(&cells, &co);
-    let v = format!("{:?}", got.violations());
+    let v = got.violations();
     assert!(
-        v.contains("HubCollapse"),
-        "a hub collapse was not named: {got}: {v}"
+        v.contains(&PlacementViolation::HubCollapse),
+        "a hub collapse was not named: {got}: {v:?}"
     );
 }
 
@@ -391,9 +410,9 @@ fn a_tiny_cloud_is_judged_without_nearest_cells() {
     for trial in 0..25 {
         let n = 5 + trial % 25;
         let cells: Vec<f32> = (0..n * H).map(|_| normal.sample(&mut rng)).collect();
-        let feats: Vec<f32> = (0..10 * H).map(|_| 0.3 * normal.sample(&mut rng)).collect();
+        let feats: Vec<f32> = (0..40 * H).map(|_| 0.3 * normal.sample(&mut rng)).collect();
         let cells = Tensor::from_vec(cells, (n, H), &Device::Cpu).unwrap();
-        let feats = Tensor::from_vec(feats, (10, H), &Device::Cpu).unwrap();
+        let feats = Tensor::from_vec(feats, (40, H), &Device::Cpu).unwrap();
         let got = placement(&cells, &feats);
         assert!(got.nearest.is_none(), "trial {trial} ({n} cells): {got}");
         assert!(

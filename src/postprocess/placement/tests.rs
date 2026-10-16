@@ -133,3 +133,38 @@ fn dist_pct_is_the_median_of_feature_percentiles() {
     let got = coembed_placement(&cells, &feats).unwrap();
     assert!((got.dist_pct - 75.0).abs() < 1.0, "{got}");
 }
+
+/// A share of a handful of features is not evidence: one marker of five just past the cells'
+/// 99th percentile is 20% "beyond the cloud". Below a neighbourhood's worth of features the
+/// share-based clauses are not judged; a non-finite row still fails.
+#[test]
+fn a_small_panel_is_not_judged_on_shares() {
+    let cells = spokes(400);
+    let mut panel = DMatrix::from_fn(5, H, |g, j| cells[(g * 50 + 25, j)]);
+    panel[(0, 0)] = cells[(399, 0)] * 1.01;
+    let got = coembed_placement(&cells, &panel).unwrap();
+    assert!(got.on_manifold(), "{got}: {:?}", got.violations());
+
+    panel.row_mut(1).fill(f32::NAN);
+    let got = coembed_placement(&cells, &panel).unwrap();
+    assert_eq!(got.violations(), [PlacementViolation::NonFinite]);
+}
+
+/// The nearest-cell statistics sample features after dropping non-finite rows: when every
+/// other row is NaN, the stride must not land only on NaN rows and report NaN.
+#[test]
+fn nearest_cells_sample_finite_rows() {
+    let cells = spokes(400);
+    let feats = DMatrix::from_fn(6000, H, |g, j| {
+        if g % 2 == 0 {
+            f32::NAN
+        } else {
+            cells[((g / 2) % 400, j)]
+        }
+    });
+    let got = coembed_placement(&cells, &feats).unwrap();
+    let nn = got
+        .nearest
+        .expect("3000 finite features are enough to measure");
+    assert!(nn.mean.is_finite(), "{got}");
+}
