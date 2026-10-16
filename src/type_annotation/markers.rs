@@ -38,23 +38,14 @@ pub fn parse_and_match_markers(
     let panel = match_panel(markers_path, gene_names, min_coverage)?;
     let c = panel.type_names.len();
     let use_idf = use_idf && c >= 2;
-    let type_markers: MarkerSets = panel
-        .membership
-        .iter()
-        .map(|genes| {
-            genes
-                .iter()
-                .filter_map(|&gi| {
-                    if use_idf {
-                        let w = idf_weight(c, panel.df[&gi]);
-                        (w > 0.0).then_some((gi, w)) // drop ubiquitous (IDF 0)
-                    } else {
-                        Some((gi, 1.0))
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    let type_markers = panel.weigh(|df| {
+        if use_idf {
+            let w = idf_weight(c, df);
+            (w > 0.0).then_some(w) // drop ubiquitous (IDF 0)
+        } else {
+            Some(1.0)
+        }
+    });
     drop_thin_types(&panel.type_names, type_markers, 1)
 }
 
@@ -69,19 +60,10 @@ pub(super) fn parse_and_match_idf_sets(
 ) -> Result<TypedSets<f64>> {
     let panel = match_panel(markers_path, gene_names, min_coverage)?;
     let c = panel.type_names.len() as f64;
-    let sets = panel
-        .membership
-        .iter()
-        .map(|genes| {
-            let mut set: Vec<(u32, f64)> = genes
-                .iter()
-                .map(|&gi| (gi, (c / panel.df[&gi] as f64).ln()))
-                .filter(|&(_, w)| w > 0.0)
-                .collect();
-            set.sort_unstable_by_key(|&(gi, _)| gi);
-            set
-        })
-        .collect();
+    let mut sets = panel.weigh(|df| Some((c / df as f64).ln()).filter(|&w| w > 0.0));
+    for set in &mut sets {
+        set.sort_unstable_by_key(|&(gi, _)| gi);
+    }
     drop_thin_types(&panel.type_names, sets, min_markers)
 }
 
@@ -93,6 +75,21 @@ struct MatchedPanel {
     membership: Vec<FxHashSet<u32>>,
     /// Per matched gene, the number of types holding it.
     df: FxHashMap<u32, usize>,
+}
+
+impl MatchedPanel {
+    /// Each type's genes, weighted by `weight(df_gene)`; a `None` weight drops the gene.
+    fn weigh<W>(&self, weight: impl Fn(usize) -> Option<W>) -> Vec<Vec<(u32, W)>> {
+        self.membership
+            .iter()
+            .map(|genes| {
+                genes
+                    .iter()
+                    .filter_map(|&gi| Some((gi, weight(self.df[&gi])?)))
+                    .collect()
+            })
+            .collect()
+    }
 }
 
 fn match_panel(
@@ -170,10 +167,11 @@ fn drop_thin_types<W>(
     min_markers: usize,
 ) -> Result<TypedSets<W>> {
     let c = type_names.len();
+    let min_markers = min_markers.max(1);
     let (kept_names, kept_sets): (Vec<Box<str>>, Vec<_>) = type_names
         .iter()
         .zip(sets)
-        .filter(|(_, m)| m.len() >= min_markers.max(1))
+        .filter(|(_, m)| m.len() >= min_markers)
         .map(|(n, m)| (n.clone(), m))
         .unzip();
     if kept_names.len() < c {
@@ -188,7 +186,7 @@ fn drop_thin_types<W>(
              the feature axis (e.g. lower `--n-hvg`, or rely on the held-out feature \
              projection) if you need them.",
             dropped.len(),
-            min_markers.max(1),
+            min_markers,
             dropped.join(", ")
         );
     }

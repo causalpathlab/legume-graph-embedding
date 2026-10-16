@@ -64,6 +64,7 @@
 use super::markers::parse_and_match_idf_sets;
 use super::UNASSIGNED;
 use anyhow::{ensure, Result};
+use legume_numeric::matrix::traits::MatOps;
 use nalgebra::{DMatrix, DVector, RowDVector};
 use std::collections::BTreeMap;
 
@@ -79,10 +80,11 @@ pub struct PanelSets {
     pub sets: Vec<WeightedSet>,
 }
 
-/// The feature embedding, each row divided by its logit's standard deviation over the cells.
+/// The feature embedding and each row's logit standard deviation over the cells.
 pub struct FeatureSpace {
-    /// `[G × H]` rows `ρ_g / σ_g`; the zero row where `σ_g = 0`.
-    unit: DMatrix<f64>,
+    /// `[G × H]` feature embedding `ρ`.
+    rho: DMatrix<f64>,
+    /// `[G]` `σ_g`; 0 marks a dead row.
     sigma: DVector<f64>,
     gene_names: Vec<Box<str>>,
 }
@@ -106,21 +108,12 @@ impl FeatureSpace {
             "{} gene names for {g} feature rows",
             gene_names.len()
         );
-        let sigma = DVector::from_iterator(
-            g,
-            rho.row_iter()
-                .map(|r| (r * cell_cov).dot(&r).max(0.0).sqrt()),
-        );
-        let mut unit = rho.clone();
-        for (mut row, &s) in unit.row_iter_mut().zip(sigma.iter()) {
-            if s > 0.0 {
-                row /= s;
-            } else {
-                row.fill(0.0);
-            }
-        }
+        let sigma = (rho * cell_cov)
+            .component_mul(rho)
+            .column_sum()
+            .map(|v| v.max(0.0).sqrt());
         Ok(Self {
-            unit,
+            rho: rho.clone(),
             sigma,
             gene_names: gene_names.to_vec(),
         })
@@ -148,12 +141,15 @@ impl FeatureSpace {
     /// gives the zero row.
     #[must_use]
     pub fn directions(&self, sets: &[WeightedSet]) -> DMatrix<f64> {
-        let mut dirs = DMatrix::zeros(sets.len(), self.unit.ncols());
+        let mut dirs = DMatrix::zeros(sets.len(), self.rho.ncols());
         for (set, mut dir) in sets.iter().zip(dirs.row_iter_mut()) {
             let mut total = 0.0;
-            for &(g, w) in set.iter().filter(|&&(g, _)| self.sigma[g as usize] > 0.0) {
-                dir += self.unit.row(g as usize) * w;
-                total += w;
+            for &(g, w) in set {
+                let s = self.sigma[g as usize];
+                if s > 0.0 {
+                    dir += self.rho.row(g as usize) / s * w;
+                    total += w;
+                }
             }
             if total > 0.0 {
                 dir /= total;
@@ -167,12 +163,8 @@ impl FeatureSpace {
 pub fn cell_covariance(cells: &DMatrix<f64>) -> Result<DMatrix<f64>> {
     let n = cells.nrows();
     ensure!(n >= 2, "a covariance needs at least 2 cells, got {n}");
-    let mean = cells.row_mean();
-    let mut centred = cells.clone();
-    for mut row in centred.row_iter_mut() {
-        row -= &mean;
-    }
-    Ok(centred.tr_mul(&centred) / (n - 1) as f64)
+    let c = cells.centre_columns();
+    Ok(c.tr_mul(&c) / (n - 1) as f64)
 }
 
 /// The mean of the cluster means. `groups[i]` is cell `i`'s cluster; cells marked
@@ -206,10 +198,9 @@ pub fn balanced_centre(cells: &DMatrix<f64>, groups: &[usize]) -> Result<DVector
 /// `[N × C]` scores `(z_i − m) · u_T`.
 #[must_use]
 pub fn scores(cells: &DMatrix<f64>, centre: &DVector<f64>, dirs: &DMatrix<f64>) -> DMatrix<f64> {
-    let centre = centre.transpose();
     let mut centred = cells.clone();
-    for mut row in centred.row_iter_mut() {
-        row -= &centre;
+    for (mut col, &m) in centred.column_iter_mut().zip(centre.iter()) {
+        col.add_scalar_mut(-m);
     }
     centred * dirs.transpose()
 }
@@ -238,10 +229,8 @@ pub fn calls(scores: &DMatrix<f64>, dirs: &DMatrix<f64>) -> Vec<CellCall> {
                 let s = row[t];
                 match best {
                     Some((_, b)) if s <= b => runner_up = runner_up.max(s),
-                    _ => {
-                        if let Some((_, b)) = best {
-                            runner_up = runner_up.max(b);
-                        }
+                    prev => {
+                        runner_up = prev.map_or(runner_up, |(_, b)| runner_up.max(b));
                         best = Some((t, s));
                     }
                 }
