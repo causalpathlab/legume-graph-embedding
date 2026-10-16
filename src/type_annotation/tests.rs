@@ -316,9 +316,8 @@ fn all_marker_types_unmatched_is_an_error() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// A tab-separated panel splits on the tab only: a Cell Ontology label carries commas, and
-// splitting on them truncated `CD4-positive, alpha-beta T cell` to `CD4-positive`, merging
-// every label that shares the prefix. A line with no tab is still read as CSV.
+// Tab lines split on the tab only, so Cell Ontology labels keep their commas; tab-less lines
+// stay CSV.
 #[test]
 fn marker_reader_keeps_commas_in_tab_separated_labels() {
     let dir = std::env::temp_dir().join(format!("geu_marker_tab_split_{}", std::process::id()));
