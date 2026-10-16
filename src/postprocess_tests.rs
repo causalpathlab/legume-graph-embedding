@@ -355,6 +355,25 @@ fn topic_mixture_cloud(seed: u64) -> (Tensor, Tensor) {
     to_tensors(cells, feats)
 }
 
+/// On a topic-mixture cloud the features must not sit beside the longest cells: the outward
+/// half of the contract holds. The inward tail is left unasserted — the cloud is sparse in
+/// its interior, a feature averaged across it lands there, and on two of these three seeds
+/// its lower quartile falls 1–4 points under the cells' local-average 10th percentile.
+#[test]
+fn a_topic_mixture_cloud_does_not_track_cell_norm() {
+    for seed in 0..3 {
+        let (cells, feats) = topic_mixture_cloud(seed);
+        let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+        let got = placement(&cells, &co);
+        let [_, q50, q75] = got.nn_norm_pct_quartiles;
+        let [_, _, b75, b90] = got.cell_baseline;
+        assert!(
+            got.beyond_p99 < 0.15 && q50 <= b75 && q75 <= b90,
+            "seed {seed}: features sit beside the longest cells: {got}"
+        );
+    }
+}
+
 /// Where the origin sits is a coordinate choice, not a property of the cells: translating
 /// a topic-mixture cloud must translate its co-embedding by the same vector and leave `T`
 /// alone. Directions taken from the origin break this — the further the cloud sits from it,

@@ -1,23 +1,37 @@
 //! **Is the co-embedding on the cell manifold?** The placement contract, measured.
 //!
 //! A co-embedded feature is a weighted mean of cells, so it should sit *inside* the cell
-//! cloud, and *where* inside should not depend on how long the nearby cells are. Two
-//! numbers locate the features, and three make up the contract:
+//! cloud, and *where* inside should not depend on how long the nearby cells are.
 //!
 //! - `dist_x_r`: median distance of a feature from the cell centre, in units of the cloud's
 //!   radius `R = mean_i ‖z_i − mean(z)‖` (the radius `hub_call` measures against).
 //! - `dist_pct`: median over features of that distance as a percentile of the cells' own
 //!   distance-from-centre distribution (100 = beyond every cell).
 //! - `beyond_p99`: share of features farther out than 99% of cells. **Contract: < 0.15.**
-//! - `nn_norm_pct`: mean over features of the mean distance-from-centre percentile of the
-//!   feature's [`NN_K`] nearest cells. ≈ 50 when placement does not track cell norm.
-//!   **Contract: within 50 ± 10.**
-//! - `nn_norm_pct_q25` / `nn_norm_pct_q75`: the quartiles of that per-feature percentile.
-//!   Single genes spread widely on healthy runs (pancreas: q25 31, q75 66; 72% of genes
-//!   outside 50 ± 10), so the band cannot be applied gene by gene. But a mean of 50 can hide
-//!   a split — half the genes at the hub, half at the edge — and that shows as quartiles in
-//!   both tails. **Contract: not q25 < 10 with q75 > 90.** No healthy run measured comes
-//!   close (q25 ≥ 17.7 across pancreas, erythroid and dentate gyrus).
+//! - `nn_norm_pct` and its quartiles: per feature, the mean distance-from-centre percentile
+//!   of its [`NN_K`] nearest cells — high when features sit beside the longest cells, low
+//!   when they collapse to the hub.
+//!
+//! **What that percentile should be is a property of the cloud, not a constant.** A feature
+//! is an average of cells, and an average sits inward of the cells it averages, by an amount
+//! that depends on the cloud's shape: on an elongated cloud a healthy feature's nearest cells
+//! sit well below the 50th percentile. So the yardstick is the cells' own **local averages**
+//! — each sampled cell replaced by the mean of its [`NN_K`] nearest cells, the smallest
+//! average a feature could be — run through the same statistic.
+//!
+//! **The two directions are not symmetric.** An average can be pulled inward of the cells
+//! it averages but never pushed outward, and a feature averages a whole cone of cells, so it
+//! sits further in than a local average does. Outward is therefore judged strictly and inward
+//! only at the tail. **Contract: the features' median is at most the local averages' 75th
+//! percentile and their 75th at most the 90th (not beside the longest cells), and the
+//! features' 25th percentile is at least the local averages' 10th (not collapsed to the
+//! hub, and not split between hub and edge).**
+//!
+//! Measured on 23 real runs, the contract fails 19 of 22 shipped co-embeddings and 9 of 23
+//! after direction scoring: every dentate gyrus run and a 263k-cell bge run (still outward),
+//! one AML bge run and BMM (a quarter of the features in hub territory). Erythroid, pancreas
+//! and the off-origin `rest` run pass. A fixed `50 ± 10` fired on 16 of 23 after the fix,
+//! healthy elongated runs included.
 //!
 //! A non-finite feature row fails the contract outright, counts as beyond p99, and is left
 //! out of the nearest-cell statistics.
@@ -42,11 +56,6 @@ const MAX_NN_CELLS: usize = 60_000;
 const MAX_NN_FEATS: usize = 3_000;
 /// Upper bound on `beyond_p99` for an on-manifold co-embedding.
 const MAX_BEYOND_P99: f32 = 0.15;
-/// Allowed distance of `nn_norm_pct` from 50.
-const NN_NORM_PCT_BAND: f32 = 10.0;
-/// A split placement has its lower quartile below this and its upper quartile above
-/// `100 −` this.
-const SPLIT_TAIL: f32 = 10.0;
 
 /// The centre of a cell cloud, each cell's distance from it, and the cloud's radius
 /// `R = mean_i ‖z_i − centre‖` — the one definition `hub_call` and [`coembed_placement`]
@@ -98,31 +107,34 @@ pub struct CoembedPlacement {
     pub non_finite: usize,
     /// Mean distance-from-centre percentile of each feature's nearest cells (0–100).
     pub nn_norm_pct: f32,
-    /// Lower quartile of the per-feature nearest-cell percentile.
-    pub nn_norm_pct_q25: f32,
-    /// Upper quartile of the per-feature nearest-cell percentile.
-    pub nn_norm_pct_q75: f32,
+    /// Quartiles (25th, 50th, 75th) of the per-feature nearest-cell percentile.
+    pub nn_norm_pct_quartiles: [f32; 3],
+    /// The same statistic for the cells' own local averages: its 10th, 25th, 75th and 90th
+    /// percentiles. The yardstick for `nn_norm_pct_quartiles`.
+    pub cell_baseline: [f32; 4],
 }
 
 impl CoembedPlacement {
-    /// Inside the cloud, not tracking cell norm, and not split between hub and edge. See
-    /// [`CoembedPlacement::contract`].
+    /// Finite, inside the cloud, and sitting among the cells the way the cells' own local
+    /// averages do. See [`CoembedPlacement::contract`].
     #[must_use]
     pub fn on_manifold(&self) -> bool {
-        let split = self.nn_norm_pct_q25 < SPLIT_TAIL && self.nn_norm_pct_q75 > 100.0 - SPLIT_TAIL;
+        let [q25, q50, q75] = self.nn_norm_pct_quartiles;
+        let [b10, _, b75, b90] = self.cell_baseline;
         self.non_finite == 0
             && self.beyond_p99 < MAX_BEYOND_P99
-            && (self.nn_norm_pct - 50.0).abs() <= NN_NORM_PCT_BAND
-            && !split
+            && q50 <= b75
+            && q75 <= b90
+            && q25 >= b10
     }
 
     /// The contract [`CoembedPlacement::on_manifold`] checks, in words.
     #[must_use]
     pub fn contract() -> String {
         format!(
-            "no non-finite rows, beyond_p99 < {MAX_BEYOND_P99}, nn_norm_pct within 50 ± {NN_NORM_PCT_BAND}, and not \
-             nn quartiles {SPLIT_TAIL} / {} in both tails",
-            100.0 - SPLIT_TAIL
+            "no non-finite rows, beyond_p99 < {MAX_BEYOND_P99}, and the features' nearest-cell \
+             percentiles against the cells' own local averages: median ≤ their q75, q75 ≤ their \
+             q90, q25 ≥ their q10"
         )
     }
 }
@@ -132,14 +144,20 @@ impl std::fmt::Display for CoembedPlacement {
         write!(
             f,
             "dist {:.2}×R (R={:.3}), dist_pct {:.1}, beyond_p99 {:.3}, nn_norm_pct {:.1} \
-             (quartiles {:.1}–{:.1})",
+             (quartiles {:.1} / {:.1} / {:.1}; cells' local averages q10–q90 {:.1} / {:.1} / \
+             {:.1} / {:.1})",
             self.dist_x_r,
             self.radius,
             self.dist_pct,
             self.beyond_p99,
             self.nn_norm_pct,
-            self.nn_norm_pct_q25,
-            self.nn_norm_pct_q75
+            self.nn_norm_pct_quartiles[0],
+            self.nn_norm_pct_quartiles[1],
+            self.nn_norm_pct_quartiles[2],
+            self.cell_baseline[0],
+            self.cell_baseline[1],
+            self.cell_baseline[2],
+            self.cell_baseline[3],
         )?;
         if self.non_finite > 0 {
             write!(f, ", {} non-finite rows", self.non_finite)?;
@@ -242,21 +260,43 @@ fn placement_of_rows(cells: &[f32], feats: &[f32], h: usize) -> anyhow::Result<C
         .collect();
     let sub_cell_pct: Vec<f32> = cell_idx.iter().map(|&i| pct(cloud.dist[i])).collect();
     let k = NN_K.min(cell_idx.len());
+    // The `k` sampled cells nearest `e`.
+    let nearest = |e: &[f32]| -> Vec<usize> {
+        let mut d2: Vec<(f32, usize)> = sub_cells
+            .iter()
+            .enumerate()
+            .map(|(c, z)| (l2_sq(z, e), c))
+            .collect();
+        d2.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
+        d2[..k].iter().map(|&(_, c)| c).collect()
+    };
+    let nearest_pct =
+        |e: &[f32]| nearest(e).iter().map(|&c| sub_cell_pct[c]).sum::<f32>() / k as f32;
+
     let mut per_feat: Vec<f32> = super::strided_indices(d, MAX_NN_FEATS)
         .into_par_iter()
         .filter(|&g| feat_dist[g].is_finite())
-        .map(|g| {
-            let e = &feats[g * h..(g + 1) * h];
-            let mut d2: Vec<(f32, usize)> = sub_cells
-                .iter()
-                .enumerate()
-                .map(|(c, z)| (l2_sq(z, e), c))
-                .collect();
-            d2.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
-            d2[..k].iter().map(|&(_, c)| sub_cell_pct[c]).sum::<f32>() / k as f32
-        })
+        .map(|g| nearest_pct(&feats[g * h..(g + 1) * h]))
         .collect();
     per_feat.sort_unstable_by(f32::total_cmp);
+
+    // The yardstick: each sampled cell's local average (the mean of its `k` nearest cells),
+    // through the same statistic.
+    let mut baseline: Vec<f32> = super::strided_indices(sub_cells.len(), MAX_NN_FEATS)
+        .into_par_iter()
+        .map(|p| {
+            let mut local = vec![0f32; h];
+            for c in nearest(sub_cells[p]) {
+                local
+                    .iter_mut()
+                    .zip(sub_cells[c])
+                    .for_each(|(l, &x)| *l += x);
+            }
+            local.iter_mut().for_each(|l| *l /= k as f32);
+            nearest_pct(&local)
+        })
+        .collect();
+    baseline.sort_unstable_by(f32::total_cmp);
 
     Ok(CoembedPlacement {
         radius,
@@ -269,8 +309,8 @@ fn placement_of_rows(cells: &[f32], feats: &[f32], h: usize) -> anyhow::Result<C
             .count(),
         // An empty `per_feat` gives 0/0 = NaN, which fails every gate.
         nn_norm_pct: per_feat.iter().sum::<f32>() / per_feat.len() as f32,
-        nn_norm_pct_q25: quantile_sorted(&per_feat, 0.25),
-        nn_norm_pct_q75: quantile_sorted(&per_feat, 0.75),
+        nn_norm_pct_quartiles: [0.25, 0.5, 0.75].map(|q| quantile_sorted(&per_feat, q)),
+        cell_baseline: [0.1, 0.25, 0.75, 0.9].map(|q| quantile_sorted(&baseline, q)),
     })
 }
 
