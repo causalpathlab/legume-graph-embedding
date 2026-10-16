@@ -26,7 +26,7 @@
 //! One direction per type ([`FeatureSpace::directions`]) and one `H`-dim dot product per
 //! cell ([`scores`]) give the whole `N × C` table. Every term is a ratio of logits, so the
 //! scores do not change under a joint rotation of `z` and `ρ`, or when any gene's `ρ_g` is
-//! rescaled.
+//! rescaled by a positive factor.
 //!
 //! # Relation to the module score
 //!
@@ -109,10 +109,9 @@ impl FeatureSpace {
             "{} gene names for {g} feature rows",
             gene_names.len()
         );
-        let sigma = (rho * cell_cov)
-            .component_mul(rho)
-            .column_sum()
-            .map(|v| v.max(0.0).sqrt());
+        let mut quad = rho * cell_cov;
+        quad.component_mul_assign(rho);
+        let sigma = quad.column_sum().map(|v| v.max(0.0).sqrt());
         Ok(Self {
             rho: rho.clone(),
             sigma,
@@ -145,6 +144,10 @@ impl FeatureSpace {
 
     /// `[C × H]` one direction `u_T` per set; an empty set, or one whose every row is dead,
     /// gives the zero row.
+    ///
+    /// # Panics
+    ///
+    /// If a set names a gene index outside this space.
     #[must_use]
     pub fn directions(&self, sets: &[WeightedSet]) -> DMatrix<f64> {
         let mut dirs = DMatrix::zeros(sets.len(), self.rho.ncols());

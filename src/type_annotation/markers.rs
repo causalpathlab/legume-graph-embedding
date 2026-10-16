@@ -185,9 +185,9 @@ fn drop_thin_types<W>(
             .collect();
         warn!(
             "{} of {c} marker type(s) kept fewer than {} marker gene(s) in the embedding and \
-             were DROPPED: {}. Their cells will be assigned among the remaining types — widen \
-             the feature axis (e.g. lower `--n-hvg`, or rely on the held-out feature \
-             projection) if you need them.",
+             were DROPPED: {}. Their cells will be assigned among the remaining types. If you \
+             need them, widen the feature axis (raise `--n-hvg`) or force the panel into \
+             training with `--must-train-features <the marker file>`.",
             dropped.len(),
             min_markers,
             dropped.join(", ")
@@ -195,8 +195,10 @@ fn drop_thin_types<W>(
     }
     anyhow::ensure!(
         !kept_names.is_empty(),
-        "no marker type matched any gene in the embedding — check the marker file's gene \
-         naming against the dictionary's row names"
+        "no marker type kept {min_markers} or more usable marker gene(s) in the embedding. A \
+         marker must match a row name, must not be held by every type (IDF 0, so a one-type \
+         panel has none), and must be live — check the marker file's gene naming against the \
+         dictionary's row names"
     );
 
     Ok((kept_names, kept_sets))

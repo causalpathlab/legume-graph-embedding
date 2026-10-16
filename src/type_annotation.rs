@@ -449,8 +449,10 @@ pub fn annotate_embeddings(
 /// Annotate cells against marker-defined types by signature projection.
 /// The cell embedding is defensively re-normalized here, so an un-normalized
 /// input still works.
-#[deprecated(note = "the soft cosine path, with no callers; score markers with \
-            `type_annotation::embedding_score`")]
+#[deprecated(
+    note = "the soft cosine path, called only by `annotate_embeddings`; score markers with \
+            `type_annotation::embedding_score`"
+)]
 pub fn annotate_by_projection(
     inp: &ProjInputs<'_>,
     cfg: &AnnotateProjConfig,
