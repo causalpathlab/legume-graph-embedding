@@ -80,7 +80,9 @@ use score::*;
 
 /// The shared per-cell label writer (`argmax.parquet`, plus the TSV pair until 0.10), used
 /// by every annotation method so their per-cell I/O is identical.
-pub use output::{write_cell_labels, write_label_tsvs, CELL_LABELS_SUFFIX};
+pub use output::{
+    write_cell_labels, write_label_tsvs, CELL_LABELS_SUFFIX, CELL_LABEL_FILE_SUFFIXES,
+};
 
 /// The shared marker-panel reader: parse `gene<TAB>celltype`, match its genes against a caller's
 /// feature axis (exact → symbol → flexible), IDF-weight them, gate on panel coverage, and drop

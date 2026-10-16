@@ -16,14 +16,16 @@ fn softmax_prob_at(row: &[f32], idx: usize) -> f32 {
 /// The file-name suffix of the per-cell label table [`write_cell_labels`] writes.
 pub const CELL_LABELS_SUFFIX: &str = ".argmax.parquet";
 
+/// Every file [`write_cell_labels`] writes, for a caller's cleanup list. The TSVs leave in 0.10.
+pub const CELL_LABEL_FILE_SUFFIXES: &[&str] =
+    &[CELL_LABELS_SUFFIX, ".argmax.tsv", ".membership.tsv"];
+
 /// Write the per-cell label table shared by every annotation method, so a downstream
 /// consumer never has to know which produced it: `{prefix}.argmax.parquet` with columns
 /// `cell`, `cell_type` and `probability`.
 ///
 /// Until 0.10 it also writes the TSV pair of [`write_label_tsvs`], so readers that have not
 /// moved to the parquet keep working.
-///
-/// `labels`/`probs` are parallel to `cell_names`.
 pub fn write_cell_labels(
     prefix: &str,
     cell_names: &[Box<str>],
