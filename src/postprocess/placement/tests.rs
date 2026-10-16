@@ -70,9 +70,9 @@ fn a_split_placement_is_visible_not_gated() {
     });
     let got = coembed_placement(&cells, &feats).unwrap();
     assert!(got.on_manifold(), "{got}: {:?}", got.violations());
-    let [q25, _, q75] = got.nn_norm_pct_quartiles;
+    let nn = got.nearest.expect("measured");
     assert!(
-        q25 < 10.0 && q75 > 90.0,
+        nn.q25 < 10.0 && nn.q75 > 90.0,
         "the split must show in the quartiles: {got}"
     );
 }
@@ -94,10 +94,10 @@ fn features_among_ordinary_cells_pass() {
 fn tied_cells_rank_at_their_midpoint() {
     let n = 200;
     let cells = spokes_with(n, |i| if i < n / 2 { 1.0 } else { 3.0 });
-    let feats = DMatrix::from_fn(10, H, |g, j| cells[(g * 4, j)]);
+    let feats = DMatrix::from_fn(40, H, |g, j| cells[(g * 2, j)]);
     let got = coembed_placement(&cells, &feats).unwrap();
     assert!(
-        (got.nn_norm_pct - 25.0).abs() < 5.0,
+        (got.nearest.expect("measured").mean - 25.0).abs() < 5.0,
         "features among the tied inner half should read ~25, got {got}"
     );
 }

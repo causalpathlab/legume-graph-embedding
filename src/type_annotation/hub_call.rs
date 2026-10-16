@@ -76,13 +76,7 @@ use legume_numeric::matrix::dmatrix_io::DMatrix;
 use log::{info, warn};
 use rayon::prelude::*;
 
-/// How close to the hub a gene must be, as a fraction of the cell cloud's own radius, before it is
-/// judged to carry no localizing information at all.
-///
-/// Deliberately small. The populations this separates are three orders of magnitude apart on real
-/// data, so there is no need to cut anywhere near the live genes — and a *false positive* here
-/// silently deletes a real marker, which is the one thing this must not do.
-const HUB_RADIUS_FRAC: f32 = 0.05;
+use crate::postprocess::HUB_RADIUS_FRAC;
 
 /// Zero every feature row that the co-embedding parked at the hub of the cell cloud.
 ///

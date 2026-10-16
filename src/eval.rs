@@ -242,10 +242,13 @@ pub fn write_feature_coembedding(
 
     // The check only reports: a co-embedding it cannot measure is still written.
     match crate::postprocess::coembed_placement_of_tensors(e_cell, &coembed) {
-        Ok(p) if p.on_manifold() => info!("co-embedding placement: {p}"),
         Ok(p) => {
             let why: Vec<String> = p.violations().iter().map(ToString::to_string).collect();
-            warn!("co-embedding placement: {p} — {}", why.join("; "));
+            if why.is_empty() {
+                info!("co-embedding placement: {p}");
+            } else {
+                warn!("co-embedding placement: {p} — {}", why.join("; "));
+            }
         }
         Err(e) => warn!("co-embedding placement could not be measured: {e}"),
     }

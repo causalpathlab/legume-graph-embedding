@@ -261,7 +261,9 @@ fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
         let t_raw = calibrate_t_for_eff(&raw, target).unwrap();
         let on_raw = placement(&cells, &coembed_from_scores(&raw, &cells, t_raw).unwrap());
         assert!(
-            on_raw.beyond_p99 > 0.3 && on_raw.nn_norm_pct > 70.0 && !on_raw.on_manifold(),
+            on_raw.beyond_p99 > 0.3
+                && on_raw.nearest.expect("measured").mean > 70.0
+                && !on_raw.on_manifold(),
             "seed {seed}: the fixture must reproduce the bias on raw-cell scores, got {on_raw}"
         );
 
