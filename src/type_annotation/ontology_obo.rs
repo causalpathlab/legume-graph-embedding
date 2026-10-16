@@ -15,6 +15,12 @@ use enrichment::{
     annotate_ontology_core, parse_label_map, Mat, OntologyAccess, OntologyParams, OntologyScore,
 };
 use log::info;
+use rustc_hash::FxHashMap;
+
+/// Read the curated `label<TAB>CL:id` map, keyed the way panel type names are.
+pub(super) fn read_label_map(path: &str) -> Result<FxHashMap<Box<str>, Box<str>>> {
+    parse_label_map(path, |id| id.starts_with("CL:"))
+}
 
 /// Load the Cell Ontology + curated `label<TAB>CL:id` map, inject them into the
 /// generic TreeBH core as closures, and run it. Returns the
@@ -31,7 +37,7 @@ pub fn annotate_ontology_from_obo(
     cluster_names: &[Box<str>],
     celltype_names: &[Box<str>],
 ) -> Result<(String, String)> {
-    let label_to_id = parse_label_map(label_cl, |id| id.starts_with("CL:"))?;
+    let label_to_id = read_label_map(label_cl)?;
     let onto = Ontology::load_obo(obo)?;
     info!("loaded Cell Ontology: {} terms from {obo}", onto.len());
 

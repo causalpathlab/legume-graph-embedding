@@ -345,3 +345,56 @@ fn marker_reader_keeps_commas_in_tab_separated_labels() {
     .collect();
     assert_eq!(pairs, expected);
 }
+
+// An indented or quoted comment line is not a marker pair.
+#[test]
+fn marker_reader_skips_indented_comments() {
+    let dir = std::env::temp_dir().join(format!("geu_marker_comment_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("markers.tsv");
+    std::fs::write(
+        &path,
+        "  # source: a panel, 2019\n\"# note\"\tx\nCD4\tT cell\nCD8A\tT cell\n",
+    )
+    .unwrap();
+    let pairs = super::markers::read_marker_tsv(path.to_str().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+    let types: Vec<Box<str>> = pairs.unwrap().into_iter().map(|(_, t)| t).collect();
+    assert_eq!(types, names(&["T_cell", "T_cell"]));
+}
+
+// The label→CL map is keyed like the panel's type names: tab-first split, spaces → `_`. A
+// comma-bearing Cell Ontology label in both files must meet.
+#[test]
+fn label_map_keys_match_panel_type_names() {
+    let dir = std::env::temp_dir().join(format!("geu_label_map_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let panel = dir.join("markers.tsv");
+    std::fs::write(
+        &panel,
+        "CD4\tCD4-positive, alpha-beta T cell\nMS4A1\tB cell\n",
+    )
+    .unwrap();
+    let map = dir.join("label_cl.tsv");
+    std::fs::write(
+        &map,
+        "label\tid\nCD4-positive, alpha-beta T cell\tCL:0000624\nB cell\tCL:0000236\n",
+    )
+    .unwrap();
+    let pairs = super::markers::read_marker_tsv(panel.to_str().unwrap());
+    let label_to_id = super::ontology_obo::read_label_map(map.to_str().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+    let label_to_id = label_to_id.unwrap();
+    for (_, t) in pairs.unwrap() {
+        assert!(
+            label_to_id.contains_key(&t),
+            "type {t:?} is not a key of the label map {label_to_id:?}"
+        );
+    }
+    assert_eq!(
+        label_to_id
+            .get("CD4-positive,_alpha-beta_T_cell")
+            .map(AsRef::as_ref),
+        Some("CL:0000624")
+    );
+}
