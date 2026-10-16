@@ -205,7 +205,10 @@ fn the_balanced_centre_weights_clusters_equally() {
 #[test]
 fn the_marker_floor_counts_live_markers() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("geu_embedding_score_live_floor");
+    let dir = std::env::temp_dir().join(format!(
+        "geu_embedding_score_live_floor_{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("markers.tsv");
     let mut file = std::fs::File::create(&path).unwrap();
@@ -223,7 +226,9 @@ fn the_marker_floor_counts_live_markers() {
     let mut f = fixture(7);
     f.rho.row_mut(13).fill(0.0);
     f.rho.row_mut(14).fill(0.0);
-    let panel = f.space().marker_sets(path.to_str().unwrap(), 0.0).unwrap();
+    let panel = f.space().marker_sets(path.to_str().unwrap(), 0.0);
+    std::fs::remove_dir_all(&dir).unwrap();
+    let panel = panel.unwrap();
     let names: Vec<&str> = panel.type_names.iter().map(AsRef::as_ref).collect();
     assert_eq!(names, ["Live", "Other"]);
     for set in &panel.sets {
@@ -233,4 +238,42 @@ fn the_marker_floor_counts_live_markers() {
             "{set:?}"
         );
     }
+}
+
+/// A centre from another embedding (wrong length) is a caller error, not a silent shift.
+#[test]
+#[should_panic(expected = "centre")]
+fn a_centre_of_the_wrong_length_is_refused() {
+    let f = fixture(8);
+    let dirs = f.space().directions(&f.sets);
+    let _ = scores(&f.z, &DVector::zeros(H - 1), &dirs);
+}
+
+/// A NaN score is not a candidate, wherever it sits among the types: the call goes to the best
+/// finite score, and a cell with none has no call.
+#[test]
+fn nan_scores_are_never_called() {
+    let dirs = DMatrix::from_element(3, H, 1.0);
+    let s = DMatrix::from_row_slice(
+        3,
+        3,
+        &[
+            f64::NAN,
+            1.0,
+            0.5, //
+            1.0,
+            0.5,
+            f64::NAN, //
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ],
+    );
+    let got = calls(&s, &dirs);
+    assert_eq!(got[0].call, Some(1));
+    assert!((got[0].margin - 0.5).abs() < 1e-12, "{:?}", got[0]);
+    assert_eq!(got[1].call, Some(0));
+    assert!((got[1].margin - 0.5).abs() < 1e-12, "{:?}", got[1]);
+    assert_eq!(got[2].call, None);
+    assert!(got[2].margin.is_nan());
 }
