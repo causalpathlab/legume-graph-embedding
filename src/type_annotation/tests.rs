@@ -382,19 +382,17 @@ fn label_map_keys_match_panel_type_names() {
     )
     .unwrap();
     let pairs = super::markers::read_marker_tsv(panel.to_str().unwrap());
-    let label_to_id = super::ontology_obo::read_label_map(map.to_str().unwrap());
+    let label_to_id = super::markers::read_label_map(map.to_str().unwrap());
     let _ = std::fs::remove_dir_all(&dir);
     let label_to_id = label_to_id.unwrap();
-    for (_, t) in pairs.unwrap() {
-        assert!(
-            label_to_id.contains_key(&t),
-            "type {t:?} is not a key of the label map {label_to_id:?}"
-        );
-    }
+    let ids: Vec<Option<&str>> = pairs
+        .unwrap()
+        .iter()
+        .map(|(_, t)| label_to_id.get(t).map(AsRef::as_ref))
+        .collect();
     assert_eq!(
-        label_to_id
-            .get("CD4-positive,_alpha-beta_T_cell")
-            .map(AsRef::as_ref),
-        Some("CL:0000624")
+        ids,
+        [Some("CL:0000624"), Some("CL:0000236")],
+        "{label_to_id:?}"
     );
 }

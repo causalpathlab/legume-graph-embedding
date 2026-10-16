@@ -312,10 +312,17 @@ fn report_panel_coverage(
     Ok(())
 }
 
-/// Split one panel or label-map line: on the tab only if it has one, so a label keeps its
-/// commas (a Cell Ontology name such as `CD4-positive, alpha-beta T cell`); else on commas.
-/// Fields are trimmed and unquoted.
-pub(super) fn split_tab_first(line: &str) -> Vec<&str> {
+// The panel and the label→CL map are read by one row reader with one line rule and one
+// label key, so a label written the same way in both files meets.
+//
+// TODO: move both files to upstream readers together (data-beans' `read_membership_pairs`,
+// enrichment's `parse_label_map`) once those split a tab-bearing line on the tab only and key
+// labels like `type_key`; moving one alone would key the two files differently again.
+
+/// Split one line: on the tab only if it has one, so a label keeps its commas (a Cell Ontology
+/// name such as `CD4-positive, alpha-beta T cell`); else on commas. Fields are trimmed and
+/// unquoted.
+fn split_tab_first(line: &str) -> Vec<&str> {
     use legume_numeric::matrix::table::Delimiter;
     let delim = if line.contains('\t') {
         Delimiter::Tab
@@ -325,18 +332,15 @@ pub(super) fn split_tab_first(line: &str) -> Vec<&str> {
     delim.split(line)
 }
 
-/// A panel label as a type name: spaces → `_`. The label→CL map keys the same way.
-pub(super) fn type_key(label: &str) -> Box<str> {
+/// A label as a type name: spaces → `_`.
+fn type_key(label: &str) -> Box<str> {
     Box::from(label.replace(' ', "_"))
 }
 
-/// Parse a marker TSV/CSV into `(gene, celltype)` pairs (the first two fields; blank, `#`
-/// and `gene`/`symbol` header rows skipped). Lines split by [`split_tab_first`]; type names
-/// are [`type_key`]s.
-///
-/// TODO: go back to `data_beans::aux::gene_sets::read_membership_pairs` once it splits a
-/// tab-bearing line on the tab only; today it splits on commas too.
-pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
+/// The first two fields of every row of a two-column label file (gz-aware), split by
+/// [`split_tab_first`]. Blank rows, rows with fewer than two fields and comment rows (a first
+/// field starting with `#`, indented or quoted) are skipped.
+fn read_two_field_rows(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
     use legume_numeric::matrix::common_io::read_lines_of_words_generic;
     let split = |line: &str| -> Vec<Box<str>> {
         split_tab_first(line)
@@ -345,22 +349,55 @@ pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
             .map(Box::from)
             .collect()
     };
-    let out: Vec<(Box<str>, Box<str>)> = read_lines_of_words_generic(path, -1, split, split)
-        .with_context(|| format!("reading markers {path}"))?
+    Ok(read_lines_of_words_generic(path, -1, split, split)
+        .with_context(|| format!("reading {path}"))?
         .lines
         .into_iter()
         .filter_map(|words| {
             let mut words = words.into_iter();
-            let (gene, label) = (words.next()?, words.next()?);
-            let header = ["gene", "symbol"]
-                .iter()
-                .any(|h| gene.eq_ignore_ascii_case(h));
-            (!gene.is_empty() && !gene.starts_with('#') && !label.is_empty() && !header)
-                .then(|| (gene, type_key(&label)))
+            let (first, second) = (words.next()?, words.next()?);
+            (!first.is_empty() && !first.starts_with('#') && !second.is_empty())
+                .then_some((first, second))
         })
+        .collect())
+}
+
+/// Parse a marker TSV/CSV into `(gene, celltype)` pairs ([`read_two_field_rows`], a
+/// `gene`/`symbol` header row skipped); type names are [`type_key`]s.
+pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
+    let out: Vec<(Box<str>, Box<str>)> = read_two_field_rows(path)
+        .with_context(|| format!("reading markers {path}"))?
+        .into_iter()
+        .filter(|(gene, _)| {
+            !["gene", "symbol"]
+                .iter()
+                .any(|h| gene.eq_ignore_ascii_case(h))
+        })
+        .map(|(gene, label)| (gene, type_key(&label)))
         .collect();
     anyhow::ensure!(!out.is_empty(), "no marker pairs parsed from {path}");
     Ok(out)
+}
+
+/// Read the curated `label<TAB>CL:id` map ([`read_two_field_rows`], rows whose id is not a
+/// `CL:` id skipped as a header), keyed by [`type_key`] like the panel's type names. One label
+/// with two ids is an error.
+pub(super) fn read_label_map(path: &str) -> Result<FxHashMap<Box<str>, Box<str>>> {
+    let mut map: FxHashMap<Box<str>, Box<str>> = FxHashMap::default();
+    for (label, id) in read_two_field_rows(path)
+        .with_context(|| format!("reading label→id map {path}"))?
+        .into_iter()
+        .filter(|(_, id)| id.starts_with("CL:"))
+    {
+        if let Some(prev) = map.insert(type_key(&label), id.clone()) {
+            anyhow::ensure!(
+                prev == id,
+                "label {label:?} mapped to two different ids in {path}: {prev} vs {id}"
+            );
+        }
+    }
+    anyhow::ensure!(!map.is_empty(), "no `label<TAB>id` rows parsed from {path}");
+    Ok(map)
 }
 
 /// Union of every type's marker gene indices (sorted, unique, in range) — the
