@@ -11,12 +11,13 @@
 //! `{out}.feature_embedding.parquet` actually holds, and it **destroys the zero**:
 //!
 //! ```text
-//! e_g = Σ_i softmax(⟨e_cell_i, ρ_g⟩ / T) · e_cell_i
+//! e_g = Σ_i softmax_i(s_ig / T) · e_cell_i,   s_ig = ⟨ê_i, ρ_g⟩ / sd_i⟨ê_i, ρ_g⟩
 //! ```
 //!
-//! For a gene the model never moved off its init, `ρ_g` is noise, the softmax over cells is flat,
-//! and the weighted average collapses to the **plain mean of every cell** — the *hub* of the cell
-//! cloud. The row comes out with a healthy unit-ish norm and a perfectly plausible coordinate, and
+//! with `ê_i` cell `i`'s unit direction from the cloud centre. For a gene whose scores carry no
+//! spread across cells (a row the model never moved off a zero init, whose score SD falls under
+//! the floor), the softmax over cells is flat, and the weighted average collapses to the **plain
+//! mean of every cell** — the *hub* of the cell cloud. The row comes out with a healthy unit-ish norm and a perfectly plausible coordinate, and
 //! `live_row` cannot tell it from a real one.
 //!
 //! This is not hypothetical. `senna bge` trains on the features that survive its null-QC refit and
@@ -99,24 +100,14 @@ pub(super) fn zero_hub_parked(
         return 0;
     }
 
-    // The hub: the centre of the cell cloud, which is exactly where a flat softmax lands a gene.
-    let hub: Vec<f32> = (0..h)
-        .map(|j| cell_emb.column(j).iter().sum::<f32>() / n as f32)
-        .collect();
-
-    // The cell cloud's own radius — the scale against which "close to the centre" is judged.
-    let radius = (0..n)
-        .map(|i| {
-            (0..h)
-                .map(|j| {
-                    let d = cell_emb[(i, j)] - hub[j];
-                    d * d
-                })
-                .sum::<f32>()
-                .sqrt()
-        })
-        .sum::<f32>()
-        / n as f32;
+    // The hub (the centre of the cell cloud, which is exactly where a flat softmax lands a
+    // gene) and the cloud's own radius — the scale against which "close to the centre" is
+    // judged. The same definition the co-embedding's placement diagnostic uses.
+    let crate::postprocess::CellCloud {
+        centre: hub,
+        radius,
+        ..
+    } = crate::postprocess::CellCloud::of(cell_emb);
     // Deliberately negated, not `radius <= 0.0`: this must also catch a NaN radius
     // (a NaN anywhere in `cell_emb` propagates here), which `<=` would let through
     // and turn every downstream `d2 < cutoff` test into a silent false.

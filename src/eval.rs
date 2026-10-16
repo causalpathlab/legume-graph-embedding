@@ -250,7 +250,8 @@ pub fn write_feature_coembedding(
     } else {
         warn!(
             "co-embedding placement: {placement} — features sit outside the cell cloud or track \
-             cell norm (want beyond_p99 < 0.15 and nn_norm_pct within 50 ± 10)"
+             cell norm (want {})",
+            crate::CoembedPlacement::contract()
         );
     }
     Ok(())

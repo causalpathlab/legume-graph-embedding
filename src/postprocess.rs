@@ -40,7 +40,7 @@
 //!
 //! Biases are absent by design — `b_f` cancels in the softmax, `b_c` is a
 //! shared per-cell depth offset that would drag every gene toward deep cells.
-//! See [`coembed_block`].
+//! See [`coembed_from_scores`].
 
 use legume_numeric::candle::candle_core::{Result, Tensor};
 use legume_numeric::candle::candle_nn::ops::softmax;
@@ -105,6 +105,7 @@ const SD_FLOOR: f64 = 1e-6;
 const NORM_FLOOR: f64 = 1e-12;
 
 mod placement;
+pub(crate) use placement::CellCloud;
 pub use placement::{coembed_placement, CoembedPlacement};
 
 /// Leiden-cluster the cell embedding once. Returns `(labels, target_eff)` where
@@ -189,7 +190,7 @@ pub fn feature_coembedding(
     // only the softmax temperature changes — so compute it once and reuse it
     // across the whole bisection.
     let e_feat_sub = subsample_rows(&e_feat, CALIB_FEATS)?;
-    // Scored by the same `ScoreKeys` that `coembed_block` uses, so `T` is
+    // Scored by the same `ScoreKeys` as the block pass below, so `T` is
     // calibrated in the SAME units it is applied in. Calibrating on one scale
     // and spending the result on another is shape-valid and silently wrong.
     let scores_sub = keys.scores(&e_feat_sub)?; // [N, B]
@@ -211,7 +212,7 @@ pub fn feature_coembedding(
     while start < d {
         let len = FEAT_BLOCK.min(d - start);
         let ef = e_feat.narrow(0, start, len)?;
-        blocks.push(coembed_block(&keys, &e_cell, &ef, t)?); // [len, H]
+        blocks.push(coembed_from_scores(&keys.scores(&ef)?, &e_cell, t)?); // [len, H]
         start += len;
         prog.inc(1);
     }
@@ -295,7 +296,7 @@ fn standardize_columns(scores: &Tensor) -> Result<Tensor> {
 /// The cells as the calibrated softmax sees them: each cell's offset from the
 /// cloud centre, scaled to unit norm.
 /// The ONE place scores are made on the calibrated path — the temperature
-/// calibration and [`coembed_block`] both go through [`ScoreKeys::scores`], so
+/// calibration and the block pass both go through [`ScoreKeys::scores`], so
 /// `T` cannot be calibrated in one set of units and applied in another.
 ///
 /// Why unit cells. `⟨e_cell_c, e_f⟩` grows with `‖e_cell_c‖`, and the per-feature
@@ -329,7 +330,9 @@ impl ScoreKeys {
     }
 }
 
-/// One feature-block: `softmax_over_cells(keys.scores(e_f) / T)ᵀ · e_cell`.
+/// `softmax_over_cells(scores / T)ᵀ · e_cell` for one `[N, B]` score block:
+/// the step both the calibrated path ([`ScoreKeys::scores`])
+/// and SIMBA's fixed-T path ([`feature_coembedding_fixed_t`], raw scores) share.
 ///
 /// Biases are deliberately absent. `b_f` is constant down a column and cancels in
 /// the softmax; `b_c` does NOT cancel, but it is a per-cell depth offset shared by
@@ -337,18 +340,6 @@ impl ScoreKeys {
 /// it halves fidelity (recall@100 0.387 → 0.162) and makes 43.6% of any gene's
 /// top-100 the same cells. The co-embedding wants the gene-SPECIFIC part of the
 /// score only.
-fn coembed_block(
-    keys: &ScoreKeys,
-    e_cell: &Tensor,
-    e_feat_block: &Tensor,
-    t: f64,
-) -> Result<Tensor> {
-    coembed_from_scores(&keys.scores(e_feat_block)?, e_cell, t)
-}
-
-/// `softmax_over_cells(scores / T)ᵀ · e_cell` for one `[N, B]` score block:
-/// the step both the calibrated path ([`coembed_block`], standardized scores)
-/// and SIMBA's fixed-T path ([`feature_coembedding_fixed_t`], raw scores) share.
 fn coembed_from_scores(scores: &Tensor, e_cell: &Tensor, t: f64) -> Result<Tensor> {
     let p = softmax(&scores.affine(1.0 / t, 0.0)?, 0)?; // softmax over cells (dim 0)
     p.t()?.contiguous()?.matmul(e_cell) // [B, N]·[N, H] = [B, H]

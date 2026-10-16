@@ -1,8 +1,8 @@
-//! Invariants of the co-embedding's per-feature rescale and its temperature
-//! calibration. The claim these exist to pin is that `T` is calibrated and spent
-//! in the SAME units: the rescale is applied inside both [`coembed_block`] and
-//! the calibration path, and doing it in only one is shape-valid, silently wrong,
-//! and invisible to every other test in the crate.
+//! Invariants of the co-embedding's scores, its temperature calibration, and its
+//! placement. The claim the calibration tests pin is that `T` is calibrated and
+//! spent in the SAME units: both the calibration and the block pass score through
+//! [`ScoreKeys`], and scoring them differently is shape-valid, silently wrong, and
+//! invisible to every other test in the crate.
 
 use super::*;
 use legume_numeric::candle::candle_core::{DType, Device};
@@ -261,8 +261,9 @@ fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
         let (co, _) = feature_coembedding(&cells, &feats, target).unwrap();
         let got = placement(&cells, &co);
         assert!(
-            (got.nn_norm_pct - 50.0).abs() <= 10.0 && got.beyond_p99 < 0.15 && got.on_manifold(),
-            "seed {seed}: features must sit on the manifold, got {got}"
+            got.on_manifold(),
+            "seed {seed}: features must sit on the manifold ({}), got {got}",
+            CoembedPlacement::contract()
         );
     }
 }
