@@ -56,7 +56,7 @@ mod output;
 
 use super::marker_bootstrap::{run_marker_bootstrap, CoarseConsensus, MarkerBootstrapConfig};
 use super::markers::parse_and_match_markers;
-use super::output::{write_label_tsvs, write_marker_embeddings};
+use super::output::{write_cell_labels, write_marker_embeddings, CELL_LABELS_SUFFIX};
 use super::score::row_major;
 use super::{n_communities, InputEmbeddings, UNASSIGNED};
 use anyhow::Result;
@@ -89,6 +89,7 @@ use ora::{OraResult, MAX_NULL_POOL};
 /// touching sibling artifacts (the embedding, the manifest).
 pub const TERM_ORA_OUTPUT_SUFFIXES: &[&str] = &[
     ".annot.parquet",
+    CELL_LABELS_SUFFIX,
     ".membership.tsv",
     ".argmax.tsv",
     ".marker_embedding.parquet",
@@ -705,9 +706,8 @@ fn annotate_inner(
             con,
         )?;
     }
-    // membership.tsv + argmax.tsv on the firm (cluster-driven) label, the shared
-    // contract `gem-summary` / `data-beans stat -g` consume.
-    write_label_tsvs(out_prefix, cell_names, &coarse_label, &coarse_conf)?;
+    // The per-cell labels on the firm (cluster-driven) label.
+    write_cell_labels(out_prefix, cell_names, &coarse_label, &coarse_conf)?;
     write_cluster_term_matrices(out_prefix, &comm_names, &type_names, &ora)?;
     write_calibration(out_prefix, &ora, n_assigned, n_outliers)?;
     log_cluster_calls(&cluster_label, &type_names, &sizes);
