@@ -315,3 +315,34 @@ fn all_marker_types_unmatched_is_an_error() {
     .is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A tab-separated panel splits on the tab only: a Cell Ontology label carries commas, and
+// splitting on them truncated `CD4-positive, alpha-beta T cell` to `CD4-positive`, merging
+// every label that shares the prefix. A line with no tab is still read as CSV.
+#[test]
+fn marker_reader_keeps_commas_in_tab_separated_labels() {
+    let dir = std::env::temp_dir().join(format!("geu_marker_tab_split_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("markers.tsv");
+    std::fs::write(
+        &path,
+        "gene\tcell_type\n\
+         CD4\tCD4-positive, alpha-beta T cell\n\
+         CD8A\tCD8-positive, alpha-beta T cell\n\
+         MS4A1,B cell\n\
+         \"CD79A\",\"B cell\"\n",
+    )
+    .unwrap();
+    let pairs = super::markers::read_marker_tsv(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let expected: Vec<(Box<str>, Box<str>)> = [
+        ("CD4", "CD4-positive,_alpha-beta_T_cell"),
+        ("CD8A", "CD8-positive,_alpha-beta_T_cell"),
+        ("MS4A1", "B_cell"),
+        ("CD79A", "B_cell"),
+    ]
+    .iter()
+    .map(|&(g, t)| (Box::from(g), Box::from(t)))
+    .collect();
+    assert_eq!(pairs, expected);
+}
