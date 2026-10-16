@@ -240,15 +240,15 @@ pub fn write_feature_coembedding(
         "Feature co-embedding (SIMBA-style, T={t:.4}) → {out_prefix}.feature_coembedding.parquet"
     );
 
-    let placement = crate::postprocess::coembed_placement_of_tensors(e_cell, &coembed)?;
-    if placement.on_manifold() {
-        info!("co-embedding placement: {placement}");
-    } else {
-        warn!(
-            "co-embedding placement: {placement} — features sit outside the cell cloud or track \
-             cell norm (want {})",
+    // The check only reports: a co-embedding it cannot measure is still written.
+    match crate::postprocess::coembed_placement_of_tensors(e_cell, &coembed) {
+        Ok(p) if p.on_manifold() => info!("co-embedding placement: {p}"),
+        Ok(p) => warn!(
+            "co-embedding placement: {p} — features sit outside the cell cloud or track cell \
+             norm (want {})",
             crate::postprocess::CoembedPlacement::contract()
-        );
+        ),
+        Err(e) => warn!("co-embedding placement could not be measured: {e}"),
     }
     Ok(())
 }

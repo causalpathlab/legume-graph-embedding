@@ -19,7 +19,8 @@
 //!   both tails. **Contract: not q25 < 10 with q75 > 90.** No healthy run measured comes
 //!   close (q25 ≥ 17.7 across pancreas, erythroid and dentate gyrus).
 //!
-//! A NaN feature row counts as beyond p99 and is left out of the nearest-cell statistics.
+//! A non-finite feature row fails the contract outright, counts as beyond p99, and is left
+//! out of the nearest-cell statistics.
 //!
 //! A pure function of `(cells, features)`, so a consumer can check any co-embedding it reads,
 //! not only the one this crate just wrote.
@@ -93,6 +94,8 @@ pub struct CoembedPlacement {
     pub dist_pct: f32,
     /// Share of features farther from the centre than 99% of cells (NaN rows included).
     pub beyond_p99: f32,
+    /// Feature rows with a non-finite coordinate (a diverged fit).
+    pub non_finite: usize,
     /// Mean distance-from-centre percentile of each feature's nearest cells (0–100).
     pub nn_norm_pct: f32,
     /// Lower quartile of the per-feature nearest-cell percentile.
@@ -107,7 +110,8 @@ impl CoembedPlacement {
     #[must_use]
     pub fn on_manifold(&self) -> bool {
         let split = self.nn_norm_pct_q25 < SPLIT_TAIL && self.nn_norm_pct_q75 > 100.0 - SPLIT_TAIL;
-        self.beyond_p99 < MAX_BEYOND_P99
+        self.non_finite == 0
+            && self.beyond_p99 < MAX_BEYOND_P99
             && (self.nn_norm_pct - 50.0).abs() <= NN_NORM_PCT_BAND
             && !split
     }
@@ -116,7 +120,7 @@ impl CoembedPlacement {
     #[must_use]
     pub fn contract() -> String {
         format!(
-            "beyond_p99 < {MAX_BEYOND_P99}, nn_norm_pct within 50 ± {NN_NORM_PCT_BAND}, and not \
+            "no non-finite rows, beyond_p99 < {MAX_BEYOND_P99}, nn_norm_pct within 50 ± {NN_NORM_PCT_BAND}, and not \
              nn quartiles {SPLIT_TAIL} / {} in both tails",
             100.0 - SPLIT_TAIL
         )
@@ -136,7 +140,11 @@ impl std::fmt::Display for CoembedPlacement {
             self.nn_norm_pct,
             self.nn_norm_pct_q25,
             self.nn_norm_pct_q75
-        )
+        )?;
+        if self.non_finite > 0 {
+            write!(f, ", {} non-finite rows", self.non_finite)?;
+        }
+        Ok(())
     }
 }
 
@@ -247,6 +255,7 @@ fn placement_of_rows(cells: &[f32], feats: &[f32], h: usize) -> anyhow::Result<C
         dist_x_r,
         dist_pct,
         beyond_p99,
+        non_finite: feat_dist.iter().filter(|x| !x.is_finite()).count(),
         // An empty `per_feat` gives 0/0 = NaN, which fails every gate.
         nn_norm_pct: per_feat.iter().sum::<f32>() / per_feat.len() as f32,
         nn_norm_pct_q25: quantile_sorted(&per_feat, 0.25),
