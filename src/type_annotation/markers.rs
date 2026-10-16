@@ -4,6 +4,9 @@ use log::warn;
 /// Per-type `(feature_index, weight)` marker lists — one inner `Vec` per type.
 pub type MarkerSets = Vec<Vec<(u32, f32)>>;
 
+/// The kept type names and their weighted marker lists.
+type TypedSets<W> = (Vec<Box<str>>, Vec<Vec<(u32, W)>>);
+
 /// Parse a marker TSV and match its genes to `gene_names`, returning the
 /// sorted type vocabulary and per-type `(gene_index, weight)` lists.
 ///
@@ -32,6 +35,71 @@ pub fn parse_and_match_markers(
     use_idf: bool,
     min_coverage: f32,
 ) -> Result<(Vec<Box<str>>, MarkerSets)> {
+    let panel = match_panel(markers_path, gene_names, min_coverage)?;
+    let c = panel.type_names.len();
+    let use_idf = use_idf && c >= 2;
+    let type_markers: MarkerSets = panel
+        .membership
+        .iter()
+        .map(|genes| {
+            genes
+                .iter()
+                .filter_map(|&gi| {
+                    if use_idf {
+                        let w = idf_weight(c, panel.df[&gi]);
+                        (w > 0.0).then_some((gi, w)) // drop ubiquitous (IDF 0)
+                    } else {
+                        Some((gi, 1.0))
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    drop_thin_types(&panel.type_names, type_markers, 1)
+}
+
+/// [`parse_and_match_markers`]'s matching and IDF, weighted in `f64` and with each set sorted
+/// by gene index: `ln(C / df_gene)` over every panel type `C`, IDF-0 genes dropped, and a
+/// type left with fewer than `min_markers` markers dropped.
+pub(super) fn parse_and_match_idf_sets(
+    markers_path: &str,
+    gene_names: &[Box<str>],
+    min_coverage: f32,
+    min_markers: usize,
+) -> Result<TypedSets<f64>> {
+    let panel = match_panel(markers_path, gene_names, min_coverage)?;
+    let c = panel.type_names.len() as f64;
+    let sets = panel
+        .membership
+        .iter()
+        .map(|genes| {
+            let mut set: Vec<(u32, f64)> = genes
+                .iter()
+                .map(|&gi| (gi, (c / panel.df[&gi] as f64).ln()))
+                .filter(|&(_, w)| w > 0.0)
+                .collect();
+            set.sort_unstable_by_key(|&(gi, _)| gi);
+            set
+        })
+        .collect();
+    drop_thin_types(&panel.type_names, sets, min_markers)
+}
+
+/// A marker panel matched to a feature axis, before weighting.
+struct MatchedPanel {
+    /// Every panel type, sorted — including those that matched nothing.
+    type_names: Vec<Box<str>>,
+    /// Per type, the matched gene indices.
+    membership: Vec<FxHashSet<u32>>,
+    /// Per matched gene, the number of types holding it.
+    df: FxHashMap<u32, usize>,
+}
+
+fn match_panel(
+    markers_path: &str,
+    gene_names: &[Box<str>],
+    min_coverage: f32,
+) -> Result<MatchedPanel> {
     let pairs = read_marker_tsv(markers_path)?;
 
     // Type vocabulary (sorted, stable).
@@ -85,32 +153,27 @@ pub fn parse_and_match_markers(
             *df.entry(gi).or_insert(0) += 1;
         }
     }
-    let use_idf = use_idf && c >= 2;
-    let type_markers: Vec<Vec<(u32, f32)>> = membership
-        .iter()
-        .map(|genes| {
-            genes
-                .iter()
-                .filter_map(|&gi| {
-                    if use_idf {
-                        let w = idf_weight(c, df.get(&gi).copied().unwrap_or(1));
-                        (w > 0.0).then_some((gi, w)) // drop ubiquitous (IDF 0)
-                    } else {
-                        Some((gi, 1.0))
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    Ok(MatchedPanel {
+        type_names,
+        membership,
+        df,
+    })
+}
 
-    // Drop types left with no markers — either none of their genes are in the
-    // embedding, or IDF zeroed every one. See the doc comment: an empty type's
-    // zero signature out-competes every real one for any cell whose best cosine is
-    // below 0.5, so keeping it silently mislabels the majority of the data.
-    let (kept_names, kept_markers): (Vec<Box<str>>, MarkerSets) = type_names
+/// Drop the types left with fewer than `min_markers` markers — none of their genes are in the
+/// embedding, or IDF zeroed them. See [`parse_and_match_markers`]: an empty type's zero
+/// signature out-competes every real one for any cell whose best cosine is below 0.5, so
+/// keeping it silently mislabels the majority of the data.
+fn drop_thin_types<W>(
+    type_names: &[Box<str>],
+    sets: Vec<Vec<(u32, W)>>,
+    min_markers: usize,
+) -> Result<TypedSets<W>> {
+    let c = type_names.len();
+    let (kept_names, kept_sets): (Vec<Box<str>>, Vec<_>) = type_names
         .iter()
-        .zip(type_markers)
-        .filter(|(_, m)| !m.is_empty())
+        .zip(sets)
+        .filter(|(_, m)| m.len() >= min_markers.max(1))
         .map(|(n, m)| (n.clone(), m))
         .unzip();
     if kept_names.len() < c {
@@ -120,10 +183,12 @@ pub fn parse_and_match_markers(
             .map(std::convert::AsRef::as_ref)
             .collect();
         warn!(
-            "{} of {c} marker type(s) matched no gene in the embedding and were DROPPED: {}. \
-             Their cells will be assigned among the remaining types — widen the feature axis \
-             (e.g. lower `--n-hvg`, or rely on the held-out feature projection) if you need them.",
+            "{} of {c} marker type(s) kept fewer than {} marker gene(s) in the embedding and \
+             were DROPPED: {}. Their cells will be assigned among the remaining types — widen \
+             the feature axis (e.g. lower `--n-hvg`, or rely on the held-out feature \
+             projection) if you need them.",
             dropped.len(),
+            min_markers.max(1),
             dropped.join(", ")
         );
     }
@@ -133,7 +198,7 @@ pub fn parse_and_match_markers(
          naming against the dictionary's row names"
     );
 
-    Ok((kept_names, kept_markers))
+    Ok((kept_names, kept_sets))
 }
 
 /// Coverage below which a panel is reported as degraded rather than merely noted. Shared with

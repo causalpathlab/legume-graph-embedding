@@ -61,8 +61,11 @@
 //! - Wolf, F. A., Angerer, P. & Theis, F. J. (2018). SCANPY: large-scale single-cell gene
 //!   expression data analysis. *Genome Biology* 19:15. doi:10.1186/s13059-017-1382-0
 
-use anyhow::Result;
-use nalgebra::{DMatrix, DVector};
+use super::markers::parse_and_match_idf_sets;
+use super::UNASSIGNED;
+use anyhow::{ensure, Result};
+use nalgebra::{DMatrix, DVector, RowDVector};
+use std::collections::BTreeMap;
 
 /// A type left with fewer markers than this (after matching and IDF) is dropped.
 pub const MIN_MARKERS: usize = 3;
@@ -92,8 +95,35 @@ impl FeatureSpace {
         cell_cov: &DMatrix<f64>,
         gene_names: &[Box<str>],
     ) -> Result<Self> {
-        let _ = (rho, cell_cov, gene_names);
-        todo!()
+        let (g, h) = rho.shape();
+        ensure!(
+            cell_cov.shape() == (h, h),
+            "cell covariance is {:?}, but the feature embedding has H = {h}",
+            cell_cov.shape()
+        );
+        ensure!(
+            gene_names.len() == g,
+            "{} gene names for {g} feature rows",
+            gene_names.len()
+        );
+        let sigma = DVector::from_iterator(
+            g,
+            rho.row_iter()
+                .map(|r| (r * cell_cov).dot(&r).max(0.0).sqrt()),
+        );
+        let mut unit = rho.clone();
+        for (mut row, &s) in unit.row_iter_mut().zip(sigma.iter()) {
+            if s > 0.0 {
+                row /= s;
+            } else {
+                row.fill(0.0);
+            }
+        }
+        Ok(Self {
+            unit,
+            sigma,
+            gene_names: gene_names.to_vec(),
+        })
     }
 
     /// `[G]` per-gene logit standard deviation `σ_g`.
@@ -109,36 +139,79 @@ impl FeatureSpace {
 
     /// Read a `gene<TAB>celltype` panel and match it to this space's genes.
     pub fn marker_sets(&self, markers_path: &str, min_coverage: f32) -> Result<PanelSets> {
-        let _ = (markers_path, min_coverage);
-        todo!()
+        let (type_names, sets) =
+            parse_and_match_idf_sets(markers_path, &self.gene_names, min_coverage, MIN_MARKERS)?;
+        Ok(PanelSets { type_names, sets })
     }
 
-    /// `[C × H]` one direction `u_T` per set; an empty set gives the zero row.
+    /// `[C × H]` one direction `u_T` per set; an empty set, or one whose every row is dead,
+    /// gives the zero row.
     #[must_use]
     pub fn directions(&self, sets: &[WeightedSet]) -> DMatrix<f64> {
-        let _ = (sets, &self.unit);
-        todo!()
+        let mut dirs = DMatrix::zeros(sets.len(), self.unit.ncols());
+        for (set, mut dir) in sets.iter().zip(dirs.row_iter_mut()) {
+            let mut total = 0.0;
+            for &(g, w) in set.iter().filter(|&&(g, _)| self.sigma[g as usize] > 0.0) {
+                dir += self.unit.row(g as usize) * w;
+                total += w;
+            }
+            if total > 0.0 {
+                dir /= total;
+            }
+        }
+        dirs
     }
 }
 
 /// `[H × H]` sample covariance (ddof 1) of the `[N × H]` cells.
 pub fn cell_covariance(cells: &DMatrix<f64>) -> Result<DMatrix<f64>> {
-    let _ = cells;
-    todo!()
+    let n = cells.nrows();
+    ensure!(n >= 2, "a covariance needs at least 2 cells, got {n}");
+    let mean = cells.row_mean();
+    let mut centred = cells.clone();
+    for mut row in centred.row_iter_mut() {
+        row -= &mean;
+    }
+    Ok(centred.tr_mul(&centred) / (n - 1) as f64)
 }
 
 /// The mean of the cluster means. `groups[i]` is cell `i`'s cluster; cells marked
 /// [`UNASSIGNED`](super::UNASSIGNED) are left out.
 pub fn balanced_centre(cells: &DMatrix<f64>, groups: &[usize]) -> Result<DVector<f64>> {
-    let _ = (cells, groups);
-    todo!()
+    ensure!(
+        groups.len() == cells.nrows(),
+        "{} group labels for {} cells",
+        groups.len(),
+        cells.nrows()
+    );
+    let h = cells.ncols();
+    let mut sums: BTreeMap<usize, (RowDVector<f64>, usize)> = BTreeMap::new();
+    for (row, &k) in cells.row_iter().zip(groups) {
+        if k != UNASSIGNED {
+            let (sum, count) = sums.entry(k).or_insert_with(|| (RowDVector::zeros(h), 0));
+            *sum += row;
+            *count += 1;
+        }
+    }
+    ensure!(!sums.is_empty(), "no cell is assigned to a group");
+    let k = sums.len() as f64;
+    let centre = sums
+        .into_values()
+        .fold(RowDVector::zeros(h), |acc, (sum, count)| {
+            acc + sum / count as f64
+        });
+    Ok((centre / k).transpose())
 }
 
 /// `[N × C]` scores `(z_i − m) · u_T`.
 #[must_use]
 pub fn scores(cells: &DMatrix<f64>, centre: &DVector<f64>, dirs: &DMatrix<f64>) -> DMatrix<f64> {
-    let _ = (cells, centre, dirs);
-    todo!()
+    let centre = centre.transpose();
+    let mut centred = cells.clone();
+    for mut row in centred.row_iter_mut() {
+        row -= &centre;
+    }
+    centred * dirs.transpose()
 }
 
 /// One cell's call.
@@ -153,8 +226,35 @@ pub struct CellCall {
 /// Per cell, the argmax of `scores` over the live types (rows of `dirs` that are not zero).
 #[must_use]
 pub fn calls(scores: &DMatrix<f64>, dirs: &DMatrix<f64>) -> Vec<CellCall> {
-    let _ = (scores, dirs);
-    todo!()
+    let live: Vec<usize> = (0..dirs.nrows())
+        .filter(|&t| dirs.row(t).iter().any(|&x| x != 0.0))
+        .collect();
+    scores
+        .row_iter()
+        .map(|row| {
+            let mut best: Option<(usize, f64)> = None;
+            let mut runner_up = f64::NEG_INFINITY;
+            for &t in &live {
+                let s = row[t];
+                match best {
+                    Some((_, b)) if s <= b => runner_up = runner_up.max(s),
+                    _ => {
+                        if let Some((_, b)) = best {
+                            runner_up = runner_up.max(b);
+                        }
+                        best = Some((t, s));
+                    }
+                }
+            }
+            CellCall {
+                call: best.map(|(t, _)| t),
+                margin: match best {
+                    Some((_, b)) if live.len() >= 2 => b - runner_up,
+                    _ => f64::NAN,
+                },
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
