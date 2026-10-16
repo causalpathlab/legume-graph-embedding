@@ -8,30 +8,35 @@
 //! land on the cell manifold. Nothing in training changes — the pseudobulk
 //! efficiency and the phase-2 per-cell projection are untouched.
 //!
+//! **The goal is to place a gene by direction, not magnitude**: beside the cells
+//! whose embedding points the way the gene's does, inside the cell cloud, and
+//! regardless of how long those cells' rows happen to be. [`coembed_placement`]
+//! measures exactly that, and `write_feature_coembedding` logs it on every write.
+//!
 //! ```text
-//!   S        = e_cell · e_featᵀ                  [N, D]   (raw dot, no unit-norm)
+//!   ê_cell   = (e_cell − μ) / ‖e_cell − μ‖         [N, H]   (per-CELL unit norm, from the centre μ)
+//!   S        = ê_cell · e_featᵀ                   [N, D]
 //!   S̃[:,f]   = S[:,f] / sd_c(S[:,f])              [N, D]   (per-FEATURE unit scale)
 //!   P[:,f]   = softmax_over_cells( S̃[:,f] / T )    [N, D]   (column-stochastic)
-//!   coembed  = Pᵀ · e_cell                         [D, H]   (gene = wtd avg of cells)
+//!   coembed  = Pᵀ · e_cell                         [D, H]   (gene = wtd avg of RAW cells)
 //! ```
 //!
-//! The per-feature rescale is what makes a single `T` well-defined. `‖e_f‖`
-//! spans ~38× across genes, so on RAW scores one `T` saturates the long genes
-//! onto one cell and leaves the short ones spread over all of them — see
-//! [`standardize_columns`].
+//! The two rescales fix the two axes of `S` separately: the per-cell one keeps
+//! placement from tracking cell norm (`ScoreKeys`), the per-feature one makes a
+//! single `T` mean the same thing for every gene ([`standardize_columns`]).
 //!
 //! The softmax temperature `T` is auto-calibrated (no user knob): bisected so
 //! the mean effective number of cells per gene (`1 / Σ_c P²`) equals the median
-//! cell-cluster size, clamped to `[MIN_TARGET_EFF, MAX_TARGET_EFF]`. The clamp is
-//! load-bearing, not defensive: an unclamped "one cluster's worth of cells" is
-//! ~600 here and scores WORSE than no calibration at all, because averaging that
-//! many cell rows pulls the barycentre to the global centroid. The cluster size
-//! comes from [`cell_clusters`], which the bge driver runs ONCE and shares with
-//! ETM resolution. Cells are the reference and are not moved.
+//! cell-cluster size, clamped to `[MIN_TARGET_EFF, MAX_TARGET_EFF]`. The upper
+//! clamp is load-bearing, not defensive: a gene averaged over a whole cluster's
+//! worth of cells is pulled toward the global centroid and stops pointing
+//! anywhere — see `MAX_TARGET_EFF`. The cluster size comes from
+//! [`cell_clusters`], which the bge driver runs ONCE and shares with ETM
+//! resolution. Cells are the reference and are not moved.
 //!
 //! Biases are absent by design — `b_f` cancels in the softmax, `b_c` is a
 //! shared per-cell depth offset that would drag every gene toward deep cells.
-//! See [`coembed_block`].
+//! See [`coembed_from_scores`].
 
 use legume_numeric::candle::candle_core::{Result, Tensor};
 use legume_numeric::candle::candle_nn::ops::softmax;
@@ -58,39 +63,50 @@ const MIN_TARGET_EFF: f64 = 20.0;
 ///
 /// A gene attending to a WHOLE cluster is past the useful point: averaging that
 /// many cell rows shrinks the barycentre toward the global centroid and the
-/// coordinate stops tracking the gene's own top cells.
+/// coordinate stops pointing at the gene's own cells.
 ///
 /// Numbers below are in the SAME units [`eff_from_scores`] reports — the MEAN
 /// over features of inverse-Simpson `1/Σ_c p²` — because that is what the
-/// bisection actually drives. (An earlier revision of this comment quoted median
-/// `exp(entropy)` instead, which is ~8× smaller here and made the constant look
-/// mis-set.) Measured on a 12k-cell dataset (`H=16`), recall of the model's own top-100
-/// cells against the gene-specific score `⟨e_f, e_c⟩`:
+/// bisection actually drives. Swept on direction scores ([`ScoreKeys`]) over 16
+/// real runs (dentate gyrus, erythroid and pancreas, five to seven model variants
+/// each), against the placement contract ([`coembed_placement`]) and `top30_cos`,
+/// the share of a gene's 30 nearest cells that are among its 30 best cells by
+/// `cos(e_f, e_cell)`:
 ///
-/// | mean eff | 16 | 49 | 178 | 488 | 1045 |
-/// |---|---|---|---|---|---|
-/// | recall@100 | 0.468 | 0.464 | 0.436 | 0.385 | 0.315 |
+/// | target | 20 | 50 | 100 | 200 |
+/// |---|---|---|---|---|
+/// | nearest-cell pct, dentate gyrus (5 runs) | 74–78 | 76–79 | 77–79 | 78–80 |
+/// | nearest-cell pct, erythroid (7 runs) | 28–43 | 29–43 | 29–43 | 29–43 |
+/// | nearest-cell pct, pancreas (4 runs) | 37–41 | 35–39 | 32–35 | 27–30 |
+/// | beyond_p99, pancreas | ≤ 0.09 | ≤ 0.04 | ≤ 0.009 | ≤ 0.003 |
+/// | top30_cos, all runs | 0.28–0.52 | 0.26–0.50 | 0.24–0.45 | 0.21–0.37 |
 ///
-/// The old behaviour (median cluster size, ~600 cells) sat at ~0.37, below the
-/// 0.366 the uncalibrated path already achieved. 100 lands at ~0.45: off the peak
-/// on purpose, since tuning to the ~20 that maximizes recall would be fitting a
-/// proxy that structurally rewards near-hard assignment (a gene parked on its top
-/// cell inherits that cell's neighbours).
+/// A smaller target always sharpens the direction match (`top30_cos` rises as the
+/// target shrinks, on every run) and moves dentate gyrus and pancreas a little
+/// toward the middle, but it leaves erythroid flat or slightly worse, and on
+/// pancreas it puts several times more genes beyond the edge of the cloud. A rule
+/// fixed before the sweep (50 must beat 100 on the nearest-cell percentile and
+/// `top30_cos` in a clear majority of runs without raising `beyond_p99`) held on 7 of
+/// 16, so the
+/// target stays at 100. The constant is also the clamp for the type-annotation
+/// anchors (`target_eff_from_labels`). Recall of the top cells by the raw dot
+/// `⟨e_f, e_cell⟩` is not used: it rewards parking a gene on the longest cells.
 ///
-/// REPLICATED over 25 fits spanning 3 datasets (6270 / 12602 / 42826 cells) and
-/// `H` ∈ {8, 16}: the per-fit optimum is median 22, range 7–61, and 100 captures
-/// **97.2%** of each fit's achievable optimum (worst 94.1%) against **74.0%**
-/// (worst 50.5%) for the old ~600 target. 100 beat 600 on 25/25.
-///
-/// Why a CONSTANT and not a fraction of `n`: the optimum does not track cell
-/// count — median optimum was 29 at N=6270, 21 at N=12602, 42 at N=42826. A gene
-/// attends to a fixed-size neighbourhood, not a fixed share of the dataset, so
-/// scaling this with `n` would be wrong in the large-`n` limit exactly where the
-/// old cluster-size target already failed.
+/// Why a CONSTANT and not a fraction of `n`: a gene attends to a fixed-size
+/// neighbourhood, not a fixed share of the dataset — on a 263k-cell run the
+/// placement is flat across the whole range, so scaling with `n` buys nothing.
 const MAX_TARGET_EFF: f64 = 100.0;
 /// Floor on a feature's score SD, so a zero-embedding feature (constant score
 /// column) divides by a positive number instead of producing `NaN`.
 const SD_FLOOR: f64 = 1e-6;
+/// Floor on a cell's norm, so an all-zero cell row scores 0 against every
+/// feature instead of producing `NaN`.
+const NORM_FLOOR: f64 = 1e-12;
+
+mod placement;
+pub(crate) use placement::HUB_COLLAPSE_SHARE;
+pub use placement::{coembed_placement, CoembedPlacement, NearestCells, PlacementViolation};
+pub(crate) use placement::{coembed_placement_of_tensors, CellCloud};
 
 /// Leiden-cluster the cell embedding once. Returns `(labels, target_eff)` where
 /// `labels[i]` is cell `i`'s cluster (dense `0..k`) and `target_eff` is the
@@ -140,10 +156,10 @@ pub fn target_eff_from_labels(labels: &[usize], n_clusters: usize) -> f64 {
 }
 
 /// Re-embed every feature onto the cell manifold (SIMBA-style). The attention is
-/// keyed on the identity `e_cell` (query = feature `β_f`, keys = cells):
-/// `P_f[c] = softmax_c(⟨e_cell[c], β_f⟩ / T)` places each feature over the cells
-/// that express it, and the coordinate is the `P_f`-weighted mean of the cell
-/// rows. `target_eff` is the eff-cells target from [`cell_clusters`]. Returns
+/// keyed on the unit-norm cells (query = feature `β_f`, keys = `ê_cell`, see
+/// `ScoreKeys`): `P_f[c] = softmax_c(⟨ê_cell[c], β_f⟩ / sd / T)` places each
+/// feature over the cells that express it, and the coordinate is the
+/// `P_f`-weighted mean of the raw cell rows. `target_eff` is the eff-cells target from [`cell_clusters`]. Returns
 /// `(coembed [D,H], calibrated_T)`; both inputs are 2-D `[*, H]` on the same
 /// device and the output is on that device.
 pub fn feature_coembedding(
@@ -168,16 +184,13 @@ pub fn feature_coembedding(
     // there.
     let e_cell = e_cell.contiguous()?;
     let e_feat = e_feat.contiguous()?;
+    let keys = ScoreKeys::new(&e_cell)?;
 
     // Calibrate T on a feature subsample. The score matrix is invariant in T —
     // only the softmax temperature changes — so compute it once and reuse it
     // across the whole bisection.
     let e_feat_sub = subsample_rows(&e_feat, CALIB_FEATS)?;
-    // Standardized here so `T` is calibrated in the SAME units `coembed_block`
-    // applies it in. Calibrating on raw scores and spending the result on
-    // standardized ones is shape-valid and silently wrong, which is why the
-    // rescale lives in one named helper both paths call.
-    let scores_sub = standardize_columns(&e_cell.matmul(&e_feat_sub.t()?.contiguous()?)?)?; // [N, B]
+    let scores_sub = keys.scores(&e_feat_sub)?; // [N, B]
     let t = calibrate_t_for_eff(&scores_sub, target_eff)?;
     info!(
         "feature co-embedding: T={:.4} (eff-cells target {:.0}); mean eff-cells/gene={:.0}",
@@ -196,7 +209,7 @@ pub fn feature_coembedding(
     while start < d {
         let len = FEAT_BLOCK.min(d - start);
         let ef = e_feat.narrow(0, start, len)?;
-        blocks.push(coembed_block(&e_cell, &ef, t)?); // [len, H]
+        blocks.push(coembed_from_scores(&keys.scores(&ef)?, &e_cell, t)?); // [len, H]
         start += len;
         prog.inc(1);
     }
@@ -207,7 +220,8 @@ pub fn feature_coembedding(
 
 /// SIMBA's own `si.tl.embed`: the same softmax-over-cells average as
 /// [`feature_coembedding`], but on the RAW dot scores at a FIXED temperature
-/// (`T = 0.5` in SIMBA) — no per-feature rescale, no calibration, no biases.
+/// (`T = 0.5` in SIMBA) — no per-cell or per-feature rescale, no calibration,
+/// no biases.
 /// `senna simba` writes this as its `feature_embedding`, so the file holds
 /// SIMBA's co-embedding rather than bge's calibrated one.
 pub fn feature_coembedding_fixed_t(
@@ -276,7 +290,46 @@ fn standardize_columns(scores: &Tensor) -> Result<Tensor> {
     scores.broadcast_div(&sd)
 }
 
-/// One feature-block: `softmax_over_cells(standardize(e_cell·e_fᵀ) / T)ᵀ · e_cell`.
+/// The cells as the calibrated softmax sees them: each cell's offset from the
+/// cloud centre, scaled to unit norm.
+/// The ONE place scores are made on the calibrated path — the temperature
+/// calibration and the block pass both go through [`ScoreKeys::scores`], so
+/// `T` cannot be calibrated in one set of units and applied in another.
+///
+/// Why unit cells. `⟨e_cell_c, e_f⟩` grows with `‖e_cell_c‖`, and the per-feature
+/// rescale in [`standardize_columns`] equalizes features, not cells. Cell norms are
+/// heavy-tailed (max/median up to ~16 on real runs), so at the calibrated `T` the
+/// softmax piles onto the longest cells along `e_f`, and the weighted mean lands at
+/// or beyond the edge of the cell cloud. Across 71 real runs the old scores put the
+/// median gene beyond 87–100% of cells, next to the top ~10% of cells by norm; the
+/// placement bias tracked max/median cell norm (Spearman +0.9), not `N`. Scoring on
+/// direction alone removes the norm from the softmax; the AVERAGE stays over the raw
+/// cells, so the coordinate is still in the cells' own units.
+///
+/// Why from the centre. Directions from the origin depend on where the origin
+/// happens to sit: for a cloud off it (`Z = θ·α` with `θ` on the simplex is off it
+/// by construction) the shared part `⟨μ, e_f⟩ / ‖e_cell‖` becomes a per-cell term
+/// and placement tracks cell norm again. From the centre, translating the cells
+/// translates the co-embedding and leaves `T` alone. bge's cell embeddings are
+/// already centred, so there this is a no-op.
+struct ScoreKeys(Tensor);
+
+impl ScoreKeys {
+    fn new(e_cell: &Tensor) -> Result<Self> {
+        let centred = e_cell.broadcast_sub(&e_cell.mean_keepdim(0)?)?; // [N, H]
+        let norm = centred.sqr()?.sum_keepdim(1)?.sqrt()?.maximum(NORM_FLOOR)?; // [N, 1]
+        Ok(Self(centred.broadcast_div(&norm)?))
+    }
+
+    /// `standardize(ê_cell · e_fᵀ)` for one `[B, H]` feature block → `[N, B]`.
+    fn scores(&self, e_feat_block: &Tensor) -> Result<Tensor> {
+        standardize_columns(&self.0.matmul(&e_feat_block.t()?.contiguous()?)?)
+    }
+}
+
+/// `softmax_over_cells(scores / T)ᵀ · e_cell` for one `[N, B]` score block:
+/// the step both the calibrated path ([`ScoreKeys::scores`])
+/// and SIMBA's fixed-T path ([`feature_coembedding_fixed_t`], raw scores) share.
 ///
 /// Biases are deliberately absent. `b_f` is constant down a column and cancels in
 /// the softmax; `b_c` does NOT cancel, but it is a per-cell depth offset shared by
@@ -284,14 +337,6 @@ fn standardize_columns(scores: &Tensor) -> Result<Tensor> {
 /// it halves fidelity (recall@100 0.387 → 0.162) and makes 43.6% of any gene's
 /// top-100 the same cells. The co-embedding wants the gene-SPECIFIC part of the
 /// score only.
-fn coembed_block(e_cell: &Tensor, e_feat_block: &Tensor, t: f64) -> Result<Tensor> {
-    let scores = standardize_columns(&e_cell.matmul(&e_feat_block.t()?.contiguous()?)?)?; // [N, B]
-    coembed_from_scores(&scores, e_cell, t)
-}
-
-/// `softmax_over_cells(scores / T)ᵀ · e_cell` for one `[N, B]` score block:
-/// the step both the calibrated path ([`coembed_block`], standardized scores)
-/// and SIMBA's fixed-T path ([`feature_coembedding_fixed_t`], raw scores) share.
 fn coembed_from_scores(scores: &Tensor, e_cell: &Tensor, t: f64) -> Result<Tensor> {
     let p = softmax(&scores.affine(1.0 / t, 0.0)?, 0)?; // softmax over cells (dim 0)
     p.t()?.contiguous()?.matmul(e_cell) // [B, N]·[N, H] = [B, H]
@@ -332,12 +377,23 @@ fn subsample_rows(x: &Tensor, k: usize) -> Result<Tensor> {
     if m <= k {
         return x.contiguous();
     }
-    let stride = m as f64 / k as f64;
-    let idx: Vec<u32> = (0..k)
-        .map(|i| (((i as f64) * stride) as usize).min(m - 1) as u32)
+    let idx: Vec<u32> = strided_indices(m, k)
+        .into_iter()
+        .map(|i| i as u32)
         .collect();
     let idx_t = Tensor::from_vec(idx, k, x.device())?;
     x.index_select(&idx_t, 0)
+}
+
+/// `min(m, k)` evenly strided indices into `0..m` — all of them when `m ≤ k`.
+fn strided_indices(m: usize, k: usize) -> Vec<usize> {
+    if m <= k {
+        return (0..m).collect();
+    }
+    let stride = m as f64 / k as f64;
+    (0..k)
+        .map(|i| (((i as f64) * stride) as usize).min(m - 1))
+        .collect()
 }
 
 #[cfg(test)]

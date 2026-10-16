@@ -1,11 +1,14 @@
-//! Invariants of the co-embedding's per-feature rescale and its temperature
-//! calibration. The claim these exist to pin is that `T` is calibrated and spent
-//! in the SAME units: the rescale is applied inside both [`coembed_block`] and
-//! the calibration path, and doing it in only one is shape-valid, silently wrong,
-//! and invisible to every other test in the crate.
+//! Invariants of the co-embedding's scores, its temperature calibration, and its
+//! placement. The claim the calibration tests pin is that `T` is calibrated and
+//! spent in the SAME units: both the calibration and the block pass score through
+//! [`ScoreKeys`], and scoring them differently is shape-valid, silently wrong, and
+//! invisible to every other test in the crate.
 
 use super::*;
 use legume_numeric::candle::candle_core::{DType, Device};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, Normal, Uniform};
 
 const N: usize = 256;
 const H: usize = 8;
@@ -43,15 +46,29 @@ fn col_sds(t: &Tensor) -> Vec<f32> {
         .collect()
 }
 
+/// `cells · featsᵀ`, the raw dot scores `[N, D]`.
+fn raw_scores(cells: &Tensor, feats: &Tensor) -> Tensor {
+    cells
+        .matmul(&feats.t().unwrap().contiguous().unwrap())
+        .unwrap()
+}
+
+fn all_finite(t: &Tensor) -> bool {
+    t.flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+        .iter()
+        .all(|x| x.is_finite())
+}
+
 /// Every feature column comes out at unit scale regardless of `‖e_f‖`. This is
 /// the whole mechanism: it is what lets one `T` mean the same thing for a long
 /// gene and a short one.
 #[test]
 fn every_feature_column_is_rescaled_to_unit_sd() {
     let (cells, feats) = fixture(32);
-    let raw = cells
-        .matmul(&feats.t().unwrap().contiguous().unwrap())
-        .unwrap();
+    let raw = raw_scores(&cells, &feats);
 
     let raw_sds = col_sds(&raw);
     let spread = raw_sds.iter().cloned().fold(f32::MIN, f32::max)
@@ -80,44 +97,403 @@ fn a_constant_column_stays_finite() {
     let dev = Device::Cpu;
     let (cells, _) = fixture(1);
     let zero_feat = Tensor::zeros((2, H), DType::F32, &dev).unwrap();
-    let raw = cells
-        .matmul(&zero_feat.t().unwrap().contiguous().unwrap())
-        .unwrap();
-
-    let out = standardize_columns(&raw).unwrap();
+    let out = standardize_columns(&raw_scores(&cells, &zero_feat)).unwrap();
     assert!(
-        out.flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap()
-            .iter()
-            .all(|x| x.is_finite()),
+        all_finite(&out),
         "a zero-embedding feature must not produce NaN/Inf"
     );
 }
 
-/// The end-to-end contract: the `T` returned by [`feature_coembedding`], applied
-/// the way `coembed_block` applies it, actually lands near the requested
-/// eff-cells target. This fails if calibration and application ever diverge in
-/// units — the failure mode the shared helper exists to prevent.
+/// Each cell's offset from the cloud centre, scaled to unit norm, by hand — the units the
+/// softmax is meant to score in.
+fn centred_unit_rows(cells: &Tensor) -> Tensor {
+    let centred = cells
+        .broadcast_sub(&cells.mean_keepdim(0).unwrap())
+        .unwrap();
+    let norm = centred
+        .sqr()
+        .unwrap()
+        .sum_keepdim(1)
+        .unwrap()
+        .sqrt()
+        .unwrap();
+    centred.broadcast_div(&norm).unwrap()
+}
+
+/// Direction-only scores, by hand: `standardize(ê_cell · e_fᵀ)`, `ê` taken from the centre.
+fn direction_scores(cells: &Tensor, feats: &Tensor) -> Tensor {
+    standardize_columns(&raw_scores(&centred_unit_rows(cells), feats)).unwrap()
+}
+
+/// The end-to-end contract: the `T` returned by [`feature_coembedding`], applied to
+/// direction-only scores, actually lands near the requested eff-cells target. This
+/// fails if the calibration scores in different units from the ones the softmax is
+/// meant to use — on raw cells, a `T` calibrated against the longest cells.
 #[test]
 fn the_calibrated_temperature_hits_its_eff_target() {
-    let (cells, feats) = fixture(96);
     let target = 40.0;
-    let (co, t) = feature_coembedding(&cells, &feats, target).unwrap();
-    assert_eq!(co.dims2().unwrap(), (96, H));
+    let cases = [
+        ("fixture", fixture(96)),
+        ("heavy-tailed", heavy_tailed_cloud(0)),
+    ];
+    for (name, (cells, feats)) in cases {
+        let (co, t) = feature_coembedding(&cells, &feats, target).unwrap();
+        assert_eq!(co.dims2().unwrap(), (feats.dim(0).unwrap(), H));
+        let eff = eff_from_scores(&direction_scores(&cells, &feats), f64::from(t)).unwrap();
+        assert!(
+            eff > target / 1.5 && eff < target * 1.5,
+            "{name}: calibrated T={t} gives eff {eff:.1} on direction scores, want within \
+             1.5× of {target}"
+        );
+    }
+}
 
-    let scores = standardize_columns(
-        &cells
-            .matmul(&feats.t().unwrap().contiguous().unwrap())
-            .unwrap(),
-    )
-    .unwrap();
-    let eff = eff_from_scores(&scores, f64::from(t)).unwrap();
+/// The temperature is a property of the cells' directions from the cloud centre: rescaling
+/// every cell's offset by its own factor (three orders of magnitude) must not move it. The
+/// cells come in `±` pairs with a shared factor, so the centre stays exactly at the origin.
+#[test]
+fn the_temperature_ignores_cell_norm() {
+    let (half, feats) = fixture(32);
+    let cells = Tensor::cat(&[&half, &half.neg().unwrap()], 0).unwrap();
+    let factors: Vec<f32> = (0..2 * N)
+        .map(|i| 10f32.powf(((i % N) % 4) as f32 - 1.5))
+        .collect();
+    let scaled = cells
+        .broadcast_mul(&Tensor::from_vec(factors, (2 * N, 1), &Device::Cpu).unwrap())
+        .unwrap();
+    let (_, t) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    let (_, t_scaled) = feature_coembedding(&scaled, &feats, 40.0).unwrap();
     assert!(
-        eff > target / 3.0 && eff < target * 3.0,
-        "calibrated T={t} gives eff {eff:.1}, want within 3× of {target}"
+        (t - t_scaled).abs() < 1e-3 * t,
+        "T moved under a per-cell rescale: {t} → {t_scaled}"
     );
+}
+
+/// An all-zero cell row has no direction. It must leave the co-embedding finite.
+#[test]
+fn a_zero_cell_stays_finite() {
+    let (cells, feats) = fixture(8);
+    let zero = Tensor::zeros((1, H), DType::F32, &Device::Cpu).unwrap();
+    let cells = Tensor::cat(&[&cells, &zero], 0).unwrap();
+    let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    assert!(all_finite(&co));
+}
+
+/// Sizes of the synthetic clouds: cells, features, and clusters (or topics).
+const N_CELLS: usize = 1500;
+const N_FEATS: usize = 120;
+const K: usize = 6;
+
+fn to_tensors(cells: Vec<f32>, feats: Vec<f32>) -> (Tensor, Tensor) {
+    (
+        Tensor::from_vec(cells, (N_CELLS, H), &Device::Cpu).unwrap(),
+        Tensor::from_vec(feats, (N_FEATS, H), &Device::Cpu).unwrap(),
+    )
+}
+
+/// Cells in a few angular clusters with a heavy-tailed (Student-t, 3 df) radius —
+/// max/median cell norm ~15, the regime the real runs sit in — and features of
+/// mixed norm.
+fn heavy_tailed_cloud(seed: u64) -> (Tensor, Tensor) {
+    use rand_distr::StudentT;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let normal = Normal::new(0f32, 1.0).unwrap();
+    let unit = |v: Vec<f32>| -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.into_iter().map(|x| x / n).collect()
+    };
+    let centres: Vec<Vec<f32>> = (0..K)
+        .map(|_| unit((0..H).map(|_| normal.sample(&mut rng)).collect()))
+        .collect();
+    let radius = StudentT::new(3f32).unwrap();
+    let mut cells = Vec::with_capacity(N_CELLS * H);
+    for i in 0..N_CELLS {
+        let dir = unit(
+            centres[i % K]
+                .iter()
+                .map(|&c| c + 0.2 * normal.sample(&mut rng))
+                .collect(),
+        );
+        let r = radius.sample(&mut rng).abs() + 0.2;
+        cells.extend(dir.iter().map(|&x| r * x));
+    }
+    let feats = mixed_norm_feats(&mut rng, &normal);
+    to_tensors(cells, feats)
+}
+
+/// `N_FEATS` features of random direction and norm spread over 0.1–3.
+fn mixed_norm_feats(rng: &mut StdRng, normal: &Normal<f32>) -> Vec<f32> {
+    let scale = Uniform::new(0.1f32, 3.0).unwrap();
+    let mut feats = Vec::with_capacity(N_FEATS * H);
+    for _ in 0..N_FEATS {
+        let s = scale.sample(rng);
+        feats.extend((0..H).map(|_| s * normal.sample(rng)));
+    }
+    feats
+}
+
+fn placement(cells: &Tensor, coembed: &Tensor) -> CoembedPlacement {
+    coembed_placement_of_tensors(cells, coembed).unwrap()
+}
+
+/// Co-embed at an eff target of 40 and assert the placement contract holds.
+fn assert_placed(cells: &Tensor, feats: &Tensor, label: &str) {
+    let (co, _) = feature_coembedding(cells, feats, 40.0).unwrap();
+    let got = placement(cells, &co);
+    assert!(
+        got.on_manifold(),
+        "{label}: features must sit on the manifold, got {got}: {:?}",
+        got.violations()
+    );
+}
+
+/// The placement contract on a heavy-tailed cloud. Scoring on raw cells (rebuilt here by
+/// hand) piles the softmax onto the longest cells: features land outside the cloud, next to
+/// its longest cells — which also checks that the fixture and the diagnostic see the bias.
+/// [`feature_coembedding`] must put them inside it, beside cells of ordinary norm.
+#[test]
+fn heavy_tailed_cells_do_not_pull_features_off_the_manifold() {
+    let target = 40.0;
+    for seed in 0..3 {
+        let (cells, feats) = heavy_tailed_cloud(seed);
+
+        let raw = standardize_columns(&raw_scores(&cells, &feats)).unwrap();
+        let t_raw = calibrate_t_for_eff(&raw, target).unwrap();
+        let on_raw = placement(&cells, &coembed_from_scores(&raw, &cells, t_raw).unwrap());
+        assert!(
+            on_raw.beyond_p99 > 0.3
+                && on_raw.nearest.expect("measured").mean > 70.0
+                && !on_raw.on_manifold(),
+            "seed {seed}: the fixture must reproduce the bias on raw-cell scores, got {on_raw}"
+        );
+
+        assert_placed(&cells, &feats, &format!("seed {seed}"));
+
+        // Not gated, but the point of the fix: the features no longer sit beside the longest
+        // cells. Their nearest cells sit at least 20 percentile points lower than on raw scores.
+        let (co, _) = feature_coembedding(&cells, &feats, target).unwrap();
+        let fixed = placement(&cells, &co).nearest.expect("measured").mean;
+        let raw = on_raw.nearest.expect("measured").mean;
+        assert!(
+            fixed < raw - 20.0,
+            "seed {seed}: nearest-cell percentile {fixed:.1} on direction scores vs {raw:.1} raw"
+        );
+    }
+}
+
+/// The same contract when the cloud does not sit at the origin. Scoring each cell's direction
+/// from the origin leaves a per-cell term `⟨μ, e_f⟩ / ‖e_cell‖` in the softmax, so placement
+/// tracks cell norm again; directions must be taken from the cloud's own centre.
+#[test]
+fn a_cloud_off_the_origin_stays_on_the_manifold() {
+    let (cells, feats) = heavy_tailed_cloud(0);
+    let norms: Vec<f32> = cells
+        .sqr()
+        .unwrap()
+        .sum(1)
+        .unwrap()
+        .sqrt()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+    let median_radius = legume_numeric::matrix::utils::median(&norms);
+    let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    let at_origin = placement(&cells, &co).nearest.expect("measured").mean;
+    for k in [1.0f32, 2.0, 4.0] {
+        let mut offset = vec![0f32; H];
+        offset[0] = k * median_radius;
+        let shifted = cells
+            .broadcast_add(&Tensor::from_vec(offset, (1, H), &Device::Cpu).unwrap())
+            .unwrap();
+        assert_placed(
+            &shifted,
+            &feats,
+            &format!("cloud shifted {k}× its median radius"),
+        );
+        // And placement among the cells does not move with the origin.
+        let (co, _) = feature_coembedding(&shifted, &feats, 40.0).unwrap();
+        let moved = placement(&shifted, &co).nearest.expect("measured").mean;
+        assert!(
+            (moved - at_origin).abs() < 2.0,
+            "shifted {k}×: nearest-cell percentile {moved:.1} vs {at_origin:.1} at the origin"
+        );
+    }
+}
+
+/// An elongated Gaussian cloud (one axis 6× the others) with no cluster structure.
+fn elongated_cloud(seed: u64) -> (Tensor, Tensor) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let normal = Normal::new(0f32, 1.0).unwrap();
+    let cells: Vec<f32> = (0..N_CELLS * H)
+        .map(|i| normal.sample(&mut rng) * if i % H == 0 { 6.0 } else { 1.0 })
+        .collect();
+    let feats = mixed_norm_feats(&mut rng, &normal);
+    to_tensors(cells, feats)
+}
+
+/// A co-embedded gene is an average of cells, so on an elongated cloud it sits well inward of
+/// single cells — its nearest cells far below the 50th norm percentile — without any bias.
+/// The contract does not judge that.
+#[test]
+fn an_elongated_cloud_stays_on_the_manifold() {
+    for seed in 0..2 {
+        let (cells, feats) = elongated_cloud(seed);
+        assert_placed(&cells, &feats, &format!("seed {seed}"));
+    }
+}
+
+/// SIMBA's fixed-T path at a high temperature collapses every gene to the hub: it must fail,
+/// and name the collapse.
+#[test]
+fn a_hub_collapse_is_not_on_the_manifold() {
+    let (cells, feats) = heavy_tailed_cloud(0);
+    let co = feature_coembedding_fixed_t(&cells, &feats, 1e3).unwrap();
+    let got = placement(&cells, &co);
+    let v = got.violations();
+    assert!(
+        v.contains(&PlacementViolation::HubCollapse),
+        "a hub collapse was not named: {got}: {v:?}"
+    );
+}
+
+/// A topic-mixture cloud, `Z = θ·α` with `θ` on the simplex (Dirichlet) and `α` a `K × H`
+/// dictionary — off the origin by construction, as `senna rest` writes it.
+fn topic_mixture_cloud(seed: u64) -> (Tensor, Tensor) {
+    use rand_distr::multi::Dirichlet;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let normal = Normal::new(0f32, 1.0).unwrap();
+    let alpha: Vec<f32> = (0..K * H).map(|_| normal.sample(&mut rng)).collect();
+    let dirichlet = Dirichlet::new(&[0.3f32; K]).unwrap();
+    let mut cells = Vec::with_capacity(N_CELLS * H);
+    for _ in 0..N_CELLS {
+        let theta: Vec<f32> = dirichlet.sample(&mut rng);
+        cells.extend((0..H).map(|j| (0..K).map(|k| theta[k] * alpha[k * H + j]).sum::<f32>()));
+    }
+    let feats: Vec<f32> = (0..N_FEATS * H).map(|_| normal.sample(&mut rng)).collect();
+    to_tensors(cells, feats)
+}
+
+/// A healthy co-embedding of a topic-mixture cloud passes, on every seed. Its features sit
+/// inward of the cells (the cloud is sparse in its interior); that is the geometry, and the
+/// contract does not judge it.
+#[test]
+fn a_topic_mixture_cloud_stays_on_the_manifold() {
+    for seed in 0..6 {
+        let (cells, feats) = topic_mixture_cloud(seed);
+        assert_placed(&cells, &feats, &format!("seed {seed}"));
+    }
+}
+
+/// A single healthy gene, checked on its own, passes: the contract does not hinge on
+/// quantiles of a handful of features.
+#[test]
+fn a_single_healthy_feature_passes() {
+    let (cells, feats) = heavy_tailed_cloud(0);
+    let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    for g in 0..co.dim(0).unwrap() {
+        let one = co.narrow(0, g, 1).unwrap();
+        let got = placement(&cells, &one);
+        assert!(
+            got.on_manifold(),
+            "feature {g} alone: {got}: {:?}",
+            got.violations()
+        );
+    }
+}
+
+/// Fewer cells than a nearest-cell neighbourhood: the nearest-cell statistics are degenerate,
+/// so they are not measured, and the verdict rests on the unambiguous clauses alone.
+#[test]
+fn a_tiny_cloud_is_judged_without_nearest_cells() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let normal = Normal::new(0f32, 1.0).unwrap();
+    for trial in 0..25 {
+        let n = 5 + trial % 25;
+        let cells: Vec<f32> = (0..n * H).map(|_| normal.sample(&mut rng)).collect();
+        let feats: Vec<f32> = (0..40 * H).map(|_| 0.3 * normal.sample(&mut rng)).collect();
+        let cells = Tensor::from_vec(cells, (n, H), &Device::Cpu).unwrap();
+        let feats = Tensor::from_vec(feats, (40, H), &Device::Cpu).unwrap();
+        let got = placement(&cells, &feats);
+        assert!(got.nearest.is_none(), "trial {trial} ({n} cells): {got}");
+        assert!(
+            got.on_manifold(),
+            "trial {trial} ({n} cells): {got}: {:?}",
+            got.violations()
+        );
+    }
+}
+
+/// Where the origin sits is a coordinate choice, not a property of the cells: translating
+/// a topic-mixture cloud must translate its co-embedding by the same vector and leave `T`
+/// alone. Directions taken from the origin break this — the further the cloud sits from it,
+/// the more the scores track each cell's norm.
+#[test]
+fn the_coembedding_moves_with_a_topic_mixture_cloud() {
+    for seed in 0..3 {
+        let (cells, feats) = topic_mixture_cloud(seed);
+        let shift = Tensor::from_vec(vec![3f32; H], (1, H), &Device::Cpu).unwrap();
+        let moved = cells.broadcast_add(&shift).unwrap();
+        let (co, t) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+        let (co_moved, t_moved) = feature_coembedding(&moved, &feats, 40.0).unwrap();
+        let gap = co
+            .broadcast_add(&shift)
+            .unwrap()
+            .sub(&co_moved)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            (t - t_moved).abs() < 1e-3 * t && gap < 1e-3,
+            "seed {seed}: translating the cells by 3·1 moved T {t} → {t_moved} and left the \
+             co-embedding off by {gap}"
+        );
+    }
+}
+
+/// The placement diagnostic only reports. Cells it cannot measure (here, all identical)
+/// must not fail the write that the co-embedding itself completed.
+#[test]
+fn an_unmeasurable_placement_does_not_fail_the_write() {
+    let dir = std::env::temp_dir().join(format!("coembed-write-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("run");
+    let cells = Tensor::ones((40, H), DType::F32, &Device::Cpu).unwrap();
+    let (_, feats) = fixture(3);
+    let names: Vec<Box<str>> = (0..3).map(|i| format!("g{i}").into()).collect();
+    let res = crate::write_feature_coembedding(out.to_str().unwrap(), &cells, &feats, &names, 20.0);
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(res.is_ok(), "the write failed on the diagnostic: {res:?}");
+}
+
+/// A cell exactly at the cloud centre has no direction; its key must be the floor's zero,
+/// not 0/0. Integer-valued `±` pairs plus a zero row put the centre exactly at the origin.
+#[test]
+fn a_cell_at_the_centre_stays_finite() {
+    let half: Vec<f32> = (0..64 * H).map(|i| ((i * 7) % 11) as f32 - 5.0).collect();
+    let half = Tensor::from_vec(half, (64, H), &Device::Cpu).unwrap();
+    let zero = Tensor::zeros((1, H), DType::F32, &Device::Cpu).unwrap();
+    let cells = Tensor::cat(&[&half, &half.neg().unwrap(), &zero], 0).unwrap();
+    let centre: Vec<f32> = cells.mean(0).unwrap().to_vec1().unwrap();
+    assert!(
+        centre.iter().all(|&c| c == 0.0),
+        "fixture centre {centre:?}"
+    );
+    let (_, feats) = fixture(8);
+    let (co, _) = feature_coembedding(&cells, &feats, 20.0).unwrap();
+    assert!(all_finite(&co));
+}
+
+/// The diagnostic reads whatever float type the co-embedding was written in.
+#[test]
+fn placement_reads_non_f32_tensors() {
+    let (cells, feats) = heavy_tailed_cloud(0);
+    let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+    let as64 = |t: &Tensor| t.to_dtype(DType::F64).unwrap();
+    assert!(coembed_placement_of_tensors(&as64(&cells), &as64(&co)).is_ok());
 }
 
 /// The clamp that keeps a big-cluster dataset off the far tail of the curve,

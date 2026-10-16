@@ -100,3 +100,17 @@ fn a_cloud_with_no_radius_is_declined_rather_than_dividing_by_zero() {
     assert_eq!(zero_hub_parked(&mut beta, &one, 3, H), 0);
     assert!(beta.iter().all(|&x| x == 1.0), "must not touch the rows");
 }
+
+/// Cells so large their distances overflow give an infinite radius. There is no usable cloud
+/// to call a hub against, so nothing is zeroed — not every row.
+#[test]
+fn an_infinite_radius_zeroes_nothing() {
+    let huge = DMatrix::from_fn(
+        10,
+        H,
+        |i, j| if j == 0 { (i as f32 - 4.5) * 1e20 } else { 0.0 },
+    );
+    let mut beta = vec![1f32; 3 * H];
+    assert_eq!(zero_hub_parked(&mut beta, &huge, 3, H), 0);
+    assert!(beta.iter().all(|&x| x == 1.0));
+}

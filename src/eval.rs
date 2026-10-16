@@ -10,7 +10,7 @@
 use crate::model::JointEmbedModel;
 use legume_numeric::candle::candle_core::Tensor;
 use legume_numeric::matrix::traits::IoOps;
-use log::info;
+use log::{info, warn};
 
 /// File stems for the two embedding tables.
 ///
@@ -239,5 +239,18 @@ pub fn write_feature_coembedding(
     info!(
         "Feature co-embedding (SIMBA-style, T={t:.4}) → {out_prefix}.feature_coembedding.parquet"
     );
+
+    // The check only reports: a co-embedding it cannot measure is still written.
+    match crate::postprocess::coembed_placement_of_tensors(e_cell, &coembed) {
+        Ok(p) => {
+            let why: Vec<String> = p.violations().iter().map(ToString::to_string).collect();
+            if why.is_empty() {
+                info!("co-embedding placement: {p}");
+            } else {
+                warn!("co-embedding placement: {p} — {}", why.join("; "));
+            }
+        }
+        Err(e) => warn!("co-embedding placement could not be measured: {e}"),
+    }
     Ok(())
 }
