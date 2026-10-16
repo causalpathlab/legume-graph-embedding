@@ -292,8 +292,28 @@ fn panel_coverage_counts_live_markers() {
     ];
     let space = space_with_dead_rows(10);
     // 9 of 10 markers are live.
-    assert!(read_panel(&space, "coverage_ok", panel, 0.9).is_ok());
-    assert!(read_panel(&space, "coverage_low", panel, 0.95).is_err());
+    assert!(read_panel(&space, "coverage_ok", panel, 0.85).is_ok());
+    let err = read_panel(&space, "coverage_low", panel, 0.95).unwrap_err();
+    assert!(format!("{err:#}").contains("coverage"), "{err:#}");
+}
+
+/// A NaN or infinite input is an error where it enters, not a silent "every row is dead"
+/// that surfaces later as a panel or coverage failure.
+#[test]
+fn non_finite_input_is_an_error() {
+    let f = fixture(11);
+    let mut z = f.z.clone();
+    z[(4, 1)] = f64::NAN;
+    assert!(cell_covariance(&z).is_err());
+    assert!(balanced_centre(&z, &f.groups).is_err());
+
+    let cov = cell_covariance(&f.z).unwrap();
+    let mut bad_cov = cov.clone();
+    bad_cov[(0, 0)] = f64::NAN;
+    assert!(FeatureSpace::new(&f.rho, &bad_cov, &f.genes).is_err());
+    let mut rho = f.rho.clone();
+    rho[(3, 2)] = f64::INFINITY;
+    assert!(FeatureSpace::new(&rho, &cov, &f.genes).is_err());
 }
 
 /// A centre from another embedding (wrong length) is a caller error, not a silent shift.
