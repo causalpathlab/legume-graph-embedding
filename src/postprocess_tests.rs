@@ -340,6 +340,21 @@ fn the_coembedding_moves_with_a_topic_mixture_cloud() {
     }
 }
 
+/// The placement diagnostic only reports. Cells it cannot measure (here, all identical)
+/// must not fail the write that the co-embedding itself completed.
+#[test]
+fn an_unmeasurable_placement_does_not_fail_the_write() {
+    let dir = std::env::temp_dir().join(format!("coembed-write-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("run");
+    let cells = Tensor::ones((40, H), DType::F32, &Device::Cpu).unwrap();
+    let (_, feats) = fixture(3);
+    let names: Vec<Box<str>> = (0..3).map(|i| format!("g{i}").into()).collect();
+    let res = crate::write_feature_coembedding(out.to_str().unwrap(), &cells, &feats, &names, 20.0);
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(res.is_ok(), "the write failed on the diagnostic: {res:?}");
+}
+
 /// The clamp that keeps a big-cluster dataset off the far tail of the curve,
 /// where the barycentre collapses toward the global centroid.
 #[test]

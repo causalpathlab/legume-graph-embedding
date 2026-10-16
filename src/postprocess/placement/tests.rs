@@ -31,6 +31,9 @@ fn nan_features_are_not_on_the_manifold() {
         got.beyond_p99 >= 0.1,
         "a NaN row must count as off the cloud, got {got}"
     );
+    // One diverged row in ten is under the beyond_p99 bar, but a co-embedding with any
+    // non-finite row is not placed — it is broken.
+    assert!(!got.on_manifold(), "one NaN row in ten passed: {got}");
 }
 
 /// Identical cells have no cloud to measure against; zero-width rows have no space.
