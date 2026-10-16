@@ -289,6 +289,52 @@ fn a_cloud_off_the_origin_stays_on_the_manifold() {
     }
 }
 
+/// An elongated Gaussian cloud (one axis 6× the others) with no cluster structure.
+fn elongated_cloud(seed: u64) -> (Tensor, Tensor) {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, Normal, Uniform};
+    let mut rng = StdRng::seed_from_u64(seed);
+    let normal = Normal::new(0f32, 1.0).unwrap();
+    let cells: Vec<f32> = (0..N_CELLS * H)
+        .map(|i| normal.sample(&mut rng) * if i % H == 0 { 6.0 } else { 1.0 })
+        .collect();
+    let scale = Uniform::new(0.1f32, 3.0).unwrap();
+    let mut feats = Vec::with_capacity(N_FEATS * H);
+    for _ in 0..N_FEATS {
+        let s = scale.sample(&mut rng);
+        feats.extend((0..H).map(|_| s * normal.sample(&mut rng)));
+    }
+    to_tensors(cells, feats)
+}
+
+/// A co-embedded gene is an average of cells, so it sits somewhat inward of single cells;
+/// on an elongated cloud that puts the genes' nearest cells well below the 50th norm
+/// percentile without any bias. The contract must judge placement against how the cells'
+/// own local averages sit, not against a fixed 50.
+#[test]
+fn an_elongated_cloud_stays_on_the_manifold() {
+    for seed in 0..2 {
+        let (cells, feats) = elongated_cloud(seed);
+        let (co, _) = feature_coembedding(&cells, &feats, 40.0).unwrap();
+        let got = placement(&cells, &co);
+        assert!(
+            got.on_manifold(),
+            "seed {seed}: features must sit on the manifold ({}), got {got}",
+            CoembedPlacement::contract()
+        );
+    }
+}
+
+/// SIMBA's fixed-T path at a high temperature collapses every gene to the hub: it must fail.
+#[test]
+fn a_hub_collapse_is_not_on_the_manifold() {
+    let (cells, feats) = heavy_tailed_cloud(0);
+    let co = feature_coembedding_fixed_t(&cells, &feats, 1e3).unwrap();
+    let got = placement(&cells, &co);
+    assert!(!got.on_manifold(), "a hub collapse passed: {got}");
+}
+
 /// A topic-mixture cloud, `Z = θ·α` with `θ` on the simplex (Dirichlet) and `α` a `K × H`
 /// dictionary — off the origin by construction, as `senna rest` writes it.
 fn topic_mixture_cloud(seed: u64) -> (Tensor, Tensor) {
