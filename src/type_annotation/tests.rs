@@ -145,6 +145,7 @@ fn layout_produces_finite_separated_coords() {
         knn: 10,
         ..AnnotateProjConfig::default()
     };
+    #[allow(deprecated)]
     let res = annotate_by_projection(
         &ProjInputs {
             feature_emb: &feat,

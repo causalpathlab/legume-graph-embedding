@@ -60,6 +60,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 mod coarsen;
 mod consensus;
+pub mod embedding_score;
 mod gene_strata;
 mod hub_call;
 mod layout;
@@ -337,6 +338,10 @@ pub struct AnnotateProjOutputs {
 /// PHATE per cell) and `{out_prefix}.feature_coords.parquet` (full features and
 /// type/coarse anchors placed on both layouts by Nyström-projecting their
 /// co-embed positions through the cell layout).
+#[deprecated(
+    note = "the soft cosine path; score markers with `type_annotation::embedding_score`, or \
+            call types with `annotate_embeddings_ora`"
+)]
 pub fn annotate_embeddings(
     input: &InputEmbeddings<'_>,
     markers_path: &str,
@@ -392,6 +397,7 @@ pub fn annotate_embeddings(
 
     let beta_flat = row_major(feature_emb);
     let cell_flat = row_major(cell_emb);
+    #[allow(deprecated)]
     let res = annotate_by_projection(
         &ProjInputs {
             feature_emb: &beta_flat,
@@ -443,6 +449,10 @@ pub fn annotate_embeddings(
 /// Annotate cells against marker-defined types by signature projection.
 /// The cell embedding is defensively re-normalized here, so an un-normalized
 /// input still works.
+#[deprecated(
+    note = "the soft cosine path, called only by `annotate_embeddings`; score markers with \
+            `type_annotation::embedding_score`"
+)]
 pub fn annotate_by_projection(
     inp: &ProjInputs<'_>,
     cfg: &AnnotateProjConfig,
