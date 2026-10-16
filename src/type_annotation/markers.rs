@@ -312,14 +312,30 @@ fn report_panel_coverage(
     Ok(())
 }
 
-/// Parse a marker TSV/CSV into `(gene, celltype)` pairs through the shared
-/// membership reader (header and `#` rows skipped), mapping spaces in
-/// cell-type names → `_`.
+/// Parse a marker TSV/CSV into `(gene, celltype)` pairs (the first two fields; blank, `#`
+/// and `gene`/`symbol` header rows skipped), mapping spaces in cell-type names → `_`.
+///
+/// A line with a tab splits on the tab only, so a label keeps its commas (a Cell Ontology
+/// name such as `CD4-positive, alpha-beta T cell`); a line with no tab is CSV.
 pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
-    let out: Vec<(Box<str>, Box<str>)> = data_beans::aux::gene_sets::read_membership_pairs(path)
+    use legume_numeric::matrix::common_io::{read_lines_of_words_generic, unquote_field};
+    let split = |line: &str| -> Vec<Box<str>> {
+        let delim = if line.contains('\t') { '\t' } else { ',' };
+        line.split(delim)
+            .map(|x| Box::from(unquote_field(x)))
+            .collect()
+    };
+    let out: Vec<(Box<str>, Box<str>)> = read_lines_of_words_generic(path, -1, split, split)
         .with_context(|| format!("reading markers {path}"))?
+        .lines
         .into_iter()
-        .map(|(gene, ct)| (gene, Box::from(ct.replace(' ', "_"))))
+        .filter_map(|words| {
+            let gene = words.first()?;
+            let label = words.get(1)?;
+            let gl = gene.to_lowercase();
+            (!gene.is_empty() && !label.is_empty() && gl != "gene" && gl != "symbol")
+                .then(|| (gene.clone(), Box::from(label.replace(' ', "_"))))
+        })
         .collect();
     anyhow::ensure!(!out.is_empty(), "no marker pairs parsed from {path}");
     Ok(out)
