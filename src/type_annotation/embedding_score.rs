@@ -45,7 +45,9 @@
 //! (the one behind [`parse_and_match_markers`](super::parse_and_match_markers)). Weights are
 //! IDF, `ln(C / #types holding the gene)`, where `C` counts every panel type. IDF-0 genes are
 //! dropped, and so is a type left with fewer than [`MIN_MARKERS`] live markers (dead rows,
-//! below, leave after the weights are set).
+//! below, leave after the weights are set, and do not count as panel coverage). Fewer than
+//! two surviving types is an error naming the types lost: a call needs a rival, and a
+//! one-type panel has none (every gene is IDF 0).
 //!
 //! [`calls`] gives each cell its best **live** type, one whose direction is not the zero
 //! row, and the margin over the runner-up. There is no null and no abstention: a call is the
@@ -71,6 +73,9 @@ use std::collections::BTreeMap;
 
 /// A type left with fewer live markers than this (after matching and IDF) is dropped.
 pub const MIN_MARKERS: usize = 3;
+
+/// Fewer surviving types than this is an error: a call needs a rival.
+const MIN_TYPES: usize = 2;
 
 /// One type's markers: `(feature index, weight)`.
 pub type WeightedSet = Vec<(u32, f64)>;
@@ -130,13 +135,15 @@ impl FeatureSpace {
         &self.gene_names
     }
 
-    /// Read a `gene<TAB>celltype` panel and match it to this space's genes.
+    /// Read a `gene<TAB>celltype` panel and match it to this space's genes. Fewer than two
+    /// surviving types is an error.
     pub fn marker_sets(&self, markers_path: &str, min_coverage: f32) -> Result<PanelSets> {
         let (type_names, sets) = parse_and_match_idf_sets(
             markers_path,
             &self.gene_names,
             min_coverage,
             MIN_MARKERS,
+            MIN_TYPES,
             |g| self.sigma[g as usize] > 0.0,
         )?;
         Ok(PanelSets { type_names, sets })

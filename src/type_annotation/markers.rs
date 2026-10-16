@@ -35,7 +35,7 @@ pub fn parse_and_match_markers(
     use_idf: bool,
     min_coverage: f32,
 ) -> Result<(Vec<Box<str>>, MarkerSets)> {
-    let panel = match_panel(markers_path, gene_names, min_coverage)?;
+    let panel = match_panel(markers_path, gene_names, min_coverage, |_| true)?;
     let c = panel.type_names.len();
     let use_idf = use_idf && c >= 2;
     let type_markers = panel.weigh(|df| {
@@ -46,28 +46,30 @@ pub fn parse_and_match_markers(
             Some(1.0)
         }
     });
-    drop_thin_types(&panel.type_names, type_markers, 1)
+    drop_thin_types(&panel.type_names, type_markers, 1, 1)
 }
 
 /// [`parse_and_match_markers`]'s matching and IDF, weighted in `f64` and with each set sorted
 /// by gene index: `ln(C / df_gene)` over every panel type `C`, IDF-0 genes dropped. Genes
-/// that are not `live` leave after weighting, so they still count in `df` and `C`; a type
-/// left with fewer than `min_markers` live markers is then dropped.
+/// that are not `live` leave after weighting, so they still count in `df` and `C`, and do not
+/// count toward `min_coverage`. A type left with fewer than `min_markers` live markers is then
+/// dropped, and fewer than `min_types` surviving types is an error.
 pub(super) fn parse_and_match_idf_sets(
     markers_path: &str,
     gene_names: &[Box<str>],
     min_coverage: f32,
     min_markers: usize,
+    min_types: usize,
     live: impl Fn(u32) -> bool,
 ) -> Result<TypedSets<f64>> {
-    let panel = match_panel(markers_path, gene_names, min_coverage)?;
+    let panel = match_panel(markers_path, gene_names, min_coverage, &live)?;
     let c = panel.type_names.len() as f64;
     let mut sets = panel.weigh(|df| Some((c / df as f64).ln()).filter(|&w| w > 0.0));
     for set in &mut sets {
         set.retain(|&(gi, _)| live(gi));
         set.sort_unstable_by_key(|&(gi, _)| gi);
     }
-    drop_thin_types(&panel.type_names, sets, min_markers)
+    drop_thin_types(&panel.type_names, sets, min_markers, min_types)
 }
 
 /// A marker panel matched to a feature axis, before weighting.
@@ -95,10 +97,12 @@ impl MatchedPanel {
     }
 }
 
+/// Match the panel and report its coverage, counting only the `live` matches as covered.
 fn match_panel(
     markers_path: &str,
     gene_names: &[Box<str>],
     min_coverage: f32,
+    live: impl Fn(u32) -> bool,
 ) -> Result<MatchedPanel> {
     let pairs = read_marker_tsv(markers_path)?;
 
@@ -144,7 +148,11 @@ fn match_panel(
     if unmatched > 0 {
         info!("{unmatched} marker pairs had no matching gene (dropped)");
     }
-    report_panel_coverage(&type_names, &requested, &membership, min_coverage)?;
+    let hits: Vec<usize> = membership
+        .iter()
+        .map(|genes| genes.iter().filter(|&&gi| live(gi)).count())
+        .collect();
+    report_panel_coverage(&type_names, &requested, &hits, min_coverage)?;
 
     // IDF: df_gene = #types containing the gene.
     let mut df: FxHashMap<u32, usize> = FxHashMap::default();
@@ -168,40 +176,37 @@ fn drop_thin_types<W>(
     type_names: &[Box<str>],
     sets: Vec<Vec<(u32, W)>>,
     min_markers: usize,
+    min_types: usize,
 ) -> Result<TypedSets<W>> {
     let c = type_names.len();
     let min_markers = min_markers.max(1);
-    let (kept_names, kept_sets): (Vec<Box<str>>, Vec<_>) = type_names
+    let (kept, lost): (Vec<_>, Vec<_>) = type_names
         .iter()
         .zip(sets)
-        .filter(|(_, m)| m.len() >= min_markers)
-        .map(|(n, m)| (n.clone(), m))
-        .unzip();
-    if kept_names.len() < c {
-        let dropped: Vec<&str> = type_names
-            .iter()
-            .filter(|n| !kept_names.contains(n))
-            .map(std::convert::AsRef::as_ref)
-            .collect();
+        .partition(|(_, m)| m.len() >= min_markers);
+    let lost: Vec<&str> = lost.iter().map(|(n, _)| n.as_ref()).collect();
+    if !lost.is_empty() {
         warn!(
-            "{} of {c} marker type(s) kept fewer than {} marker gene(s) in the embedding and \
-             were DROPPED: {}. Their cells will be assigned among the remaining types. If you \
-             need them, widen the feature axis (raise `--n-hvg`) or force the panel into \
-             training with `--must-train-features <the marker file>`.",
-            dropped.len(),
-            min_markers,
-            dropped.join(", ")
+            "{} of {c} marker type(s) kept fewer than {min_markers} marker gene(s) in the \
+             embedding and were DROPPED: {}. Their cells will be assigned among the remaining \
+             types. If you need them, widen the feature axis (raise `--n-hvg`) or force the \
+             panel into training with `--must-train-features <the marker file>`.",
+            lost.len(),
+            lost.join(", ")
         );
     }
     anyhow::ensure!(
-        !kept_names.is_empty(),
-        "no marker type kept {min_markers} or more usable marker gene(s) in the embedding. A \
-         marker must match a row name, must not be held by every type (IDF 0, so a one-type \
-         panel has none), and must be live — check the marker file's gene naming against the \
-         dictionary's row names"
+        kept.len() >= min_types.max(1),
+        "{} marker type(s) kept {min_markers} or more usable marker gene(s) in the embedding; \
+         {} needed. Lost: {}. A marker must match a row name, must not be held by every type \
+         (IDF 0, so a one-type panel has none), and must be live — check the marker file's \
+         gene naming against the dictionary's row names",
+        kept.len(),
+        min_types.max(1),
+        lost.join(", ")
     );
 
-    Ok((kept_names, kept_sets))
+    Ok(kept.into_iter().map(|(n, m)| (n.clone(), m)).unzip())
 }
 
 /// Coverage below which a panel is reported as degraded rather than merely noted. Shared with
@@ -230,12 +235,12 @@ const MAX_LISTED: usize = 10;
 fn report_panel_coverage(
     type_names: &[Box<str>],
     requested: &[FxHashSet<&str>],
-    membership: &[FxHashSet<u32>],
+    hits: &[usize],
     min_coverage: f32,
 ) -> Result<()> {
     let (n_req, n_hit): (usize, usize) = (
         requested.iter().map(FxHashSet::len).sum(),
-        membership.iter().map(FxHashSet::len).sum(),
+        hits.iter().sum(),
     );
     if n_req == 0 {
         return Ok(());
@@ -247,7 +252,7 @@ fn report_panel_coverage(
     let mut thin: Vec<(f32, &str, usize, usize)> = (0..type_names.len())
         .filter(|&i| !requested[i].is_empty())
         .map(|i| {
-            let (hit, req) = (membership[i].len(), requested[i].len());
+            let (hit, req) = (hits[i], requested[i].len());
             (hit as f32 / req as f32, type_names[i].as_ref(), hit, req)
         })
         .filter(|&(cov, ..)| cov < WARN_COVERAGE)
