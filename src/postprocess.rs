@@ -8,6 +8,11 @@
 //! land on the cell manifold. Nothing in training changes — the pseudobulk
 //! efficiency and the phase-2 per-cell projection are untouched.
 //!
+//! **The goal is to place a gene by direction, not magnitude**: beside the cells
+//! whose embedding points the way the gene's does, inside the cell cloud, and
+//! regardless of how long those cells' rows happen to be. [`coembed_placement`]
+//! measures exactly that, and `write_feature_coembedding` logs it on every write.
+//!
 //! ```text
 //!   ê_cell   = e_cell / ‖e_cell‖ (per row)         [N, H]   (per-CELL unit norm)
 //!   S        = ê_cell · e_featᵀ                   [N, D]
@@ -16,7 +21,7 @@
 //!   coembed  = Pᵀ · e_cell                         [D, H]   (gene = wtd avg of RAW cells)
 //! ```
 //!
-//! The two rescales fix the two axes of `S` separately — see [`ScoreKeys`].
+//! The two rescales fix the two axes of `S` separately — see `ScoreKeys`.
 //! The per-feature one is what makes a single `T` well-defined. `‖e_f‖` spans
 //! ~38× across genes, so on RAW scores one `T` saturates the long genes onto one
 //! cell and leaves the short ones spread over all of them — see
@@ -26,12 +31,12 @@
 //!
 //! The softmax temperature `T` is auto-calibrated (no user knob): bisected so
 //! the mean effective number of cells per gene (`1 / Σ_c P²`) equals the median
-//! cell-cluster size, clamped to `[MIN_TARGET_EFF, MAX_TARGET_EFF]`. The clamp is
-//! load-bearing, not defensive: an unclamped "one cluster's worth of cells" is
-//! ~600 here and scores WORSE than no calibration at all, because averaging that
-//! many cell rows pulls the barycentre to the global centroid. The cluster size
-//! comes from [`cell_clusters`], which the bge driver runs ONCE and shares with
-//! ETM resolution. Cells are the reference and are not moved.
+//! cell-cluster size, clamped to `[MIN_TARGET_EFF, MAX_TARGET_EFF]`. The upper
+//! clamp is load-bearing, not defensive: a gene averaged over a whole cluster's
+//! worth of cells is pulled toward the global centroid and stops pointing
+//! anywhere — see `MAX_TARGET_EFF`. The cluster size comes from
+//! [`cell_clusters`], which the bge driver runs ONCE and shares with ETM
+//! resolution. Cells are the reference and are not moved.
 //!
 //! Biases are absent by design — `b_f` cancels in the softmax, `b_c` is a
 //! shared per-cell depth offset that would drag every gene toward deep cells.
@@ -62,36 +67,36 @@ const MIN_TARGET_EFF: f64 = 20.0;
 ///
 /// A gene attending to a WHOLE cluster is past the useful point: averaging that
 /// many cell rows shrinks the barycentre toward the global centroid and the
-/// coordinate stops tracking the gene's own top cells.
+/// coordinate stops pointing at the gene's own cells.
 ///
 /// Numbers below are in the SAME units [`eff_from_scores`] reports — the MEAN
 /// over features of inverse-Simpson `1/Σ_c p²` — because that is what the
-/// bisection actually drives. (An earlier revision of this comment quoted median
-/// `exp(entropy)` instead, which is ~8× smaller here and made the constant look
-/// mis-set.) Measured on a 12k-cell dataset (`H=16`), recall of the model's own top-100
-/// cells against the gene-specific score `⟨e_f, e_c⟩`:
+/// bisection actually drives. Measured on direction scores ([`ScoreKeys`]) on three
+/// real runs, against the placement contract ([`coembed_placement`]: `nn_norm_pct`
+/// → 50, `beyond_p99` → 0) and `top30_cos`, the share of a gene's 30 nearest cells
+/// that are among its 30 best cells by `cos(e_f, e_cell)`:
 ///
-/// | mean eff | 16 | 49 | 178 | 488 | 1045 |
+/// | run (cells) | target | nn_norm_pct | dist_pct | beyond_p99 | top30_cos |
 /// |---|---|---|---|---|---|
-/// | recall@100 | 0.468 | 0.464 | 0.436 | 0.385 | 0.315 |
+/// | pancreas (3.7k) | 20 / 50 / 100 / 200 | 50.7 / 49.2 / 46.6 / 41.6 | 60 / 53 / 42 / 25 | ≤ 0.017 | 0.53 / 0.51 / 0.47 / 0.39 |
+/// | dentate gyrus (2.9k) | 20 / 50 / 100 / 200 | 76.0 / 77.2 / 78.3 / 79.4 | 85 / 87 / 88 / 89 | ≤ 0.004 | 0.49 / 0.46 / 0.42 / 0.34 |
+/// | bone marrow (263k) | 20 / 50 / 100 / 200 | 42.9 / 43.0 / 43.1 / 43.0 | 44 / 44 / 44 / 43 | 0.12 / 0.11 / 0.11 / 0.10 | 0.27 / 0.27 / 0.27 / 0.27 |
 ///
-/// The old behaviour (median cluster size, ~600 cells) sat at ~0.37, below the
-/// 0.366 the uncalibrated path already achieved. 100 lands at ~0.45: off the peak
-/// on purpose, since tuning to the ~20 that maximizes recall would be fitting a
-/// proxy that structurally rewards near-hard assignment (a gene parked on its top
-/// cell inherits that cell's neighbours).
+/// On the small runs a smaller target places genes better by direction, and on
+/// the large one the target barely matters. 50 is the smallest value that keeps
+/// pancreas centred (`dist_pct` 53 — at 20 genes start to drift outward, 60) while
+/// taking most of the `top30_cos` gain over 100.
 ///
-/// REPLICATED over 25 fits spanning 3 datasets (6270 / 12602 / 42826 cells) and
-/// `H` ∈ {8, 16}: the per-fit optimum is median 22, range 7–61, and 100 captures
-/// **97.2%** of each fit's achievable optimum (worst 94.1%) against **74.0%**
-/// (worst 50.5%) for the old ~600 target. 100 beat 600 on 25/25.
+/// An earlier revision set 100 from recall of the top cells by the raw dot
+/// `⟨e_f, e_cell⟩`. On raw-cell scores that metric rewarded the near-hard placement
+/// of a gene on the longest cells, which is the bias [`ScoreKeys`] removes; once
+/// genes are placed by direction it drops by design (top-30 by dot 0.33–0.55 →
+/// 0.02–0.30 on the runs above) and no longer measures the goal.
 ///
-/// Why a CONSTANT and not a fraction of `n`: the optimum does not track cell
-/// count — median optimum was 29 at N=6270, 21 at N=12602, 42 at N=42826. A gene
-/// attends to a fixed-size neighbourhood, not a fixed share of the dataset, so
-/// scaling this with `n` would be wrong in the large-`n` limit exactly where the
-/// old cluster-size target already failed.
-const MAX_TARGET_EFF: f64 = 100.0;
+/// Why a CONSTANT and not a fraction of `n`: a gene attends to a fixed-size
+/// neighbourhood, not a fixed share of the dataset — on the 263k-cell run the
+/// placement is flat across the whole range, so scaling with `n` buys nothing.
+const MAX_TARGET_EFF: f64 = 50.0;
 /// Floor on a feature's score SD, so a zero-embedding feature (constant score
 /// column) divides by a positive number instead of producing `NaN`.
 const SD_FLOOR: f64 = 1e-6;
