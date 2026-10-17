@@ -460,6 +460,6 @@ fn label_files_reject_invalid_utf8() {
     let map = super::markers::read_label_map(&path_in(&dir, "label_cl.tsv"));
     let _ = std::fs::remove_dir_all(&dir);
     for err in [panel.map(drop).unwrap_err(), map.map(drop).unwrap_err()] {
-        assert!(format!("{err:#}").contains("line 2"), "{err:#}");
+        assert!(format!("{err:#}").contains("line 2:"), "{err:#}");
     }
 }

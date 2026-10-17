@@ -340,21 +340,29 @@ fn type_key(label: &str) -> Box<str> {
 }
 
 /// The first two cells of every row of a two-column label file (gz-aware), split by
-/// [`split_tab_first`]. Rows with an empty or missing first or second cell and comment rows (a
-/// first cell starting with `#` or `%`, indented or quoted) are skipped; a line that is not
-/// UTF-8 is an error naming the line.
+/// [`split_tab_first`]. Comment rows (a first cell starting with `#` or `%`, indented or
+/// quoted) are skipped; so are rows with an empty or missing first or second cell, with a
+/// warning counting them. A line that cannot be read (not UTF-8, a corrupt gz) is an error
+/// naming the line.
 fn read_two_field_rows(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
     use std::io::BufRead;
     let mut rows = Vec::new();
+    let mut gapped = 0usize;
     let reader = legume_numeric::matrix::common_io::open_buf_reader(path)?;
     for (i, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("line {} is not UTF-8 text", i + 1))?;
-        let mut cells = split_tab_first(&line).into_iter();
-        if let (Some(first), Some(second)) = (cells.next(), cells.next()) {
-            if !first.is_empty() && !second.is_empty() && !first.starts_with(['#', '%']) {
-                rows.push((Box::from(first), Box::from(second)));
+        let line = line.with_context(|| format!("line {}", i + 1))?;
+        let cells = split_tab_first(&line);
+        match cells.as_slice() {
+            [] | [""] => {}
+            [first, ..] if first.starts_with(['#', '%']) => {}
+            [first, second, ..] if !first.is_empty() && !second.is_empty() => {
+                rows.push((Box::from(*first), Box::from(*second)));
             }
+            _ => gapped += 1,
         }
+    }
+    if gapped > 0 {
+        log::warn!("{path}: skipped {gapped} row(s) with an empty or missing first or second cell");
     }
     Ok(rows)
 }
