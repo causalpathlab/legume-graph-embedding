@@ -315,3 +315,151 @@ fn all_marker_types_unmatched_is_an_error() {
     .is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Write `files` into a fresh temp directory for one test; returns it, and the caller removes
+/// it.
+fn label_files(tag: &str, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("geu_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, bytes) in files {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    dir
+}
+
+fn path_in(dir: &std::path::Path, name: &str) -> String {
+    dir.join(name).to_str().unwrap().to_owned()
+}
+
+// Tab lines split on the tab only, so Cell Ontology labels keep their commas; tab-less lines
+// stay CSV.
+#[test]
+fn marker_reader_keeps_commas_in_tab_separated_labels() {
+    let dir = label_files(
+        "marker_tab_split",
+        &[(
+            "markers.tsv",
+            b"gene\tcell_type\n\
+              CD4\tCD4-positive, alpha-beta T cell\n\
+              CD8A\tCD8-positive, alpha-beta T cell\n\
+              MS4A1,B cell\n\
+              \"CD79A\",\"B cell\"\n",
+        )],
+    );
+    let pairs = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let expected: Vec<(Box<str>, Box<str>)> = [
+        ("CD4", "CD4-positive,_alpha-beta_T_cell"),
+        ("CD8A", "CD8-positive,_alpha-beta_T_cell"),
+        ("MS4A1", "B_cell"),
+        ("CD79A", "B_cell"),
+    ]
+    .iter()
+    .map(|&(g, t)| (Box::from(g), Box::from(t)))
+    .collect();
+    assert_eq!(pairs.unwrap(), expected);
+}
+
+// An indented or quoted comment line is not a marker pair.
+#[test]
+fn marker_reader_skips_indented_comments() {
+    let dir = label_files(
+        "marker_comment",
+        &[(
+            "markers.tsv",
+            b"  # source: a panel, 2019\n\"# note\"\tx\nCD4\tT cell\nCD8A\tT cell\n",
+        )],
+    );
+    let pairs = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let types: Vec<Box<str>> = pairs.unwrap().into_iter().map(|(_, t)| t).collect();
+    assert_eq!(types, names(&["T_cell", "T_cell"]));
+}
+
+// The label→CL map is keyed like the panel's type names, so a comma-bearing Cell Ontology
+// label written the same way in both files meets.
+#[test]
+fn label_map_keys_match_panel_type_names() {
+    let dir = label_files(
+        "label_map",
+        &[
+            (
+                "markers.tsv",
+                b"CD4\tCD4-positive, alpha-beta T cell\nMS4A1\tB cell\n",
+            ),
+            (
+                "label_cl.tsv",
+                b"label\tid\nCD4-positive, alpha-beta T cell\tCL:0000624\nB cell\tCL:0000236\n",
+            ),
+        ],
+    );
+    let pairs = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
+    let label_to_id = super::markers::read_label_map(&path_in(&dir, "label_cl.tsv"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let label_to_id = label_to_id.unwrap();
+    let ids: Vec<Option<&str>> = pairs
+        .unwrap()
+        .iter()
+        .map(|(_, t)| label_to_id.get(t).map(AsRef::as_ref))
+        .collect();
+    assert_eq!(
+        ids,
+        [Some("CL:0000624"), Some("CL:0000236")],
+        "{label_to_id:?}"
+    );
+}
+
+// Cells keep their columns: a row with an empty gene or type cell is skipped, never filled
+// from the next column, and a leading tab still makes the line tab-separated. A trailing tab
+// on a CSV row does not.
+#[test]
+fn label_files_keep_columns_in_place() {
+    let dir = label_files(
+        "label_columns",
+        &[
+            (
+                "markers.tsv",
+                b"CD4\t\t1.8\n\tCD4-positive, alpha-beta T cell\nMS4A1\tB cell\n",
+            ),
+            (
+                "label_cl.tsv",
+                b"B cell\t\tCL:0000236\nT cell,CL:0000084\t\nNK cell\tCL:0000623\n",
+            ),
+        ],
+    );
+    let pairs = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
+    let label_to_id = super::markers::read_label_map(&path_in(&dir, "label_cl.tsv"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let types: Vec<Box<str>> = pairs.unwrap().into_iter().map(|(_, t)| t).collect();
+    assert_eq!(types, names(&["B_cell"]));
+    let label_to_id = label_to_id.unwrap();
+    let get = |k: &str| label_to_id.get(k).map(AsRef::as_ref);
+    assert_eq!(
+        [get("B_cell"), get("T_cell"), get("NK_cell")],
+        [None, Some("CL:0000084"), Some("CL:0000623")]
+    );
+}
+
+// A line that is not UTF-8 is an error naming the line, not the silent end of the file.
+#[test]
+fn label_files_reject_invalid_utf8() {
+    let dir = label_files(
+        "label_utf8",
+        &[
+            (
+                "markers.tsv",
+                b"CD4\tT cell\nCD8A\tna\xefve T cell\nMS4A1\tB cell\n",
+            ),
+            (
+                "label_cl.tsv",
+                b"T cell\tCL:0000084\nna\xefve T cell\tCL:0000898\nB cell\tCL:0000236\n",
+            ),
+        ],
+    );
+    let panel = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
+    let map = super::markers::read_label_map(&path_in(&dir, "label_cl.tsv"));
+    let _ = std::fs::remove_dir_all(&dir);
+    for err in [panel.map(drop).unwrap_err(), map.map(drop).unwrap_err()] {
+        assert!(format!("{err:#}").contains("line 2:"), "{err:#}");
+    }
+}

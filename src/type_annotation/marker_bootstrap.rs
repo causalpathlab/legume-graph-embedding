@@ -149,8 +149,8 @@ pub struct BootstrapResult {
     /// Normalized entropy of the per-cell nearest-centroid distribution, in `[0, 1]`.
     pub entropy: Vec<f32>,
     /// The **shipped** label's consensus (panel *and* clustering resampled). `None` when no
-    /// [`CoarseStep`] was supplied. This — not `support` above — is what `membership.tsv`
-    /// carries.
+    /// [`CoarseStep`] was supplied. This — not `support` above — is what the per-cell
+    /// label files ([`write_cell_labels`](super::write_cell_labels)) carry.
     pub coarse: Option<CoarseConsensus>,
     /// Per type, per listed marker: robust z of the marker's distance to its type's centroid.
     /// **Large ⇒ the embedding puts this gene nowhere near the type it is listed under.**
@@ -162,10 +162,10 @@ pub struct BootstrapResult {
     pub type_qc: Vec<TypeQc>,
 }
 
-/// The consensus over the **shipped**, cluster-driven label — the one that lands in
-/// `membership.tsv`. Distinct from the nearest-centroid numbers on [`BootstrapResult`]: this
-/// one additionally absorbs the clustering's own stochasticity, so it is the stricter (and the
-/// operationally relevant) statement.
+/// The consensus over the **shipped**, cluster-driven label — the one that lands in the
+/// per-cell label files. Distinct from the nearest-centroid numbers on [`BootstrapResult`]:
+/// this one additionally absorbs the clustering's own stochasticity, so it is the stricter (and
+/// the operationally relevant) statement.
 pub struct CoarseConsensus {
     /// `[n × (c+1)]` row-major; the last column is `unassigned`.
     pub post: Vec<f32>,

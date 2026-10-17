@@ -56,7 +56,10 @@ mod output;
 
 use super::marker_bootstrap::{run_marker_bootstrap, CoarseConsensus, MarkerBootstrapConfig};
 use super::markers::parse_and_match_markers;
-use super::output::{write_label_tsvs, write_marker_embeddings};
+use super::output::{
+    write_cell_labels, write_marker_embeddings, ARGMAX_TSV_SUFFIX, CELL_LABELS_SUFFIX,
+    MEMBERSHIP_TSV_SUFFIX,
+};
 use super::score::row_major;
 use super::{n_communities, InputEmbeddings, UNASSIGNED};
 use anyhow::Result;
@@ -84,13 +87,16 @@ mod tests;
 #[cfg(test)]
 use ora::{OraResult, MAX_NULL_POOL};
 
-/// File-name suffixes (relative to `out_prefix`) the firm term-ORA path writes.
-/// Kept explicit (never a glob) so a caller can erase a prior run without
-/// touching sibling artifacts (the embedding, the manifest).
+/// File-name suffixes (relative to `out_prefix`) to erase before a rerun of the firm
+/// term-ORA path: everything it writes, plus every name in
+/// [`CELL_LABEL_FILE_SUFFIXES`](super::CELL_LABEL_FILE_SUFFIXES), retired ones included, so
+/// it is a cleanup list, not a list of outputs. Kept explicit (never a glob) so a caller can
+/// erase a prior run without touching sibling artifacts (the embedding, the manifest).
 pub const TERM_ORA_OUTPUT_SUFFIXES: &[&str] = &[
     ".annot.parquet",
-    ".membership.tsv",
-    ".argmax.tsv",
+    CELL_LABELS_SUFFIX,
+    MEMBERSHIP_TSV_SUFFIX,
+    ARGMAX_TSV_SUFFIX,
     ".marker_embedding.parquet",
     ".cluster_term_p.parquet",
     ".cluster_term_q.parquet",
@@ -705,9 +711,8 @@ fn annotate_inner(
             con,
         )?;
     }
-    // membership.tsv + argmax.tsv on the firm (cluster-driven) label, the shared
-    // contract `gem-summary` / `data-beans stat -g` consume.
-    write_label_tsvs(out_prefix, cell_names, &coarse_label, &coarse_conf)?;
+    // The per-cell labels on the firm (cluster-driven) label.
+    write_cell_labels(out_prefix, cell_names, &coarse_label, &coarse_conf)?;
     write_cluster_term_matrices(out_prefix, &comm_names, &type_names, &ora)?;
     write_calibration(out_prefix, &ora, n_assigned, n_outliers)?;
     log_cluster_calls(&cluster_label, &type_names, &sizes);

@@ -9,16 +9,18 @@
 //! `senna annotate-ontology` / `-by-enrichment` (which delegate to it), so the
 //! OBO glue is written once.
 
+use super::markers::read_label_map;
 use anyhow::Result;
 use data_beans::aux::ontology::Ontology;
-use enrichment::{
-    annotate_ontology_core, parse_label_map, Mat, OntologyAccess, OntologyParams, OntologyScore,
-};
+use enrichment::{annotate_ontology_core, Mat, OntologyAccess, OntologyParams, OntologyScore};
 use log::info;
 
 /// Load the Cell Ontology + curated `label<TAB>CL:id` map, inject them into the
 /// generic TreeBH core as closures, and run it. Returns the
 /// `(ontology_assignment.tsv, ontology_node_mass.parquet)` paths.
+///
+/// `celltype_names` are type names as the marker reader gives them; the map is keyed the
+/// same way.
 #[allow(clippy::too_many_arguments)]
 pub fn annotate_ontology_from_obo(
     out: &str,
@@ -31,7 +33,7 @@ pub fn annotate_ontology_from_obo(
     cluster_names: &[Box<str>],
     celltype_names: &[Box<str>],
 ) -> Result<(String, String)> {
-    let label_to_id = parse_label_map(label_cl, |id| id.starts_with("CL:"))?;
+    let label_to_id = read_label_map(label_cl)?;
     let onto = Ontology::load_obo(obo)?;
     info!("loaded Cell Ontology: {} terms from {obo}", onto.len());
 

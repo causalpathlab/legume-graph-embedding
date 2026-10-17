@@ -312,17 +312,103 @@ fn report_panel_coverage(
     Ok(())
 }
 
-/// Parse a marker TSV/CSV into `(gene, celltype)` pairs through the shared
-/// membership reader (header and `#` rows skipped), mapping spaces in
-/// cell-type names → `_`.
+// The panel and the label→CL map are read by one row reader with one line rule and one
+// label key, so a label written the same way in both files meets.
+//
+// TODO: move both files to upstream readers together (data-beans' `read_membership_pairs`,
+// enrichment's `parse_label_map`) once those follow `split_tab_first` (tab-first, cells kept
+// in their columns) and key labels like `type_key`; moving one alone would read the two files
+// differently again.
+
+/// Split one line: on the tab only if it has one before any trailing whitespace, so a label
+/// keeps its commas (a Cell Ontology name such as `CD4-positive, alpha-beta T cell`); else on
+/// commas. Cells keep their columns (an empty one stays empty) and are trimmed and unquoted.
+fn split_tab_first(line: &str) -> Vec<&str> {
+    use legume_numeric::matrix::table::Delimiter;
+    let line = line.trim_end();
+    let delim = if line.contains('\t') {
+        Delimiter::Tab
+    } else {
+        Delimiter::Comma
+    };
+    delim.split(line)
+}
+
+/// A label as a type name: spaces → `_`.
+fn type_key(label: &str) -> Box<str> {
+    Box::from(label.replace(' ', "_"))
+}
+
+/// The first two cells of every row of a two-column label file (gz-aware), split by
+/// [`split_tab_first`]. Comment rows (a first cell starting with `#` or `%`, indented or
+/// quoted) are skipped; so are rows with an empty or missing first or second cell, with a
+/// warning counting them. A line that cannot be read (not UTF-8, a corrupt gz) is an error
+/// naming the line.
+fn read_two_field_rows(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
+    use std::io::BufRead;
+    let mut rows = Vec::new();
+    let mut gapped = 0usize;
+    let reader = legume_numeric::matrix::common_io::open_buf_reader(path)?;
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("line {}", i + 1))?;
+        let cells = split_tab_first(&line);
+        match cells.as_slice() {
+            [] | [""] => {}
+            [first, ..] if first.starts_with(['#', '%']) => {}
+            [first, second, ..] if !first.is_empty() && !second.is_empty() => {
+                rows.push((Box::from(*first), Box::from(*second)));
+            }
+            _ => gapped += 1,
+        }
+    }
+    if gapped > 0 {
+        log::warn!("{path}: skipped {gapped} row(s) with an empty or missing first or second cell");
+    }
+    Ok(rows)
+}
+
+/// Parse a marker TSV/CSV into `(gene, celltype)` pairs ([`read_two_field_rows`], a
+/// `gene`/`symbol` header row skipped); type names are [`type_key`]s.
 pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
-    let out: Vec<(Box<str>, Box<str>)> = data_beans::aux::gene_sets::read_membership_pairs(path)
+    let out: Vec<(Box<str>, Box<str>)> = read_two_field_rows(path)
         .with_context(|| format!("reading markers {path}"))?
         .into_iter()
-        .map(|(gene, ct)| (gene, Box::from(ct.replace(' ', "_"))))
+        .filter(|(gene, _)| {
+            !["gene", "symbol"]
+                .iter()
+                .any(|h| gene.eq_ignore_ascii_case(h))
+        })
+        .map(|(gene, label)| (gene, type_key(&label)))
         .collect();
     anyhow::ensure!(!out.is_empty(), "no marker pairs parsed from {path}");
     Ok(out)
+}
+
+/// Read the curated `label<TAB>CL:id` map ([`read_two_field_rows`], rows whose id is not a
+/// `CL:` id skipped as a header), keyed by [`type_key`] like the panel's type names. Two ids
+/// for one key is an error.
+pub(super) fn read_label_map(path: &str) -> Result<FxHashMap<Box<str>, Box<str>>> {
+    use std::collections::hash_map::Entry;
+    let mut map: FxHashMap<Box<str>, Box<str>> = FxHashMap::default();
+    for (label, id) in read_two_field_rows(path)
+        .with_context(|| format!("reading label→id map {path}"))?
+        .into_iter()
+        .filter(|(_, id)| id.starts_with("CL:"))
+    {
+        match map.entry(type_key(&label)) {
+            Entry::Vacant(e) => {
+                e.insert(id);
+            }
+            Entry::Occupied(e) => anyhow::ensure!(
+                *e.get() == id,
+                "label {label:?} (as {:?}) has two ids in {path}: {} and {id}",
+                e.key(),
+                e.get()
+            ),
+        }
+    }
+    anyhow::ensure!(!map.is_empty(), "no `label<TAB>id` rows parsed from {path}");
+    Ok(map)
 }
 
 /// Union of every type's marker gene indices (sorted, unique, in range) — the

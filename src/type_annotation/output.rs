@@ -13,15 +13,62 @@ fn softmax_prob_at(row: &[f32], idx: usize) -> f32 {
     }
 }
 
-/// Write the two per-cell label files shared by BOTH annotation methods, so a
-/// downstream consumer never has to know which produced them:
-/// * `{prefix}.argmax.tsv` — `cell⇥cell_type⇥probability` (with header), the
-///   argmax reader `senna plot` consumes.
+/// The file-name suffix of the per-cell label table [`write_cell_labels`] writes.
+pub const CELL_LABELS_SUFFIX: &str = ".argmax.parquet";
+
+pub(super) const ARGMAX_TSV_SUFFIX: &str = ".argmax.tsv";
+pub(super) const MEMBERSHIP_TSV_SUFFIX: &str = ".membership.tsv";
+
+/// Every per-cell label file this crate writes or has written, for a caller's cleanup list. A
+/// retired name stays listed, so a rerun still erases it.
+pub const CELL_LABEL_FILE_SUFFIXES: &[&str] =
+    &[CELL_LABELS_SUFFIX, ARGMAX_TSV_SUFFIX, MEMBERSHIP_TSV_SUFFIX];
+
+/// `labels` and `probs` must have one entry per cell.
+fn check_label_lengths(n: usize, labels: &[Box<str>], probs: &[f32]) -> Result<()> {
+    anyhow::ensure!(
+        labels.len() == n && probs.len() == n,
+        "{} labels and {} probabilities for {n} cells",
+        labels.len(),
+        probs.len()
+    );
+    Ok(())
+}
+
+/// Write the per-cell label table shared by every annotation method, so a downstream
+/// consumer never has to know which produced it: `{prefix}.argmax.parquet` with columns
+/// `cell`, `cell_type` and `probability`.
+///
+/// Until 0.10 it also writes the TSV pair of [`write_label_tsvs`], so readers that have not
+/// moved to the parquet keep working.
+pub fn write_cell_labels(
+    prefix: &str,
+    cell_names: &[Box<str>],
+    labels: &[Box<str>],
+    probs: &[f32],
+) -> Result<()> {
+    check_label_lengths(cell_names.len(), labels, probs)?;
+    let path = format!("{prefix}{CELL_LABELS_SUFFIX}");
+    write_named_table(
+        &path,
+        "cell",
+        cell_names,
+        &[
+            (Box::from("cell_type"), Column::Str(labels)),
+            (Box::from("probability"), Column::F32(probs)),
+        ],
+    )
+    .with_context(|| format!("writing {path}"))?;
+    info!("wrote {path}");
+    write_label_tsvs(prefix, cell_names, labels, probs)
+}
+
+/// The TSV pair [`write_cell_labels`] writes beside its parquet until 0.10:
+/// * `{prefix}.argmax.tsv` — `cell⇥cell_type⇥probability` (with header).
 /// * `{prefix}.membership.tsv` — `cell⇥cell_type` (no header), for
 ///   `data-beans stat -g` / `senna gem-summary` grouping.
 ///
-/// `labels`/`probs` are parallel to `cell_names`. The single writer keeps the
-/// two annotation passes (`-by-projection`, `-by-enrichment`) in lock-step.
+/// It writes no parquet: new callers want [`write_cell_labels`].
 pub fn write_label_tsvs(
     prefix: &str,
     cell_names: &[Box<str>],
@@ -29,6 +76,7 @@ pub fn write_label_tsvs(
     probs: &[f32],
 ) -> Result<()> {
     let n = cell_names.len();
+    check_label_lengths(n, labels, probs)?;
     let mut argmax = Vec::with_capacity(n + 1);
     argmax.push(Box::from("cell\tcell_type\tprobability"));
     argmax.par_extend(
@@ -36,7 +84,7 @@ pub fn write_label_tsvs(
             .into_par_iter()
             .map(|i| format!("{}\t{}\t{:.4}", cell_names[i], labels[i], probs[i]).into_boxed_str()),
     );
-    let argmax_path = format!("{prefix}.argmax.tsv");
+    let argmax_path = format!("{prefix}{ARGMAX_TSV_SUFFIX}");
     write_lines(&argmax, &argmax_path).with_context(|| format!("writing {argmax_path}"))?;
     info!("wrote {argmax_path}");
 
@@ -45,7 +93,7 @@ pub fn write_label_tsvs(
         .zip(labels)
         .map(|(cell, label)| format!("{cell}\t{label}").into_boxed_str())
         .collect();
-    let membership_path = format!("{prefix}.membership.tsv");
+    let membership_path = format!("{prefix}{MEMBERSHIP_TSV_SUFFIX}");
     write_lines(&membership, &membership_path)
         .with_context(|| format!("writing {membership_path}"))?;
     info!("wrote {membership_path}");
@@ -141,10 +189,7 @@ pub(super) fn write_type_coembeddings(
 /// Write the tidy annotation tables:
 /// * `{prefix}.annot.parquet` — one row per cell: community, coarse + fine
 ///   label, score (z), and p-value for each layer.
-/// * `{prefix}.membership.tsv` — `cell⇥coarse_label` (no header) for
-///   `data-beans stat`/`gem-summary` grouping.
-/// * `{prefix}.argmax.tsv` — `cell⇥cell_type⇥probability` (with header), the
-///   uniform argmax contract shared with `annotate-by-enrichment`.
+/// * the per-cell labels on the coarse label ([`write_cell_labels`]).
 /// * `{prefix}.community_profile.parquet` — one row per community.
 /// * `{prefix}.type_map.parquet` — fine → coarse merge record.
 /// * `{prefix}.{type,coarse}_embedding.parquet` — signature plot anchors.
@@ -239,10 +284,8 @@ pub(super) fn write_annotation_outputs(
     .with_context(|| format!("writing {annot_path}"))?;
     info!("wrote {annot_path}");
 
-    // Per-cell label files (argmax.tsv + membership.tsv), keyed on the robust
-    // COARSE label + its softmax confidence. Shared with `annotate-by-enrichment`
-    // via the one writer below, so both methods emit an identical contract.
-    write_label_tsvs(out_prefix, cell_names, &coarse_label, &coarse_prob)?;
+    // Per-cell labels on the robust COARSE label + its softmax confidence.
+    write_cell_labels(out_prefix, cell_names, &coarse_label, &coarse_prob)?;
 
     /////////////////////////////
     // community profile table //
