@@ -316,24 +316,22 @@ fn report_panel_coverage(
 // label key, so a label written the same way in both files meets.
 //
 // TODO: move both files to upstream readers together (data-beans' `read_membership_pairs`,
-// enrichment's `parse_label_map`) once those split a tab-bearing line on the tab only and key
-// labels like `type_key`; moving one alone would key the two files differently again.
+// enrichment's `parse_label_map`) once those follow `split_tab_first` (tab-first, cells kept
+// in their columns) and key labels like `type_key`; moving one alone would read the two files
+// differently again.
 
-/// Split one line: on the tab only if it has one, so a label keeps its commas (a Cell Ontology
-/// name such as `CD4-positive, alpha-beta T cell`); else on commas. Fields are trimmed and
-/// unquoted; the line is trimmed first (a trailing tab picks no delimiter) and empty fields
-/// (an aligning double tab) are dropped.
+/// Split one line: on the tab only if it has one before any trailing whitespace, so a label
+/// keeps its commas (a Cell Ontology name such as `CD4-positive, alpha-beta T cell`); else on
+/// commas. Cells keep their columns (an empty one stays empty) and are trimmed and unquoted.
 fn split_tab_first(line: &str) -> Vec<&str> {
     use legume_numeric::matrix::table::Delimiter;
-    let line = line.trim();
+    let line = line.trim_end();
     let delim = if line.contains('\t') {
         Delimiter::Tab
     } else {
         Delimiter::Comma
     };
-    let mut fields = delim.split(line);
-    fields.retain(|f| !f.is_empty());
-    fields
+    delim.split(line)
 }
 
 /// A label as a type name: spaces → `_`.
@@ -341,16 +339,19 @@ fn type_key(label: &str) -> Box<str> {
     Box::from(label.replace(' ', "_"))
 }
 
-/// The first two fields of every row of a two-column label file (gz-aware), split by
-/// [`split_tab_first`]. Rows with fewer than two fields and comment rows (a first field
-/// starting with `#` or `%`, indented or quoted) are skipped; a line that is not UTF-8 is an
-/// error.
+/// The first two cells of every row of a two-column label file (gz-aware), split by
+/// [`split_tab_first`]. Rows with an empty or missing first or second cell and comment rows (a
+/// first cell starting with `#` or `%`, indented or quoted) are skipped; a line that is not
+/// UTF-8 is an error naming the line.
 fn read_two_field_rows(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
+    use std::io::BufRead;
     let mut rows = Vec::new();
-    for line in legume_numeric::matrix::common_io::read_lines(path)? {
-        let mut fields = split_tab_first(&line).into_iter();
-        if let (Some(first), Some(second)) = (fields.next(), fields.next()) {
-            if !first.starts_with(['#', '%']) {
+    let reader = legume_numeric::matrix::common_io::open_buf_reader(path)?;
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("line {} is not UTF-8 text", i + 1))?;
+        let mut cells = split_tab_first(&line).into_iter();
+        if let (Some(first), Some(second)) = (cells.next(), cells.next()) {
+            if !first.is_empty() && !second.is_empty() && !first.starts_with(['#', '%']) {
                 rows.push((Box::from(first), Box::from(second)));
             }
         }
@@ -379,18 +380,24 @@ pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
 /// `CL:` id skipped as a header), keyed by [`type_key`] like the panel's type names. Two ids
 /// for one key is an error.
 pub(super) fn read_label_map(path: &str) -> Result<FxHashMap<Box<str>, Box<str>>> {
+    use std::collections::hash_map::Entry;
     let mut map: FxHashMap<Box<str>, Box<str>> = FxHashMap::default();
     for (label, id) in read_two_field_rows(path)
         .with_context(|| format!("reading label→id map {path}"))?
         .into_iter()
         .filter(|(_, id)| id.starts_with("CL:"))
     {
-        let key = type_key(&label);
-        let prev = map.entry(key.clone()).or_insert_with(|| id.clone());
-        anyhow::ensure!(
-            *prev == id,
-            "label {label:?} (as {key:?}) has two ids in {path}: {prev} and {id}"
-        );
+        match map.entry(type_key(&label)) {
+            Entry::Vacant(e) => {
+                e.insert(id);
+            }
+            Entry::Occupied(e) => anyhow::ensure!(
+                *e.get() == id,
+                "label {label:?} (as {:?}) has two ids in {path}: {} and {id}",
+                e.key(),
+                e.get()
+            ),
+        }
     }
     anyhow::ensure!(!map.is_empty(), "no `label<TAB>id` rows parsed from {path}");
     Ok(map)
