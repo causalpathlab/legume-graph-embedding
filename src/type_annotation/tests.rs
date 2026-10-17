@@ -396,3 +396,43 @@ fn label_map_keys_match_panel_type_names() {
         "{label_to_id:?}"
     );
 }
+
+// Label-map rows the old parser accepted still parse: an aligning double tab, a stray
+// trailing tab on a CSV row.
+#[test]
+fn label_map_skips_empty_cells() {
+    let dir = std::env::temp_dir().join(format!("geu_label_map_cells_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let map = dir.join("label_cl.tsv");
+    std::fs::write(&map, "B cell\t\tCL:0000236\nT cell,CL:0000084\t\n").unwrap();
+    let label_to_id = super::markers::read_label_map(map.to_str().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+    let label_to_id = label_to_id.unwrap();
+    assert_eq!(
+        label_to_id.get("B_cell").map(AsRef::as_ref),
+        Some("CL:0000236")
+    );
+    assert_eq!(
+        label_to_id.get("T_cell").map(AsRef::as_ref),
+        Some("CL:0000084")
+    );
+}
+
+// A line that is not UTF-8 is an error, not the silent end of the file.
+#[test]
+fn label_files_reject_invalid_utf8() {
+    let dir = std::env::temp_dir().join(format!("geu_label_utf8_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("labels.tsv");
+    std::fs::write(
+        &path,
+        b"CD4\tT cell\nCD8A\tna\xefve T cell\nMS4A1\tB cell\n".as_slice(),
+    )
+    .unwrap();
+    let path = path.to_str().unwrap();
+    let panel = super::markers::read_marker_tsv(path);
+    let map = super::markers::read_label_map(path);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(panel.is_err(), "panel read past a bad line: {panel:?}");
+    assert!(map.is_err(), "label map read past a bad line: {map:?}");
+}
