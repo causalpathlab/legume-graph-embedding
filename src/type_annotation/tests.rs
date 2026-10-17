@@ -409,40 +409,57 @@ fn label_map_keys_match_panel_type_names() {
     );
 }
 
-// Empty cells (an aligning double tab) and a trailing tab do not cost a row.
+// Cells keep their columns: a row with an empty gene or type cell is skipped, never filled
+// from the next column, and a leading tab still makes the line tab-separated. A trailing tab
+// on a CSV row does not.
 #[test]
-fn label_map_skips_empty_cells() {
+fn label_files_keep_columns_in_place() {
     let dir = label_files(
-        "label_map_cells",
-        &[(
-            "label_cl.tsv",
-            b"B cell\t\tCL:0000236\nT cell,CL:0000084\t\n",
-        )],
+        "label_columns",
+        &[
+            (
+                "markers.tsv",
+                b"CD4\t\t1.8\n\tCD4-positive, alpha-beta T cell\nMS4A1\tB cell\n",
+            ),
+            (
+                "label_cl.tsv",
+                b"B cell\t\tCL:0000236\nT cell,CL:0000084\t\nNK cell\tCL:0000623\n",
+            ),
+        ],
     );
+    let pairs = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
     let label_to_id = super::markers::read_label_map(&path_in(&dir, "label_cl.tsv"));
     let _ = std::fs::remove_dir_all(&dir);
+    let types: Vec<Box<str>> = pairs.unwrap().into_iter().map(|(_, t)| t).collect();
+    assert_eq!(types, names(&["B_cell"]));
     let label_to_id = label_to_id.unwrap();
     let get = |k: &str| label_to_id.get(k).map(AsRef::as_ref);
     assert_eq!(
-        [get("B_cell"), get("T_cell")],
-        [Some("CL:0000236"), Some("CL:0000084")]
+        [get("B_cell"), get("T_cell"), get("NK_cell")],
+        [None, Some("CL:0000084"), Some("CL:0000623")]
     );
 }
 
-// A line that is not UTF-8 is an error, not the silent end of the file.
+// A line that is not UTF-8 is an error naming the line, not the silent end of the file.
 #[test]
 fn label_files_reject_invalid_utf8() {
     let dir = label_files(
         "label_utf8",
-        &[(
-            "labels.tsv",
-            b"CD4\tT cell\nCD8A\tna\xefve T cell\nMS4A1\tB cell\n",
-        )],
+        &[
+            (
+                "markers.tsv",
+                b"CD4\tT cell\nCD8A\tna\xefve T cell\nMS4A1\tB cell\n",
+            ),
+            (
+                "label_cl.tsv",
+                b"T cell\tCL:0000084\nna\xefve T cell\tCL:0000898\nB cell\tCL:0000236\n",
+            ),
+        ],
     );
-    let path = path_in(&dir, "labels.tsv");
-    let panel = super::markers::read_marker_tsv(&path);
-    let map = super::markers::read_label_map(&path);
+    let panel = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
+    let map = super::markers::read_label_map(&path_in(&dir, "label_cl.tsv"));
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(panel.is_err(), "panel read past a bad line: {panel:?}");
-    assert!(map.is_err(), "label map read past a bad line: {map:?}");
+    for err in [panel.map(drop).unwrap_err(), map.map(drop).unwrap_err()] {
+        assert!(format!("{err:#}").contains("line 2"), "{err:#}");
+    }
 }
