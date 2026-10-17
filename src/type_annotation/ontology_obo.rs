@@ -19,8 +19,8 @@ use log::info;
 /// generic TreeBH core as closures, and run it. Returns the
 /// `(ontology_assignment.tsv, ontology_node_mass.parquet)` paths.
 ///
-/// The map is keyed like panel type names (spaces as `_`), so `celltype_names` are the type
-/// names the marker reader gives.
+/// `celltype_names` are type names as the marker reader gives them; the map is keyed the
+/// same way.
 #[allow(clippy::too_many_arguments)]
 pub fn annotate_ontology_from_obo(
     out: &str,

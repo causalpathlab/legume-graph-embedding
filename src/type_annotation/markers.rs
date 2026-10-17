@@ -321,7 +321,8 @@ fn report_panel_coverage(
 
 /// Split one line: on the tab only if it has one, so a label keeps its commas (a Cell Ontology
 /// name such as `CD4-positive, alpha-beta T cell`); else on commas. Fields are trimmed and
-/// unquoted; empty ones (an aligning double tab, a stray trailing tab) are dropped.
+/// unquoted; the line is trimmed first (a trailing tab picks no delimiter) and empty fields
+/// (an aligning double tab) are dropped.
 fn split_tab_first(line: &str) -> Vec<&str> {
     use legume_numeric::matrix::table::Delimiter;
     let line = line.trim();
@@ -330,11 +331,9 @@ fn split_tab_first(line: &str) -> Vec<&str> {
     } else {
         Delimiter::Comma
     };
-    delim
-        .split(line)
-        .into_iter()
-        .filter(|f| !f.is_empty())
-        .collect()
+    let mut fields = delim.split(line);
+    fields.retain(|f| !f.is_empty());
+    fields
 }
 
 /// A label as a type name: spaces → `_`.
@@ -347,11 +346,8 @@ fn type_key(label: &str) -> Box<str> {
 /// starting with `#` or `%`, indented or quoted) are skipped; a line that is not UTF-8 is an
 /// error.
 fn read_two_field_rows(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
-    use legume_numeric::matrix::common_io::open_buf_reader;
-    use std::io::BufRead;
     let mut rows = Vec::new();
-    for line in open_buf_reader(path)?.lines() {
-        let line = line?;
+    for line in legume_numeric::matrix::common_io::read_lines(path)? {
         let mut fields = split_tab_first(&line).into_iter();
         if let (Some(first), Some(second)) = (fields.next(), fields.next()) {
             if !first.starts_with(['#', '%']) {
@@ -383,24 +379,18 @@ pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
 /// `CL:` id skipped as a header), keyed by [`type_key`] like the panel's type names. Two ids
 /// for one key is an error.
 pub(super) fn read_label_map(path: &str) -> Result<FxHashMap<Box<str>, Box<str>>> {
-    use std::collections::hash_map::Entry;
     let mut map: FxHashMap<Box<str>, Box<str>> = FxHashMap::default();
     for (label, id) in read_two_field_rows(path)
         .with_context(|| format!("reading label→id map {path}"))?
         .into_iter()
         .filter(|(_, id)| id.starts_with("CL:"))
     {
-        match map.entry(type_key(&label)) {
-            Entry::Occupied(e) => anyhow::ensure!(
-                *e.get() == id,
-                "labels keyed {:?} (spaces as `_`) map to two ids in {path}: {} and {id} (at {label:?})",
-                e.key(),
-                e.get()
-            ),
-            Entry::Vacant(e) => {
-                e.insert(id);
-            }
-        }
+        let key = type_key(&label);
+        let prev = map.entry(key.clone()).or_insert_with(|| id.clone());
+        anyhow::ensure!(
+            *prev == id,
+            "label {label:?} (as {key:?}) has two ids in {path}: {prev} and {id}"
+        );
     }
     anyhow::ensure!(!map.is_empty(), "no `label<TAB>id` rows parsed from {path}");
     Ok(map)

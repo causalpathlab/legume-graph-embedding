@@ -316,23 +316,37 @@ fn all_marker_types_unmatched_is_an_error() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Write `files` into a fresh temp directory for one test; returns it, and the caller removes
+/// it.
+fn label_files(tag: &str, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("geu_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, bytes) in files {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    dir
+}
+
+fn path_in(dir: &std::path::Path, name: &str) -> String {
+    dir.join(name).to_str().unwrap().to_owned()
+}
+
 // Tab lines split on the tab only, so Cell Ontology labels keep their commas; tab-less lines
 // stay CSV.
 #[test]
 fn marker_reader_keeps_commas_in_tab_separated_labels() {
-    let dir = std::env::temp_dir().join(format!("geu_marker_tab_split_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("markers.tsv");
-    std::fs::write(
-        &path,
-        "gene\tcell_type\n\
-         CD4\tCD4-positive, alpha-beta T cell\n\
-         CD8A\tCD8-positive, alpha-beta T cell\n\
-         MS4A1,B cell\n\
-         \"CD79A\",\"B cell\"\n",
-    )
-    .unwrap();
-    let pairs = super::markers::read_marker_tsv(path.to_str().unwrap()).unwrap();
+    let dir = label_files(
+        "marker_tab_split",
+        &[(
+            "markers.tsv",
+            b"gene\tcell_type\n\
+              CD4\tCD4-positive, alpha-beta T cell\n\
+              CD8A\tCD8-positive, alpha-beta T cell\n\
+              MS4A1,B cell\n\
+              \"CD79A\",\"B cell\"\n",
+        )],
+    );
+    let pairs = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
     let _ = std::fs::remove_dir_all(&dir);
     let expected: Vec<(Box<str>, Box<str>)> = [
         ("CD4", "CD4-positive,_alpha-beta_T_cell"),
@@ -343,46 +357,44 @@ fn marker_reader_keeps_commas_in_tab_separated_labels() {
     .iter()
     .map(|&(g, t)| (Box::from(g), Box::from(t)))
     .collect();
-    assert_eq!(pairs, expected);
+    assert_eq!(pairs.unwrap(), expected);
 }
 
 // An indented or quoted comment line is not a marker pair.
 #[test]
 fn marker_reader_skips_indented_comments() {
-    let dir = std::env::temp_dir().join(format!("geu_marker_comment_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("markers.tsv");
-    std::fs::write(
-        &path,
-        "  # source: a panel, 2019\n\"# note\"\tx\nCD4\tT cell\nCD8A\tT cell\n",
-    )
-    .unwrap();
-    let pairs = super::markers::read_marker_tsv(path.to_str().unwrap());
+    let dir = label_files(
+        "marker_comment",
+        &[(
+            "markers.tsv",
+            b"  # source: a panel, 2019\n\"# note\"\tx\nCD4\tT cell\nCD8A\tT cell\n",
+        )],
+    );
+    let pairs = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
     let _ = std::fs::remove_dir_all(&dir);
     let types: Vec<Box<str>> = pairs.unwrap().into_iter().map(|(_, t)| t).collect();
     assert_eq!(types, names(&["T_cell", "T_cell"]));
 }
 
-// The label→CL map is keyed like the panel's type names: tab-first split, spaces → `_`. A
-// comma-bearing Cell Ontology label in both files must meet.
+// The label→CL map is keyed like the panel's type names, so a comma-bearing Cell Ontology
+// label written the same way in both files meets.
 #[test]
 fn label_map_keys_match_panel_type_names() {
-    let dir = std::env::temp_dir().join(format!("geu_label_map_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let panel = dir.join("markers.tsv");
-    std::fs::write(
-        &panel,
-        "CD4\tCD4-positive, alpha-beta T cell\nMS4A1\tB cell\n",
-    )
-    .unwrap();
-    let map = dir.join("label_cl.tsv");
-    std::fs::write(
-        &map,
-        "label\tid\nCD4-positive, alpha-beta T cell\tCL:0000624\nB cell\tCL:0000236\n",
-    )
-    .unwrap();
-    let pairs = super::markers::read_marker_tsv(panel.to_str().unwrap());
-    let label_to_id = super::markers::read_label_map(map.to_str().unwrap());
+    let dir = label_files(
+        "label_map",
+        &[
+            (
+                "markers.tsv",
+                b"CD4\tCD4-positive, alpha-beta T cell\nMS4A1\tB cell\n",
+            ),
+            (
+                "label_cl.tsv",
+                b"label\tid\nCD4-positive, alpha-beta T cell\tCL:0000624\nB cell\tCL:0000236\n",
+            ),
+        ],
+    );
+    let pairs = super::markers::read_marker_tsv(&path_in(&dir, "markers.tsv"));
+    let label_to_id = super::markers::read_label_map(&path_in(&dir, "label_cl.tsv"));
     let _ = std::fs::remove_dir_all(&dir);
     let label_to_id = label_to_id.unwrap();
     let ids: Vec<Option<&str>> = pairs
@@ -397,41 +409,39 @@ fn label_map_keys_match_panel_type_names() {
     );
 }
 
-// Label-map rows the old parser accepted still parse: an aligning double tab, a stray
-// trailing tab on a CSV row.
+// Empty cells (an aligning double tab) and a trailing tab do not cost a row.
 #[test]
 fn label_map_skips_empty_cells() {
-    let dir = std::env::temp_dir().join(format!("geu_label_map_cells_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let map = dir.join("label_cl.tsv");
-    std::fs::write(&map, "B cell\t\tCL:0000236\nT cell,CL:0000084\t\n").unwrap();
-    let label_to_id = super::markers::read_label_map(map.to_str().unwrap());
+    let dir = label_files(
+        "label_map_cells",
+        &[(
+            "label_cl.tsv",
+            b"B cell\t\tCL:0000236\nT cell,CL:0000084\t\n",
+        )],
+    );
+    let label_to_id = super::markers::read_label_map(&path_in(&dir, "label_cl.tsv"));
     let _ = std::fs::remove_dir_all(&dir);
     let label_to_id = label_to_id.unwrap();
+    let get = |k: &str| label_to_id.get(k).map(AsRef::as_ref);
     assert_eq!(
-        label_to_id.get("B_cell").map(AsRef::as_ref),
-        Some("CL:0000236")
-    );
-    assert_eq!(
-        label_to_id.get("T_cell").map(AsRef::as_ref),
-        Some("CL:0000084")
+        [get("B_cell"), get("T_cell")],
+        [Some("CL:0000236"), Some("CL:0000084")]
     );
 }
 
 // A line that is not UTF-8 is an error, not the silent end of the file.
 #[test]
 fn label_files_reject_invalid_utf8() {
-    let dir = std::env::temp_dir().join(format!("geu_label_utf8_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("labels.tsv");
-    std::fs::write(
-        &path,
-        b"CD4\tT cell\nCD8A\tna\xefve T cell\nMS4A1\tB cell\n".as_slice(),
-    )
-    .unwrap();
-    let path = path.to_str().unwrap();
-    let panel = super::markers::read_marker_tsv(path);
-    let map = super::markers::read_label_map(path);
+    let dir = label_files(
+        "label_utf8",
+        &[(
+            "labels.tsv",
+            b"CD4\tT cell\nCD8A\tna\xefve T cell\nMS4A1\tB cell\n",
+        )],
+    );
+    let path = path_in(&dir, "labels.tsv");
+    let panel = super::markers::read_marker_tsv(&path);
+    let map = super::markers::read_label_map(&path);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(panel.is_err(), "panel read past a bad line: {panel:?}");
     assert!(map.is_err(), "label map read past a bad line: {map:?}");
