@@ -18,6 +18,9 @@ use log::info;
 /// Load the Cell Ontology + curated `label<TAB>CL:id` map, inject them into the
 /// generic TreeBH core as closures, and run it. Returns the
 /// `(ontology_assignment.tsv, ontology_node_mass.parquet)` paths.
+///
+/// The map is keyed like panel type names (spaces as `_`), so `celltype_names` are the type
+/// names the marker reader gives.
 #[allow(clippy::too_many_arguments)]
 pub fn annotate_ontology_from_obo(
     out: &str,

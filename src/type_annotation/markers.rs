@@ -321,15 +321,20 @@ fn report_panel_coverage(
 
 /// Split one line: on the tab only if it has one, so a label keeps its commas (a Cell Ontology
 /// name such as `CD4-positive, alpha-beta T cell`); else on commas. Fields are trimmed and
-/// unquoted.
+/// unquoted; empty ones (an aligning double tab, a stray trailing tab) are dropped.
 fn split_tab_first(line: &str) -> Vec<&str> {
     use legume_numeric::matrix::table::Delimiter;
+    let line = line.trim();
     let delim = if line.contains('\t') {
         Delimiter::Tab
     } else {
         Delimiter::Comma
     };
-    delim.split(line)
+    delim
+        .split(line)
+        .into_iter()
+        .filter(|f| !f.is_empty())
+        .collect()
 }
 
 /// A label as a type name: spaces → `_`.
@@ -338,28 +343,23 @@ fn type_key(label: &str) -> Box<str> {
 }
 
 /// The first two fields of every row of a two-column label file (gz-aware), split by
-/// [`split_tab_first`]. Blank rows, rows with fewer than two fields and comment rows (a first
-/// field starting with `#`, indented or quoted) are skipped.
+/// [`split_tab_first`]. Rows with fewer than two fields and comment rows (a first field
+/// starting with `#` or `%`, indented or quoted) are skipped; a line that is not UTF-8 is an
+/// error.
 fn read_two_field_rows(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
-    use legume_numeric::matrix::common_io::read_lines_of_words_generic;
-    let split = |line: &str| -> Vec<Box<str>> {
-        split_tab_first(line)
-            .into_iter()
-            .take(2)
-            .map(Box::from)
-            .collect()
-    };
-    Ok(read_lines_of_words_generic(path, -1, split, split)
-        .with_context(|| format!("reading {path}"))?
-        .lines
-        .into_iter()
-        .filter_map(|words| {
-            let mut words = words.into_iter();
-            let (first, second) = (words.next()?, words.next()?);
-            (!first.is_empty() && !first.starts_with('#') && !second.is_empty())
-                .then_some((first, second))
-        })
-        .collect())
+    use legume_numeric::matrix::common_io::open_buf_reader;
+    use std::io::BufRead;
+    let mut rows = Vec::new();
+    for line in open_buf_reader(path)?.lines() {
+        let line = line?;
+        let mut fields = split_tab_first(&line).into_iter();
+        if let (Some(first), Some(second)) = (fields.next(), fields.next()) {
+            if !first.starts_with(['#', '%']) {
+                rows.push((Box::from(first), Box::from(second)));
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// Parse a marker TSV/CSV into `(gene, celltype)` pairs ([`read_two_field_rows`], a
@@ -380,20 +380,26 @@ pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
 }
 
 /// Read the curated `label<TAB>CL:id` map ([`read_two_field_rows`], rows whose id is not a
-/// `CL:` id skipped as a header), keyed by [`type_key`] like the panel's type names. One label
-/// with two ids is an error.
+/// `CL:` id skipped as a header), keyed by [`type_key`] like the panel's type names. Two ids
+/// for one key is an error.
 pub(super) fn read_label_map(path: &str) -> Result<FxHashMap<Box<str>, Box<str>>> {
+    use std::collections::hash_map::Entry;
     let mut map: FxHashMap<Box<str>, Box<str>> = FxHashMap::default();
     for (label, id) in read_two_field_rows(path)
         .with_context(|| format!("reading label→id map {path}"))?
         .into_iter()
         .filter(|(_, id)| id.starts_with("CL:"))
     {
-        if let Some(prev) = map.insert(type_key(&label), id.clone()) {
-            anyhow::ensure!(
-                prev == id,
-                "label {label:?} mapped to two different ids in {path}: {prev} vs {id}"
-            );
+        match map.entry(type_key(&label)) {
+            Entry::Occupied(e) => anyhow::ensure!(
+                *e.get() == id,
+                "labels keyed {:?} (spaces as `_`) map to two ids in {path}: {} and {id} (at {label:?})",
+                e.key(),
+                e.get()
+            ),
+            Entry::Vacant(e) => {
+                e.insert(id);
+            }
         }
     }
     anyhow::ensure!(!map.is_empty(), "no `label<TAB>id` rows parsed from {path}");
