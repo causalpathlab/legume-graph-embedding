@@ -324,8 +324,8 @@ fn partition_by_group_reports_background_modules() {
         .filter(|&m| part.background[m as usize])
         .collect();
     assert_eq!(bg.len(), 1, "one background module for group 1: {bg:?}");
-    for i in d0..n {
-        assert_eq!(part.labels[i], bg[0]);
+    for &label in &part.labels[d0..n] {
+        assert_eq!(label, bg[0]);
     }
 }
 
@@ -345,17 +345,11 @@ fn without_a_size_minimum_the_background_is_chosen_by_activity_alone() {
         .collect();
     assert_eq!(bg.len(), 1, "one flagged background: {bg:?}");
     // `planted(3, 10, 5, 10, ..)`: rows 30..45 are flat or never counted.
-    for i in 30..45 {
-        assert_eq!(
-            part.labels[i], bg[0],
-            "flat/empty row {i} not in background"
-        );
+    for (i, &label) in (30..45).zip(&part.labels[30..45]) {
+        assert_eq!(label, bg[0], "flat/empty row {i} not in background");
     }
-    for i in d0..n {
-        assert_ne!(
-            part.labels[i], bg[0],
-            "active single row {i} sent to background"
-        );
+    for (i, &label) in (d0..n).zip(&part.labels[d0..n]) {
+        assert_ne!(label, bg[0], "active single row {i} sent to background");
     }
 }
 

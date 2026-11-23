@@ -157,40 +157,6 @@ fn the_distillation_fits_a_planted_target_on_held_out_pseudobulks() {
         report.held_out_cosine
     );
 
-    // The likelihood refinement starts from the distilled map and lowers the
-    // cells' own per-count NLL — the objective it trains is the one reported.
-    // Forced by `refine`'s signature only: it now takes the fit's encoder SET
-    // and one dictionary per track, which on this one-track axis is this trunk
-    // and one dictionary. No assertion below changed.
-    let encs = CellEncoders::new(
-        vec![TrackEncoder {
-            track: 0,
-            name: "t0".into(),
-            rows: (0..D as u32).collect(),
-            encoder,
-        }],
-        D,
-    );
-    let dicts = vec![FrozenDict::new(&feat, &b, H, &dev).unwrap()];
-    let refined = refine(
-        &encs,
-        &dicts,
-        &[std::borrow::Cow::Borrowed(folded.as_slice())],
-        1.0,
-        3,
-        &dev,
-    )
-    .unwrap();
-    let encoder = &encs.iter()[0].encoder;
-    assert_eq!(refined.n_cells, n_cells);
-    assert!(refined.nll_per_count_before.is_finite() && refined.nll_per_count_after.is_finite());
-    assert!(
-        refined.nll_per_count_after < refined.nll_per_count_before,
-        "NLL/count {} → {}",
-        refined.nll_per_count_before,
-        refined.nll_per_count_after
-    );
-
     // Saved and reloaded on the same dictionary, the trunk places the same
     // rows at the same points: one estimator, both halves.
     let path = std::env::temp_dir().join(format!(
@@ -318,8 +284,14 @@ fn one_track_fixture() -> OneTrackFixture {
     }
 }
 
-/// `project_cells` on the one-track fixture, returning `(θ, b_cell)`.
-fn one_track_project(fx: &OneTrackFixture) -> (Vec<f32>, Vec<f32>) {
+/// `project_cells` on the fixture's cells and its one-level distillation, on
+/// `tracks` (and `collapse`), with the distillation seeded by `seed`.
+fn project_fixture(
+    fx: &OneTrackFixture,
+    tracks: &TrackSpec,
+    collapse: Option<&RowCollapse>,
+    seed: u64,
+) -> (Phase2Out, CellEncoders) {
     let dev = Device::Cpu;
     let cells: Vec<(u32, &[u32], &[f32])> = fx
         .edges
@@ -343,10 +315,14 @@ fn one_track_project(fx: &OneTrackFixture) -> (Vec<f32>, Vec<f32>) {
     }];
     let spec = DistillSpec {
         levels: &levels,
-        seed: 20_260_914,
+        seed,
     };
-    let (out, encs) =
-        project_cells(&input, &cells, None, &spec, &TrackSpec::base(D), None).unwrap();
+    project_cells(&input, &cells, None, &spec, tracks, collapse).unwrap()
+}
+
+/// `project_cells` on the one-track fixture, returning `(θ, b_cell)`.
+fn one_track_project(fx: &OneTrackFixture) -> (Vec<f32>, Vec<f32>) {
+    let (out, encs) = project_fixture(fx, &TrackSpec::base(D), None, 20_260_914);
     // One count track, so exactly one encoder — the file `senna bge` persists.
     assert_eq!(encs.iter().len(), 1);
     assert!(encs.single().is_some());
@@ -361,49 +337,49 @@ fn one_track_project(fx: &OneTrackFixture) -> (Vec<f32>, Vec<f32>) {
 ///
 /// The bar is 5e-4, not exact: the global gradient-norm clip sums the
 /// per-parameter squares in `GradStore`'s hash-map order, which differs between
-/// processes, so the clip factor — and through the refinement, the answer — can
-/// move run to run *within one build*. The six runs behind the snapshot agreed
-/// far inside the bar, and re-seeding track 0 off `spec.seed` moves θ[0] by
-/// well over it.
+/// processes, so the clip factor — and through the distillation, the answer —
+/// can move run to run *within one build*. Six runs in separate processes
+/// agreed to the printed precision when the snapshot was taken, and
+/// re-seeding track 0 off `spec.seed` moves θ[0] by well over the bar.
 #[test]
-fn one_track_project_cells_matches_the_previous_output() {
+fn one_track_project_cells_matches_its_snapshot() {
     #[rustfmt::skip]
     const THETA: [f32; FIX_CELLS * H] = [
-        0.203109, -0.107541, -0.157314, 0.058433, -0.086704, -0.152246,
-        -0.045752, 0.085753, 0.015765, -0.041326, 0.176028, -0.036660,
-        0.267939, -0.087062, -0.182925, -0.042972, -0.019994, -0.176514,
-        -0.092915, 0.123936, -0.005518, -0.110193, 0.279293, 0.002435,
-        0.265573, -0.143911, -0.158012, -0.065789, -0.076130, -0.149596,
-        0.020219, 0.033865, -0.057489, -0.110193, 0.279293, 0.002435,
-        0.194284, -0.131810, -0.127327, -0.076847, -0.010759, -0.093634,
-        -0.038931, 0.031786, -0.009169, -0.077517, 0.295738, 0.015932,
-        0.085314, -0.109521, -0.066885, -0.051909, 0.071052, -0.047744,
-        -0.032488, 0.015211, 0.018998, -0.070097, 0.266701, 0.016663,
-        0.085314, -0.109521, -0.066885, -0.057143, 0.030019, -0.030547,
-        -0.063254, -0.002902, 0.119968, -0.030610, 0.238321, 0.028054,
-        0.042879, -0.045137, -0.017436, -0.045018, -0.025343, 0.031198,
-        -0.089959, -0.099387, 0.170223, -0.023186, 0.219146, 0.025290,
-        0.043764, -0.066149, -0.046222, -0.045018, -0.025343, 0.031198,
-        -0.092799, -0.135982, 0.186704, -0.068617, 0.196431, 0.028556,
-        0.043764, -0.066149, -0.046222, -0.006413, -0.065482, 0.052580,
-        -0.022780, -0.145474, 0.204507, -0.042115, 0.042647, 0.124450,
-        0.081346, -0.078643, -0.011180, -0.002283, -0.054526, 0.030870,
-        -0.022780, -0.145474, 0.204507, -0.014857, -0.005274, 0.159811,
-        0.120790, -0.088061, -0.165305, -0.037615, -0.076657, 0.019209,
-        -0.003736, -0.126952, 0.181781, -0.005667, -0.014257, 0.058296,
-        0.085639, -0.045470, -0.133344, -0.021665, -0.069696, -0.042657,
-        -0.040255, -0.105655, 0.193101, -0.005667, -0.014257, 0.058296,
+        0.038609, -0.143939, -0.057067, -0.007485, -0.191772, 0.061527,
+        -0.009132, 0.030710, 0.033948, 0.008459, -0.023417, 0.077106,
+        0.089336, -0.188895, -0.025509, -0.028137, -0.146537, 0.046357,
+        -0.033967, 0.035642, 0.053604, -0.001857, 0.005392, 0.109993,
+        0.108762, -0.196808, -0.053541, -0.040000, -0.150706, 0.041384,
+        0.002826, -0.038478, 0.026355, -0.001857, 0.005392, 0.109993,
+        0.053914, -0.157894, -0.052658, -0.039947, -0.083103, 0.049308,
+        -0.021623, 0.030577, 0.024395, 0.023949, 0.040979, 0.075716,
+        -0.005154, -0.078345, -0.060801, -0.023708, -0.000501, 0.043300,
+        -0.005764, 0.077635, -0.002974, 0.022677, 0.033378, 0.072825,
+        -0.005154, -0.078345, -0.060801, -0.028708, 0.006277, 0.031275,
+        -0.010857, 0.100085, 0.016485, 0.027494, 0.047177, 0.048505,
+        -0.019381, 0.035689, -0.068743, 0.004772, 0.067739, -0.006403,
+        -0.004648, 0.079746, 0.020654, 0.019075, 0.064556, 0.016991,
+        -0.023205, -0.003779, -0.070722, 0.004772, 0.067739, -0.006403,
+        -0.011607, 0.078597, 0.010932, 0.000930, 0.089497, -0.004441,
+        -0.023205, -0.003779, -0.070722, 0.008781, 0.081176, -0.019463,
+        -0.000278, 0.073619, -0.017315, -0.012439, 0.060957, 0.012248,
+        -0.003716, 0.041259, -0.088413, 0.010429, 0.071922, -0.019956,
+        -0.000278, 0.073619, -0.017315, -0.005960, 0.058458, -0.003796,
+        -0.009595, -0.039312, -0.124772, 0.004892, 0.052004, -0.021015,
+        0.000227, 0.067612, -0.031015, -0.008387, 0.012187, -0.001883,
+        -0.016314, -0.017921, -0.096118, -0.022214, -0.019675, 0.003209,
+        0.003059, 0.061397, -0.002378, -0.008387, 0.012187, -0.001883,
     ];
     #[rustfmt::skip]
     const B_CELL: [f32; FIX_CELLS] = [
-        0.375882, 0.442689, 0.501585, 0.364092, 0.433011, 0.492288,
-        0.430064, 0.467982, 0.302100, 0.553641, 0.445128, 0.467982,
-        0.379358, 0.496944, 0.443856, 0.347053, 0.317504, 0.372328,
-        0.507619, 0.352778, 0.317504, 0.440672, 0.383090, 0.363420,
-        0.244760, 0.383526, 0.311893, 0.431103, 0.163324, 0.383526,
-        0.379372, 0.294358, 0.163324, 0.319245, 0.314993, 0.240584,
-        0.166783, 0.244607, 0.314993, 0.318938, 0.154058, 0.316019,
-        0.317954, 0.387527, 0.236552, 0.314083, 0.315606, 0.387527,
+        0.384616, 0.449633, 0.507936, 0.387837, 0.450988, 0.509984,
+        0.445485, 0.512177, 0.315863, 0.566129, 0.450534, 0.512177,
+        0.385221, 0.509214, 0.445622, 0.387037, 0.312507, 0.383234,
+        0.503140, 0.387134, 0.312507, 0.446473, 0.377105, 0.385873,
+        0.231277, 0.379428, 0.310526, 0.447012, 0.153180, 0.379428,
+        0.378272, 0.308659, 0.153180, 0.308881, 0.308750, 0.236378,
+        0.150434, 0.235545, 0.308750, 0.310228, 0.151208, 0.310409,
+        0.308158, 0.381767, 0.232367, 0.313236, 0.310978, 0.381767,
     ];
     let (theta, b_cell) = one_track_project(&one_track_fixture());
     assert_eq!(theta.len(), THETA.len());
@@ -411,13 +387,13 @@ fn one_track_project_cells_matches_the_previous_output() {
     for (i, (&got, &want)) in theta.iter().zip(&THETA).enumerate() {
         assert!(
             (got - want).abs() < 5e-4,
-            "θ[{i}] drifted from the pre-change output: {got} vs {want}"
+            "θ[{i}] drifted from the snapshot: {got} vs {want}"
         );
     }
     for (i, (&got, &want)) in b_cell.iter().zip(&B_CELL).enumerate() {
         assert!(
             (got - want).abs() < 5e-4,
-            "b_cell[{i}] drifted from the pre-change output: {got} vs {want}"
+            "b_cell[{i}] drifted from the snapshot: {got} vs {want}"
         );
     }
 }
@@ -440,29 +416,6 @@ fn two_track_spec() -> TrackSpec {
             crate::fit::config::TrackInfo {
                 name: "m1/t1".into(),
                 is_count: true,
-            },
-        ],
-    }
-}
-
-/// Two count tracks over rows `0..4` / `4..8` and a NON-count track over
-/// `8..12`.
-fn three_track_spec() -> TrackSpec {
-    TrackSpec {
-        track_of_row: (0..D).map(|r| (r / 4) as u32).collect(),
-        gene_of_row: (0..D).map(|r| (r % 4) as u32).collect(),
-        tracks: vec![
-            crate::fit::config::TrackInfo {
-                name: "t0".into(),
-                is_count: true,
-            },
-            crate::fit::config::TrackInfo {
-                name: "t1".into(),
-                is_count: true,
-            },
-            crate::fit::config::TrackInfo {
-                name: "t2".into(),
-                is_count: false,
             },
         ],
     }
@@ -701,85 +654,6 @@ fn save_and_load_round_trip_per_track() {
     }
 }
 
-#[test]
-fn refine_lowers_the_summed_nll_with_a_third_non_count_track_present() {
-    let dev = Device::Cpu;
-    let spec = three_track_spec();
-    spec.validate(D).unwrap();
-    let (feat, b) = dict_feat();
-    let folded = rows(64);
-    let by_track = split_rows_by_track(&folded, &spec);
-    assert_eq!(by_track.len(), 3);
-    let dicts: Vec<FrozenDict> = (0..3)
-        .map(|t| FrozenDict::for_rows(&feat, &b, H, &spec.rows_of_track(t), &dev).unwrap())
-        .collect();
-    let build = || {
-        CellEncoders::new(
-            spec.count_tracks()
-                .iter()
-                .map(|&t| TrackEncoder {
-                    track: t as u32,
-                    name: spec.tracks[t].name.clone(),
-                    rows: spec.rows_of_track(t),
-                    encoder: {
-                        let rows_t = spec.rows_of_track(t);
-                        let dict = FrozenDict::for_rows(&feat, &b, H, &rows_t, &dev).unwrap();
-                        let mean = gene_mean(&by_track[t], rows_t.len());
-                        let enc = CellEncoder::build(dict, &mean, &dev).unwrap();
-                        seed_trunk(&enc.varmap, 5).unwrap();
-                        enc
-                    },
-                })
-                .collect(),
-            D,
-        )
-    };
-    // `nll_per_count` divides by the counts of every track scored, so the
-    // comparisons below are on the NLL itself, reconstructed from the reported
-    // per-count value and the counts that went into it.
-    let counts_of = |bt: &[Cow<'_, [FoldedRow]>]| -> f64 {
-        bt.iter()
-            .flat_map(|t| t.iter())
-            .flat_map(|r| r.counts.iter())
-            .map(|&v| f64::from(v))
-            .sum()
-    };
-    let nll_of = |st: &RefineStats, bt: &[Cow<'_, [FoldedRow]>]| -> f64 {
-        f64::from(st.nll_per_count_before) * counts_of(bt)
-    };
-
-    // Two count tracks and one that only contributes its likelihood term.
-    let all = build();
-    assert_eq!(all.iter().len(), 2);
-    let three = refine(&all, &dicts, &by_track, 1.0, 9, &dev).unwrap();
-    assert_eq!(three.n_cells, 64);
-    assert!(
-        three.nll_per_count_after < three.nll_per_count_before,
-        "NLL/count {} → {}",
-        three.nll_per_count_before,
-        three.nll_per_count_after
-    );
-
-    // The same two count tracks alone.
-    let two = refine(&build(), &dicts[..2], &by_track[..2], 1.0, 9, &dev).unwrap();
-    let (n3, n2) = (nll_of(&three, &by_track), nll_of(&two, &by_track[..2]));
-    assert!(
-        n3 > n2 + 1.0,
-        "the third track added nothing to the summed NLL: {n3} vs {n2}"
-    );
-
-    // …and an ABSENT third track — present in the spec, no counts on it —
-    // contributes exactly zero, so it puts the NLL back where two tracks had it.
-    let empty: Vec<FoldedRow> = (0..64).map(|_| FoldedRow::new(vec![], vec![])).collect();
-    let absent = [by_track[0].clone(), by_track[1].clone(), Cow::Owned(empty)];
-    let none = refine(&build(), &dicts, &absent, 1.0, 9, &dev).unwrap();
-    let n0 = nll_of(&none, &absent);
-    assert!(
-        (n0 - n2).abs() < 1e-2,
-        "an absent track must contribute exactly 0: {n0} vs {n2}"
-    );
-}
-
 ///////////////////////////////////////////////////
 // One COUNT track is not the same as one track  //
 ///////////////////////////////////////////////////
@@ -803,41 +677,31 @@ fn count_plus_non_count_spec() -> TrackSpec {
     }
 }
 
+/// A non-count track has no encoder, so it does not move `θ`: two cells whose
+/// counts all sit on the non-count track, on different rows and in different
+/// amounts, land at the same point. They still get their own intercepts there.
+#[test]
+fn counts_on_a_non_count_track_alone_do_not_move_the_cell() {
+    let mut fx = one_track_fixture();
+    let spec = count_plus_non_count_spec();
+    // Rows 6..12 are the non-count track t1.
+    fx.edges[0] = (vec![6, 7], vec![3.0, 1.0]);
+    fx.edges[1] = (vec![8, 11], vec![5.0, 2.0]);
+    let (out, _) = project_fixture(&fx, &spec, None, 20_260_914);
+    assert_eq!(out.theta[..H], out.theta[H..2 * H]);
+    assert!(out.other_intercepts[0][..2].iter().all(|v| v.is_finite()));
+}
+
 /// One encoder is NOT one track. With a non-count track present the single
-/// encoder reads only its own `D_0 < F` rows, so the warm start must go through
+/// encoder reads only its own `D_0 < F` rows, so the placement must go through
 /// the split rows: handing it the unsplit global rows indexes a `[n, D_0]`
 /// block at a global feature id and blows up.
 #[test]
 fn one_count_track_beside_a_non_count_track_does_not_take_the_one_track_shortcut() {
-    let dev = Device::Cpu;
     let fx = one_track_fixture();
     let spec = count_plus_non_count_spec();
     spec.validate(D).unwrap();
-    let cells: Vec<(u32, &[u32], &[f32])> = fx
-        .edges
-        .iter()
-        .enumerate()
-        .map(|(i, (f, c))| (i as u32, f.as_slice(), c.as_slice()))
-        .collect();
-    let input = Phase2Input {
-        feat: &fx.feat,
-        b_feat: &fx.b_feat,
-        h: H,
-        n_cells: FIX_CELLS,
-        lambda: 1.0,
-        dev: &dev,
-        label: "Phase 2",
-        gauge_fix: true,
-    };
-    let levels = vec![DistillLevel {
-        e_pb: &fx.e_pb,
-        cell_to_pb: &fx.cell_to_pb,
-    }];
-    let distill_spec = DistillSpec {
-        levels: &levels,
-        seed: 20_260_914,
-    };
-    let (out, encs) = project_cells(&input, &cells, None, &distill_spec, &spec, None).unwrap();
+    let (out, encs) = project_fixture(&fx, &spec, None, 20_260_914);
     // Exactly one encoder, on the count track's rows alone.
     assert_eq!(encs.iter().len(), 1);
     assert_eq!(encs.iter()[0].rows, spec.rows_of_track(0));
@@ -940,23 +804,6 @@ fn load_refuses_a_path_list_that_is_not_exactly_the_count_tracks() {
     }
 }
 
-/// The refinement step is a dense `[step × D]` block with a backward pass, so
-/// it answers to the same activation budget as every other phase-2 block: an
-/// ordinary axis keeps the full step, a very wide one (a multiome axis with
-/// every peak) shrinks it instead of running the device out of memory.
-#[test]
-fn refine_step_answers_to_the_block_budget() {
-    assert_eq!(refine_cells_per_step(30_000), REFINE_CELLS_PER_STEP);
-    let wide = 2_000_000;
-    let step = refine_cells_per_step(wide);
-    assert!(
-        step < REFINE_CELLS_PER_STEP,
-        "step {step} on {wide} features"
-    );
-    assert_eq!(step, block_sgd::block_cells(wide));
-    assert!(refine_cells_per_step(usize::MAX / 1024) >= 1);
-}
-
 /// Phase 2 on a collapsed axis. Every cell's intercept is the FULL axis'
 /// closed form at its `θ` (the collapse is exact for the likelihood), and the
 /// saved encoder, which carries the collapse, places the run's own full-axis
@@ -983,39 +830,7 @@ fn phase_2_on_a_collapsed_axis_is_exact_on_the_full_axis() {
     let collapse = RowCollapse::from_modules(&module_only, &labels).unwrap();
     assert_eq!(collapse.n_rows, 8);
 
-    let cells: Vec<(u32, &[u32], &[f32])> = fx
-        .edges
-        .iter()
-        .enumerate()
-        .map(|(i, (f, c))| (i as u32, f.as_slice(), c.as_slice()))
-        .collect();
-    let input = Phase2Input {
-        feat: &fx.feat,
-        b_feat: &fx.b_feat,
-        h: H,
-        n_cells: FIX_CELLS,
-        lambda: 1.0,
-        dev: &dev,
-        label: "Phase 2",
-        gauge_fix: true,
-    };
-    let levels = vec![DistillLevel {
-        e_pb: &fx.e_pb,
-        cell_to_pb: &fx.cell_to_pb,
-    }];
-    let spec = DistillSpec {
-        levels: &levels,
-        seed: 20_260_922,
-    };
-    let (out, encs) = project_cells(
-        &input,
-        &cells,
-        None,
-        &spec,
-        &TrackSpec::base(D),
-        Some(&collapse),
-    )
-    .unwrap();
+    let (out, encs) = project_fixture(&fx, &TrackSpec::base(D), Some(&collapse), 20_260_922);
     assert_eq!(out.theta.len(), FIX_CELLS * H);
     let tm = &out.gauge.theta_mean;
     let theta = |i: usize| -> Vec<f32> { (0..H).map(|k| out.theta[i * H + k] + tm[k]).collect() };
@@ -1048,6 +863,12 @@ fn phase_2_on_a_collapsed_axis_is_exact_on_the_full_axis() {
     enc.save(&path).unwrap();
     let again = CellEncoder::load(&fx.feat, &fx.b_feat, H, &path, &dev).unwrap();
     std::fs::remove_file(&path).ok();
+    let cells: Vec<(u32, &[u32], &[f32])> = fx
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(i, (f, c))| (i as u32, f.as_slice(), c.as_slice()))
+        .collect();
     let placed = again.encode_edges(&cells).unwrap();
     for i in 0..FIX_CELLS {
         for (k, want) in theta(i).into_iter().enumerate() {
