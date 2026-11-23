@@ -9,7 +9,6 @@
 //! silently left the loss.
 
 use super::config::FitConfig;
-use crate::data::UnifiedData;
 use crate::model::{JointEmbedModel, ModelArgs, ModelInit, ShareFeaturesArgs};
 use legume_numeric::candle::candle_nn::VarMap;
 
@@ -27,16 +26,13 @@ pub(super) struct Heads {
 /// `varmap.all_vars()` therefore updates the feature side once and each head's
 /// cell side independently.
 pub(super) fn build_heads(
-    unified: &UnifiedData,
-    pb_blobs: &[UnifiedData],
+    n_features: usize,
+    n_cells: usize,
+    n_pb_per_level: &[usize],
     config: &FitConfig,
     varmap: &VarMap,
 ) -> anyhow::Result<Heads> {
-    let (n_features, n_cells, h) = (
-        unified.n_features(),
-        unified.n_cells(),
-        config.embedding_dim,
-    );
+    let h = config.embedding_dim;
     let zeros_features = vec![0f32; n_features];
     let zeros_cells = vec![0f32; n_cells];
 
@@ -60,9 +56,8 @@ pub(super) fn build_heads(
         &config.device,
     )?;
 
-    let mut level_models: Vec<JointEmbedModel> = Vec::with_capacity(pb_blobs.len());
-    for (level_idx, pb) in pb_blobs.iter().enumerate() {
-        let n_pb = pb.n_cells();
+    let mut level_models: Vec<JointEmbedModel> = Vec::with_capacity(n_pb_per_level.len());
+    for (level_idx, &n_pb) in n_pb_per_level.iter().enumerate() {
         let prefix = format!("pb_l{level_idx}");
         // Each level's cell side is keyed by its own `{prefix}_e_cell` name, so one base
         // seed yields an independent reproducible init per level.

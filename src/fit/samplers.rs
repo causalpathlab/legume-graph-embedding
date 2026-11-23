@@ -1,4 +1,4 @@
-use crate::data::UnifiedData;
+use super::input::FitInput;
 use crate::loss::modality::ModalityPools;
 use crate::loss::{CellFeatureSampler, PerBatchStratifiedCellSampler};
 use crate::progress::new_progress_bar;
@@ -24,12 +24,12 @@ use rand_distr::weighted::WeightedIndex;
 /// (the cell axis re-indexes at sample time and ignores the original batch id).
 pub(crate) fn subsample_cell_samplers_multilevel(
     full: &[PerBatchStratifiedCellSampler],
-    cell_to_pb_per_level: &[Vec<usize>],
+    cell_to_pb_per_level: &[&[usize]],
     k: usize,
     alpha_cell: f32,
     seed: u64,
 ) -> Vec<PerBatchStratifiedCellSampler> {
-    let n_cells = cell_to_pb_per_level.first().map_or(0, std::vec::Vec::len);
+    let n_cells = cell_to_pb_per_level.first().map_or(0, |c| c.len());
     // Global keep bitmap: ≤k cells per pb-sample, per level, unioned.
     let mut keep = vec![false; n_cells];
     for (level, c2pb) in cell_to_pb_per_level.iter().enumerate() {
@@ -99,33 +99,24 @@ pub(crate) fn subsample_cell_samplers_multilevel(
 /// a batch gets coverage proportional to `degree^alpha_cell` instead
 /// of being drowned by deeply sequenced cells.
 pub(crate) fn build_active_samplers(
-    unified: &UnifiedData,
+    input: &FitInput<'_>,
     alpha_cell: f32,
 ) -> anyhow::Result<Vec<PerBatchStratifiedCellSampler>> {
     // Build the per-batch stratified-cell samplers by **streaming columns**
-    // from the backend, never materializing the flat cell↔feature edge list.
+    // from the count stream, never materializing the flat cell↔feature edge list.
     // The strat-cell sampler groups edges by cell (`per_cell`), which is
     // exactly a column read — so the 5 GB flat triplet list (which only the
-    // unused flat `PerBatch` path ever read) is skipped entirely. The HVG /
-    // frozen subset is honored via `feature_to_backend_row`.
+    // unused flat `PerBatch` path ever read) is skipped entirely. The stream
+    // reports features on the fit's axis (a subset already applied).
     // Split the negative pools by modality so a positive is contrasted against
     // its own panel. `None` for a single panel.
-    let modality_of_feature = unified.feature_modality.clone();
+    let modality_of_feature = input.feature_modality.clone();
 
-    let data = unified.count_backend();
-    let n_cells = data.num_columns();
-    let n_features = unified.n_features();
-    let n_batches = unified.n_batches();
-    let batch_membership = &unified.batch_membership;
-
-    // backend compact row → unified id (u32::MAX ⇒ dropped by a subset).
-    let backend_rows = data.num_rows();
-    let mut backend_to_unified = vec![u32::MAX; backend_rows];
-    for (uid, &brow) in unified.feature_to_backend_row.iter().enumerate() {
-        if brow < backend_rows {
-            backend_to_unified[brow] = uid as u32;
-        }
-    }
+    let data = input.cells;
+    let n_cells = data.n_cells();
+    let n_features = data.n_features();
+    let n_batches = input.batch_names.len();
+    let batch_membership = input.batch_membership;
 
     // Per-batch accumulators, filled as cells stream in.
     let mut active_cells: Vec<Vec<u32>> = vec![Vec::new(); n_batches];
@@ -133,16 +124,7 @@ pub(crate) fn build_active_samplers(
     let mut cell_w: Vec<Vec<f32>> = vec![Vec::new(); n_batches];
     let mut feat_count: Vec<Vec<f32>> = (0..n_batches).map(|_| vec![0f32; n_features]).collect();
 
-    // Slab width targets ~8M edges/slab. When nnz can't be reported
-    // (num_non_zeros errs → 0) fall back to a fixed cell-count slab rather
-    // than the whole matrix, so the streaming memory bound always holds.
-    let chunk = match data.num_non_zeros() {
-        Ok(nnz) if nnz > 0 => {
-            let avg_per_col = (nnz / n_cells.max(1)).max(1);
-            (8_000_000 / avg_per_col).clamp(1, n_cells.max(1))
-        }
-        _ => (1usize << 14).min(n_cells.max(1)),
-    };
+    let chunk = crate::simba::graph::slab_width(data);
     let pb_bar = new_progress_bar(n_cells as u64);
     pb_bar.set_message("strat-cell sampler (streaming columns)");
 
@@ -150,18 +132,14 @@ pub(crate) fn build_active_samplers(
     while start < n_cells {
         let end = (start + chunk).min(n_cells);
         let slab = end - start;
-        // Group this slab's nonzeros by local column (cell). `for_each_triplet`
-        // emits out_col relative to the passed `start..end`, i.e. 0..slab.
+        // Group this slab's nonzeros by local column (cell). `for_each_count`
+        // reports cells relative to the passed `start..end`, i.e. 0..slab.
         let mut col_feats: Vec<Vec<u32>> = vec![Vec::new(); slab];
         let mut col_counts: Vec<Vec<f32>> = vec![Vec::new(); slab];
         let mut col_wts: Vec<Vec<f32>> = vec![Vec::new(); slab];
         let mut col_deg: Vec<f32> = vec![0.0; slab];
-        data.for_each_triplet(start..end, slab, |brow, local_col, v| {
+        data.for_each_count(start..end, &mut |uid, local_col, v| {
             if v == 0.0 {
-                return;
-            }
-            let uid = backend_to_unified[brow as usize];
-            if uid == u32::MAX {
                 return;
             }
             let lc = local_col as usize;
@@ -200,7 +178,7 @@ pub(crate) fn build_active_samplers(
     let mut active: Vec<PerBatchStratifiedCellSampler> = Vec::new();
     for b in 0..n_batches {
         if active_cells[b].is_empty() {
-            empty.push(unified.batch_names[b].as_ref());
+            empty.push(input.batch_names[b].as_ref());
             continue;
         }
         let cell_picker = WeightedIndex::new(std::mem::take(&mut cell_w[b])).expect("cell weights");

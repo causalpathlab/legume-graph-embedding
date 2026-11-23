@@ -25,7 +25,6 @@
 )]
 
 pub mod cell_projection;
-pub mod data;
 pub mod embedding_dim;
 pub mod eval;
 pub mod feature_qc;
@@ -33,17 +32,14 @@ pub mod fit;
 pub mod fne;
 pub mod loss;
 pub mod model;
-pub mod multiome_plan;
 pub mod postprocess;
 pub mod preset_mode;
 pub mod progress;
 pub mod simba;
+pub mod training_data;
 pub mod transfer;
 pub mod type_annotation;
 
-pub use data::{load_unified_data, validate_multiome_groups, LoadUnifiedArgs, UnifiedData};
-pub use data_beans::alg::refine_multilevel::RefineParams;
-pub use data_beans::aux::feature_names::FeatureNameKind;
 pub use embedding_dim::EmbeddingDim;
 pub use eval::{
     embedding_col_names, save_embedding, save_outputs, save_outputs_named,
@@ -52,18 +48,16 @@ pub use eval::{
 pub use feature_qc::{hvg_feature_qc, FeatureQcConfig, FeatureQcResult};
 pub use fit::{
     fit, partition_modules, validate_offset_rank, CellEncoders, CisCoupling, CisGateReadout,
-    CisGates, FeatureModuleArgs, FeatureModuleConfig, FitConfig, FitOutput, MultiomeOptions,
-    ParentModulesOwned, TrackEncoder, TrackInfo, TrackSpec,
+    CisGates, FeatureModuleArgs, FeatureModuleConfig, FitConfig, FitInput, FitOutput,
+    MultiomeOptions, ParentModulesOwned, TrackEncoder, TrackInfo, TrackSpec,
 };
 pub use model::JointEmbedModel;
-pub use multiome_plan::{
-    detect_multiome_plan, plan_from_axes, read_file_axes, FileAxes, MultiomePlan,
-};
 pub use postprocess::{
     cell_clusters, coembed_placement, feature_coembedding, feature_coembedding_fixed_t,
     CoembedPlacement, NearestCells, PlacementViolation,
 };
 pub use preset_mode::{LoraArgs, LoraSpec, PresetMode, PresetOffsets, PresetRows};
+pub use training_data::{CellCountStream, PseudobulkLevels};
 
 /// Graceful-stop on Ctrl+C. Lives in `legume_numeric::matrix` so the annotation crates *below* this one
 /// (`enrichment`, which owns the raw-count marker bootstrap) can share the same flag and the same

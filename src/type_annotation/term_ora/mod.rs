@@ -71,9 +71,8 @@ use clustering::{cell_knn_graph, cluster_cells, cluster_sizes};
 use log::{info, warn};
 use ora::{capped_n_perm, cluster_best, cluster_calls, cluster_term_ora, ln_factorials, Want};
 use output::{
-    log_cluster_calls, report_bootstrap, report_consensus, report_panel_null, run_ontology,
-    write_annot_parquet, write_bootstrap_outputs, write_calibration, write_cluster_term_matrices,
-    write_panel_null,
+    log_cluster_calls, report_bootstrap, report_consensus, report_panel_null, write_annot_parquet,
+    write_bootstrap_outputs, write_calibration, write_cluster_term_matrices, write_panel_null,
 };
 
 /// `super::panel_null` reaches the centroids through here, so the path it has always used
@@ -102,8 +101,6 @@ pub const TERM_ORA_OUTPUT_SUFFIXES: &[&str] = &[
     ".cluster_term_q.parquet",
     ".cluster_term_softq.parquet",
     ".null_calibration.tsv",
-    ".ontology_assignment.tsv",
-    ".ontology_node_mass.parquet",
     ".label_stability.parquet",
     ".marker_support.parquet",
     ".type_qc.tsv",
@@ -136,14 +133,6 @@ pub struct TermOraConfig {
     pub fdr_alpha: f32,
     /// Softmax temperature when building the row-normalized Q over significant terms.
     pub q_temperature: f32,
-    /// Cell Ontology OBO path — runs the TreeBH ontology layer when set with `label_cl`.
-    pub obo: Option<String>,
-    /// Curated `label<TAB>CL:id` map (paired with `obo`).
-    pub label_cl: Option<String>,
-    /// TreeBH per-level selective-FDR target.
-    pub ontology_fdr_q: f64,
-    /// Benjamini–Yekutieli within ontology families (any dependence).
-    pub ontology_by: bool,
     /// Draws for the **marker-panel permutation null** ([`super::panel_null`]) — the *bias*
     /// guard the bootstrap cannot supply. `0` ⇒ off.
     pub panel_perm: usize,
@@ -176,10 +165,6 @@ impl Default for TermOraConfig {
             assign_mad: 2.5,
             fdr_alpha: 0.1,
             q_temperature: 1.0,
-            obo: None,
-            label_cl: None,
-            ontology_fdr_q: 0.1,
-            ontology_by: false,
             panel_perm: 0,
             support_perm: 0,
             bootstrap: None,
@@ -351,10 +336,6 @@ fn annotate_inner(
     regroup: Option<&Regroup<'_>>,
     cfg: &TermOraConfig,
 ) -> Result<CommunityCalls> {
-    anyhow::ensure!(
-        cfg.obo.is_some() == cfg.label_cl.is_some(),
-        "--obo and --label-cl must be given together to run the ontology layer (got only one)"
-    );
     let &InputEmbeddings {
         feature_emb,
         gene_names,
@@ -716,21 +697,6 @@ fn annotate_inner(
     write_cluster_term_matrices(out_prefix, &comm_names, &type_names, &ora)?;
     write_calibration(out_prefix, &ora, n_assigned, n_outliers)?;
     log_cluster_calls(&cluster_label, &type_names, &sizes);
-
-    //////////////////////////////////////////////////////////////////
-    // 7. optional ontology (TreeBH over the cluster × term matrix) //
-    //////////////////////////////////////////////////////////////////
-    if let (Some(obo), Some(label_cl)) = (cfg.obo.as_deref(), cfg.label_cl.as_deref()) {
-        run_ontology(
-            out_prefix,
-            obo,
-            label_cl,
-            &comm_names,
-            &type_names,
-            &ora,
-            cfg,
-        )?;
-    }
 
     // Per-community calls, so a trajectory caller can name each node directly.
     //

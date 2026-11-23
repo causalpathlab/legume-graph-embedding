@@ -258,10 +258,10 @@ pub(super) fn assign_nearest(
 
 /// Mark `assign[c] = UNASSIGNED` for cells whose distance to their assigned
 /// centroid is a high-side robust outlier (`> median + k·MAD`) within that term
-/// — the shared `data_beans::qc_lib` robust-band idiom. Terms with < 3 assigned
+/// — the shared `legume_numeric::matrix::robust_band` idiom. Terms with < 3 assigned
 /// cells are left intact (too few to define a band). Returns the number pruned.
 pub(super) fn prune_outliers(assign: &mut [usize], dist: &[f32], c: usize, k: f64) -> usize {
-    use data_beans::qc_lib::{robust_outlier_keep, Tail};
+    use legume_numeric::matrix::robust_band::{robust_outlier_keep, Tail};
     // Per-term cell indices (post-assignment).
     let mut per_term: Vec<Vec<usize>> = vec![Vec::new(); c];
     for (i, &t) in assign.iter().enumerate() {

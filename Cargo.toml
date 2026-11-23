@@ -1,6 +1,6 @@
 [package]
 name = "legume-graph-embedding"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -30,9 +30,9 @@ metal = [
 ]
 
 [dependencies]
-data-beans = { version = "0.13", default-features = false, features = ["aux", "alg"] }
-legume-numeric = { version = "0.10", features = ["matrix", "param", "candle", "mcmc"] }
+legume-numeric = { version = "0.10.11", features = ["matrix", "param", "candle", "mcmc"] }
 enrichment = { version = "0.5", package = "legume-enrichment" }
+genomic-data = { version = "0.6.2", package = "legume-genomic-types" }
 
 anyhow = "1.0"
 clap = { version = "4.5.20", features = ["derive"] }
@@ -48,6 +48,6 @@ statrs = { version = "0.18", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
+nalgebra-sparse = "0.11"
 serde_json = "1.0"
-data-beans = { version = "0.13", default-features = false, features = ["aux", "alg"] }
 nalgebra = "0.34"

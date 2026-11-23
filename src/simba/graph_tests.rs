@@ -1,7 +1,6 @@
 use super::*;
 use crate::simba::auto_wd;
-use data_beans::sparse_io::{create_sparse_from_triplets, SparseIoBackend};
-use data_beans::sparse_io_vector::SparseIoVec;
+use nalgebra_sparse::{CooMatrix, CscMatrix};
 
 fn approx(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol
@@ -43,7 +42,7 @@ fn auto_wd_uses_the_small_graph_formula_below_fifty_million_edges_and_the_large_
 /// that dominates cell 0's library and carries the largest log-normalized
 /// value in the matrix, so it must shape both the library sizes and the
 /// histogram range without ever becoming an edge.
-fn tiny_backend() -> SparseIoVec {
+fn tiny_backend() -> CscMatrix<f32> {
     // (row = gene, col = cell, value)
     let triplets: Vec<(u64, u64, f32)> = vec![
         (0, 0, 90.0),
@@ -55,22 +54,12 @@ fn tiny_backend() -> SparseIoVec {
         (1, 2, 1.0),
         (2, 2, 1.0), // cell 2: lib 2
     ];
-    let shape = (4usize, 3usize, triplets.len());
-    let mut b = create_sparse_from_triplets(&triplets, shape, None, Some(&SparseIoBackend::Zarr))
-        .expect("backend");
-    b.register_row_names_vec(
-        &(0..4)
-            .map(|g| format!("g{g}").into_boxed_str())
-            .collect::<Vec<_>>(),
-    );
-    b.register_column_names_vec(
-        &(0..3)
-            .map(|c| format!("c{c}").into_boxed_str())
-            .collect::<Vec<_>>(),
-    );
-    let mut v = SparseIoVec::new();
-    v.push(std::sync::Arc::from(b), None).expect("push");
-    v
+    let (n_rows, n_cols) = (4usize, 3usize);
+    let mut coo = CooMatrix::new(n_rows, n_cols);
+    for (r, c, v) in triplets {
+        coo.push(r as usize, c as usize, v);
+    }
+    CscMatrix::from(&coo)
 }
 
 #[test]

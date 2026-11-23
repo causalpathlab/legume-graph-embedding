@@ -16,16 +16,12 @@
 //! resolution, where sparsity plays no part, the divide agreed across studies
 //! markedly better than the offset.
 //!
-//! This module turns the collapse's `δ` into that fold on the unified axes:
-//! batches matched **by name** (the count backend numbers batches by sorted name,
-//! the unified data by first appearance), rows gathered onto the unified feature
-//! axis, floored so a gene a batch never measured divides by a small positive
-//! number rather than zero.
+//! This module turns the collapse's `δ` (columns in the cells' batch-id order)
+//! into that fold, floored so a gene a batch never measured divides by a small
+//! positive number rather than zero.
 
 use super::projection::CellBatchFold;
-use anyhow::Context;
 use nalgebra::DMatrix;
-use rustc_hash::FxHashMap;
 
 /// Floor on a posterior-mean `δ`, so a gene a batch never measured stays a finite
 /// positive divisor.
@@ -60,55 +56,30 @@ impl BatchGeneFold {
     }
 }
 
-/// What [`batch_gene_fold`] reads.
-pub(crate) struct FoldSource<'a> {
-    /// The collapse's `δ` posterior mean, `[backend_rows × collapse_batches]`.
-    pub delta: &'a DMatrix<f32>,
-    /// The collapse's batch names, in `delta`'s column order.
-    pub collapse_batch_names: &'a [Box<str>],
-    /// Unified batch names, in unified batch-id order.
-    pub unified_batch_names: &'a [Box<str>],
-    pub n_features: usize,
-    /// Unified feature → backend row.
-    pub feature_to_backend: &'a [usize],
-}
-
-/// Build the per-batch fold table, or `None` when there is a single unified
-/// batch (nothing to correct against).
-pub(crate) fn batch_gene_fold(src: FoldSource) -> anyhow::Result<Option<BatchGeneFold>> {
-    let n_batches = src.unified_batch_names.len();
+/// Build the per-batch fold table from `delta` (`[n_features × n_batches]`,
+/// columns in `batch_names` order), or `None` when there is a single batch
+/// (nothing to correct against).
+pub(crate) fn batch_gene_fold(
+    delta: &DMatrix<f32>,
+    batch_names: &[Box<str>],
+) -> anyhow::Result<Option<BatchGeneFold>> {
+    let n_batches = batch_names.len();
     if n_batches < 2 {
         return Ok(None);
     }
     anyhow::ensure!(
-        src.delta.ncols() == src.collapse_batch_names.len(),
-        "collapse δ has {} columns but {} batch names",
-        src.delta.ncols(),
-        src.collapse_batch_names.len()
+        delta.ncols() == n_batches,
+        "δ has {} columns for {n_batches} batches",
+        delta.ncols()
     );
-    let col_of: FxHashMap<&str, usize> = src
-        .collapse_batch_names
-        .iter()
-        .enumerate()
-        .map(|(c, name)| (name.as_ref(), c))
+    let n_features = delta.nrows();
+    let fold = (0..n_batches)
+        .flat_map(|b| (0..n_features).map(move |f| delta[(f, b)].max(DELTA_FLOOR)))
         .collect();
-    let delta =
-        super::setup::gather_to_unified_axis(src.delta, src.n_features, src.feature_to_backend);
-    let n_features = src.n_features;
-    let mut fold = Vec::with_capacity(n_batches * n_features);
-    for name in src.unified_batch_names {
-        let &c = col_of.get(name.as_ref()).with_context(|| {
-            format!(
-                "batch {name:?} has no δ column in the collapse (collapse batches: {})",
-                src.collapse_batch_names.join(", ")
-            )
-        })?;
-        fold.extend((0..n_features).map(|f| delta[(f, c)].max(DELTA_FLOOR)));
-    }
     Ok(Some(BatchGeneFold {
         delta: fold,
         n_features,
-        batch_names: src.unified_batch_names.to_vec(),
+        batch_names: batch_names.to_vec(),
     }))
 }
 

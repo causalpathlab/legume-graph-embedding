@@ -1,6 +1,34 @@
-use crate::data::Triplet;
 use crate::fit::config::TrackSpec;
 use crate::fit::projection::CellBatchFold;
+use rayon::prelude::*;
+
+/// One pseudobulk-feature edge of phase 1.
+#[derive(Clone, Copy)]
+pub struct Triplet {
+    pub cell: u32,
+    pub feature: u32,
+    pub count: f32,
+}
+
+/// The nonzero entries of `rates` (`[n_features × n_pb]`) as triplets, a
+/// pseudobulk's entries together, features ascending within each.
+#[must_use]
+pub fn pb_triplets(rates: &nalgebra::DMatrix<f32>) -> Vec<Triplet> {
+    let n_features = rates.nrows();
+    (0..rates.ncols())
+        .into_par_iter()
+        .flat_map_iter(|s| {
+            (0..n_features).filter_map(move |g| {
+                let c = rates[(g, s)];
+                (c > 0.0).then_some(Triplet {
+                    cell: s as u32,
+                    feature: g as u32,
+                    count: c,
+                })
+            })
+        })
+        .collect()
+}
 
 /// Every unit's feature rows and counts, plus its exposure per TRACK.
 ///

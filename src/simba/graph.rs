@@ -1,10 +1,10 @@
 //! `si.tl.gen_graph`: the cell–gene edge list with one relation per level.
 //!
-//! Entities are the cells (every column of the backend) and the HVGs (the
+//! Entities are the cells (every cell of the count stream) and the HVGs (the
 //! caller's `hvg_rows`, in that order). Every nonzero HVG entry is one edge
 //! `(cell, gene, level)`. The level comes from [`super::discretize`], which
 //! sees the log-normalized nonzero values of ALL genes — SIMBA discretizes
-//! before it subsets to the HVGs — so the build streams the backend twice:
+//! before it subsets to the HVGs — so the build streams the counts twice:
 //! pass 1 takes library sizes, the global value range and the HVG entries;
 //! pass 2 fills the histogram over every gene. Peak memory is one column slab
 //! plus the HVG stash (`cell u32 + gene u32 + value f32` per edge, the value
@@ -13,7 +13,7 @@
 use super::discretize::{log_norm, Discretization, Histogram};
 use super::HIST_BINS;
 use crate::progress::new_progress_bar;
-use data_beans::sparse_io_vector::SparseIoVec;
+use crate::training_data::CellCountStream;
 
 /// PBG's `weight` per relation (bin level): `round(linspace(1, 5, n), 2)`
 /// over the levels PRESENT in the graph, ascending. Rust's `round` is
@@ -113,12 +113,13 @@ impl EdgeList {
     }
 }
 
-/// Column-slab width targeting ~8M nonzeros per slab (as the composite
-/// trainer's sampler does), so the streaming memory bound holds.
-fn slab_width(data: &SparseIoVec) -> usize {
-    let n_cells = data.num_columns().max(1);
-    match data.num_non_zeros() {
-        Ok(nnz) if nnz > 0 => {
+/// Cells per slab when streaming counts: ~8M nonzeros per slab, or a fixed
+/// count when the stream cannot say how many it holds, so the streaming
+/// memory bound always holds. Shared by simba and the fit's samplers.
+pub(crate) fn slab_width(data: &dyn CellCountStream) -> usize {
+    let n_cells = data.n_cells().max(1);
+    match data.nnz_hint() {
+        Some(nnz) if nnz > 0 => {
             let avg_per_col = (nnz / n_cells).max(1);
             (8_000_000 / avg_per_col).clamp(1, n_cells)
         }
@@ -126,22 +127,46 @@ fn slab_width(data: &SparseIoVec) -> usize {
     }
 }
 
-/// Build the edge list over `hvg_rows` (backend row indices, which become
+/// The counts of cells `cells`, one `(feature, count)` list per cell, features
+/// ascending and repeats summed.
+fn slab_columns(
+    data: &dyn CellCountStream,
+    cells: std::ops::Range<usize>,
+) -> anyhow::Result<Vec<Vec<(u32, f32)>>> {
+    let mut cols: Vec<Vec<(u32, f32)>> = vec![Vec::new(); cells.len()];
+    data.for_each_count(cells, &mut |row, lc, x| cols[lc as usize].push((row, x)))?;
+    for col in &mut cols {
+        if col.windows(2).all(|w| w[0].0 < w[1].0) {
+            continue;
+        }
+        col.sort_unstable_by_key(|&(row, _)| row);
+        col.dedup_by(|next, kept| {
+            let same = next.0 == kept.0;
+            if same {
+                kept.1 += next.1;
+            }
+            same
+        });
+    }
+    Ok(cols)
+}
+
+/// Build the edge list over `hvg_rows` (feature rows of `data`, which become
 /// gene entities `0..hvg_rows.len()` in that order) with `n_bins` levels.
 pub fn build_edge_list(
-    data: &SparseIoVec,
+    data: &dyn CellCountStream,
     hvg_rows: &[usize],
     n_bins: usize,
 ) -> anyhow::Result<(EdgeList, Discretization)> {
-    let n_cells = data.num_columns();
-    let n_rows = data.num_rows();
+    let n_cells = data.n_cells();
+    let n_rows = data.n_features();
     anyhow::ensure!(n_cells > 0, "simba: no cells");
     anyhow::ensure!(!hvg_rows.is_empty(), "simba: no genes selected");
     let mut hvg_pos = vec![u32::MAX; n_rows];
     for (g, &row) in hvg_rows.iter().enumerate() {
         anyhow::ensure!(
             row < n_rows,
-            "simba: gene row {row} outside the {n_rows} backend rows"
+            "simba: gene row {row} outside the {n_rows} feature rows"
         );
         anyhow::ensure!(
             hvg_pos[row] == u32::MAX,
@@ -162,15 +187,14 @@ pub fn build_edge_list(
     let mut start = 0usize;
     while start < n_cells {
         let end = (start + chunk).min(n_cells);
-        let csc = data.read_columns_csc(start..end)?;
-        for (lc, col) in csc.col_iter().enumerate() {
+        for (lc, col) in slab_columns(data, start..end)?.into_iter().enumerate() {
             let c = start + lc;
-            let s: f64 = col.values().iter().map(|&x| f64::from(x)).sum();
+            let s: f64 = col.iter().map(|&(_, x)| f64::from(x)).sum();
             lib_size[c] = s;
             if s <= 0.0 {
                 continue;
             }
-            for (&row, &x) in col.row_indices().iter().zip(col.values()) {
+            for &(row, x) in &col {
                 if x <= 0.0 {
                     continue;
                 }
@@ -178,7 +202,7 @@ pub fn build_edge_list(
                 let vf = f64::from(v);
                 lo = lo.min(vf);
                 hi = hi.max(vf);
-                let g = hvg_pos[row];
+                let g = hvg_pos[row as usize];
                 if g != u32::MAX {
                     cell.push(c as u32);
                     gene.push(g);
@@ -206,7 +230,7 @@ pub fn build_edge_list(
     let mut start = 0usize;
     while start < n_cells {
         let end = (start + chunk).min(n_cells);
-        data.for_each_triplet(start..end, end - start, |_brow, lc, x| {
+        data.for_each_count(start..end, &mut |_row, lc, x| {
             if x > 0.0 {
                 let s = lib_size[start + lc as usize];
                 if s > 0.0 {
