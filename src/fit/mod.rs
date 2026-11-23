@@ -83,6 +83,11 @@ pub fn fit(input: FitInput<'_>, config: FitConfig) -> anyhow::Result<FitOutput> 
     tracks
         .validate(n_features)
         .context("the fit's track spec does not describe this feature axis")?;
+    anyhow::ensure!(
+        input.sketched_rows.map(<[bool]>::to_vec) == tracks.base_track_rows(),
+        "the pseudobulks were not sketched on the track spec's base-track rows (build them \
+         with `projection_rows = TrackSpec::base_track_rows()`)"
+    );
     let n_tracks = tracks.n_tracks();
     let cell_to_pb_per_level: Vec<&[usize]> = input.levels.iter().map(|l| l.cell_to_pb).collect();
     // Per-batch gene fold for phase 2, from the finest collapse's `δ`. The
@@ -168,7 +173,26 @@ pub fn fit(input: FitInput<'_>, config: FitConfig) -> anyhow::Result<FitOutput> 
     // Build only the dense matrix each branch needs. Both are `[n_features ×
     // n_pb]`; on a wide ATAC axis that is hundreds of MiB each, and leaving
     // both live through hier::train and phase 2 roughly doubles peak memory.
-    let finest_counts = input.finest_counts;
+    let n_finest_pb = input
+        .levels
+        .last()
+        .expect("at least one level")
+        .rates
+        .ncols();
+    let finest_counts = || -> anyhow::Result<(DMatrix<f32>, Vec<f32>)> {
+        let (counts, sizes) = (input.finest_counts)()?;
+        anyhow::ensure!(
+            counts.nrows() == n_features
+                && counts.ncols() == n_finest_pb
+                && sizes.len() == n_finest_pb,
+            "fit: the finest counts are {} × {} with {} sizes; expected {n_features} × \
+             {n_finest_pb}",
+            counts.nrows(),
+            counts.ncols(),
+            sizes.len()
+        );
+        Ok((counts, sizes))
+    };
     let n_per_modality = config
         .feature_modules
         .as_ref()

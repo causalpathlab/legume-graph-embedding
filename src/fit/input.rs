@@ -42,6 +42,10 @@ pub struct FitInput<'a> {
     pub finest_counts: FinestCounts<'a>,
     /// `None` when the collapse fit no δ.
     pub batch_delta: Option<BatchDelta<'a>>,
+    /// The features the pseudobulks were sketched on (`None`: all). Must be
+    /// [`super::TrackSpec::base_track_rows`] of the fit's tracks: on a
+    /// multi-track axis the sketch reads the base track alone.
+    pub sketched_rows: Option<&'a [bool]>,
 }
 
 impl FitInput<'_> {
@@ -74,6 +78,16 @@ impl FitInput<'_> {
                 level.cell_to_pb.len()
             );
         }
+        if let Some(d) = &self.batch_delta {
+            anyhow::ensure!(
+                d.delta.nrows() == n_features && d.delta.ncols() == d.collapse_batch_names.len(),
+                "fit: the batch δ is {} × {}; the counts have {n_features} features and the \
+                 collapse {} batch names",
+                d.delta.nrows(),
+                d.delta.ncols(),
+                d.collapse_batch_names.len()
+            );
+        }
         if let Some(m) = &self.feature_modality {
             anyhow::ensure!(
                 m.len() == n_features,
@@ -82,5 +96,42 @@ impl FitInput<'_> {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra_sparse::{CooMatrix, CscMatrix};
+
+    /// A δ on another feature axis (the backend's rows, say) is refused, not
+    /// read as if its rows were the fit's features.
+    #[test]
+    fn a_delta_off_the_feature_axis_is_refused() {
+        let cells = CscMatrix::from(&CooMatrix::<f32>::new(3, 2));
+        let rates = DMatrix::<f32>::zeros(3, 1);
+        let cell_to_pb = [0usize, 0];
+        let names: Vec<Box<str>> = vec!["a".into(), "b".into()];
+        let finest = || Ok((DMatrix::<f32>::zeros(3, 1), vec![1.0]));
+        let input = |delta| FitInput {
+            cells: &cells,
+            batch_membership: &[0, 1],
+            batch_names: &names,
+            feature_modality: None,
+            levels: vec![PbLevel {
+                rates: &rates,
+                cell_to_pb: &cell_to_pb,
+            }],
+            finest_counts: &finest,
+            batch_delta: Some(BatchDelta {
+                delta,
+                collapse_batch_names: &names,
+            }),
+            sketched_rows: None,
+        };
+        let on_axis = DMatrix::<f32>::from_element(3, 2, 1.0);
+        let backend_rows = DMatrix::<f32>::from_element(5, 2, 1.0);
+        assert!(input(&on_axis).validate().is_ok());
+        assert!(input(&backend_rows).validate().is_err());
     }
 }
