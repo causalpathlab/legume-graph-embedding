@@ -22,7 +22,7 @@ pub use config::{
     ParentModulesOwned, TrackInfo, TrackSpec,
 };
 pub use hier::{CisCoupling, CisGateReadout, CisGates};
-pub use input::{BatchDelta, FinestCounts, FitInput, PbLevel};
+pub use input::FitInput;
 pub use module_args::FeatureModuleArgs;
 pub use module_partition::{parent_module_logits, partition_modules};
 pub use pb_readout::{majority_batch_per_pb, PbLevelEmbedding};
@@ -74,8 +74,7 @@ pub fn fit(input: FitInput<'_>, config: FitConfig) -> anyhow::Result<FitOutput> 
     let stop = crate::stop::stop_flag();
     let n_features = input.cells.n_features();
     // Row structure of the feature axis: plain genes (every row its own gene)
-    // unless the caller named tracks. (The caller sketched its pseudobulks on
-    // `TrackSpec::base_track_rows`.)
+    // unless the caller named tracks.
     let tracks = config
         .tracks
         .clone()
@@ -83,22 +82,15 @@ pub fn fit(input: FitInput<'_>, config: FitConfig) -> anyhow::Result<FitOutput> 
     tracks
         .validate(n_features)
         .context("the fit's track spec does not describe this feature axis")?;
-    anyhow::ensure!(
-        input.sketched_rows.map(<[bool]>::to_vec) == tracks.base_track_rows(),
-        "the pseudobulks were not sketched on the track spec's base-track rows (build them \
-         with `projection_rows = TrackSpec::base_track_rows()`)"
-    );
     let n_tracks = tracks.n_tracks();
-    let cell_to_pb_per_level: Vec<&[usize]> = input.levels.iter().map(|l| l.cell_to_pb).collect();
-    // Per-batch gene fold for phase 2, from the finest collapse's `δ`. The
-    // collapse numbers batches by its own order; the input by first appearance
-    // — matched by name inside.
-    let batch_gene_fold: Option<BatchGeneFold> = match &input.batch_delta {
-        Some(d) => batch_fold::batch_gene_fold(batch_fold::FoldSource {
-            delta: d.delta,
-            collapse_batch_names: d.collapse_batch_names,
-            unified_batch_names: input.batch_names,
-        })?,
+    let pseudobulks = input.pseudobulks;
+    let n_levels = pseudobulks.n_levels();
+    let cell_to_pb_per_level: Vec<&[usize]> =
+        (0..n_levels).map(|l| pseudobulks.cell_to_pb(l)).collect();
+    // Per-batch gene fold for phase 2, from the finest collapse's `δ`
+    // (columns in the input's batch-id order).
+    let batch_gene_fold: Option<BatchGeneFold> = match pseudobulks.finest_delta() {
+        Some(delta) => batch_fold::batch_gene_fold(&delta, input.batch_names)?,
         None => None,
     };
 
@@ -108,11 +100,14 @@ pub fn fit(input: FitInput<'_>, config: FitConfig) -> anyhow::Result<FitOutput> 
     let varmap = VarMap::new();
     // Phase 1 trains by the exact hierarchical softmax (see `hier`), which owns
     // its own module warm start and composes the dictionary itself.
-    // The finest level's feature profile (batch-corrected pseudobulk rates) —
-    // seeds the hier engine's module partition.
-    let finest_profile =
-        || -> &DMatrix<f32> { input.levels.last().expect("at least one level").rates };
-    let n_pb_per_level: Vec<usize> = input.levels.iter().map(|l| l.rates.ncols()).collect();
+    // Each level's pseudobulk-feature edges, read one level at a time so its
+    // dense rates are dropped as soon as they are triplets.
+    let (n_pb_per_level, pb_triplets): (Vec<usize>, Vec<Vec<Triplet>>) = (0..n_levels)
+        .map(|l| {
+            let rates = pseudobulks.rates(l);
+            (rates.ncols(), hier::units::pb_triplets(&rates))
+        })
+        .unzip();
     let models::Heads {
         mut cell_model,
         mut level_models,
@@ -133,11 +128,6 @@ pub fn fit(input: FitInput<'_>, config: FitConfig) -> anyhow::Result<FitOutput> 
     let cell_fold = batch_gene_fold
         .as_ref()
         .map(|fold| fold.cell_fold(input.batch_membership));
-    let pb_triplets: Vec<Vec<Triplet>> = input
-        .levels
-        .iter()
-        .map(|l| hier::units::pb_triplets(l.rates))
-        .collect();
     let blobs: Vec<&[Triplet]> = pb_triplets.iter().map(Vec::as_slice).collect();
     // `--phase1-cells-per-pb 0` ⇒ `use_cell_axis == false` (pure-pb phase 1,
     // logged above as "cell axis SUPPRESSED"); `phase1_cell_samplers()` would
@@ -173,14 +163,9 @@ pub fn fit(input: FitInput<'_>, config: FitConfig) -> anyhow::Result<FitOutput> 
     // Build only the dense matrix each branch needs. Both are `[n_features ×
     // n_pb]`; on a wide ATAC axis that is hundreds of MiB each, and leaving
     // both live through hier::train and phase 2 roughly doubles peak memory.
-    let n_finest_pb = input
-        .levels
-        .last()
-        .expect("at least one level")
-        .rates
-        .ncols();
+    let n_finest_pb = *n_pb_per_level.last().expect("at least one level");
     let finest_counts = || -> anyhow::Result<(DMatrix<f32>, Vec<f32>)> {
-        let (counts, sizes) = (input.finest_counts)()?;
+        let (counts, sizes) = pseudobulks.finest_counts()?;
         anyhow::ensure!(
             counts.nrows() == n_features
                 && counts.ncols() == n_finest_pb
@@ -297,7 +282,11 @@ pub fn fit(input: FitInput<'_>, config: FitConfig) -> anyhow::Result<FitOutput> 
                     "parent modules are {}-dimensional but this fit uses H={h}",
                     parent.mu.ncols()
                 );
-                let logits = module_partition::parent_module_logits(parent, finest_profile());
+                let logits = module_partition::parent_module_logits(
+                    parent,
+                    // the finest level's batch-corrected rates
+                    &pseudobulks.rates(n_levels - 1),
+                );
                 info!(
                     "Phase 1 (hier) — module partition seeded from the parent's membership ({} \
                  modules)",

@@ -210,7 +210,7 @@ fn drop_thin_types<W>(
 }
 
 /// Coverage below which a panel is reported as degraded rather than merely noted. Shared with
-/// `data_beans::aux`'s gene-set reconciliation, which asks the same question of GAF/GMT term
+/// the gene-set reconciliation (`genomic_data::name_matching`, re-exported by data-beans), which asks the same question of GAF/GMT term
 /// sets — a marker panel is just another term→genes map, and a thin overlap means the same
 /// thing in both.
 use genomic_data::name_matching::COVERAGE_WARN_FRAC as WARN_COVERAGE;

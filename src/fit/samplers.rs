@@ -124,15 +124,7 @@ pub(crate) fn build_active_samplers(
     let mut cell_w: Vec<Vec<f32>> = vec![Vec::new(); n_batches];
     let mut feat_count: Vec<Vec<f32>> = (0..n_batches).map(|_| vec![0f32; n_features]).collect();
 
-    // Slab width targets ~8M edges/slab. When nnz can't be reported, fall back to a fixed cell-count slab rather
-    // than the whole matrix, so the streaming memory bound always holds.
-    let chunk = match data.nnz_hint() {
-        Some(nnz) if nnz > 0 => {
-            let avg_per_col = (nnz / n_cells.max(1)).max(1);
-            (8_000_000 / avg_per_col).clamp(1, n_cells.max(1))
-        }
-        _ => (1usize << 14).min(n_cells.max(1)),
-    };
+    let chunk = crate::simba::graph::slab_width(data);
     let pb_bar = new_progress_bar(n_cells as u64);
     pb_bar.set_message("strat-cell sampler (streaming columns)");
 

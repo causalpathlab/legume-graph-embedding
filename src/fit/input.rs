@@ -1,31 +1,9 @@
 //! What [`super::fit`] trains on: the cells' counts, their batches, and the
-//! pseudobulks a caller built from them (data-beans'
-//! `unified::build_embedding_pseudobulks`, say). Plain matrices and a count
-//! stream, so this crate depends on no storage crate.
+//! pseudobulks collapsed from them, read through the cell and pseudobulk
+//! contracts of `legume-cell-pseudobulk` so this crate depends on no storage
+//! crate (data-beans implements them).
 
-use legume_numeric::matrix::cell_count_stream::CellCountStream;
-use nalgebra::DMatrix;
-
-/// One collapse level: its pseudobulk rates and each cell's pseudobulk.
-pub struct PbLevel<'a> {
-    /// `[n_features × n_pb]` on the fit's feature axis (batch-adjusted when
-    /// the collapse fit a δ).
-    pub rates: &'a DMatrix<f32>,
-    /// `[n_cells]`: each cell's pseudobulk at this level.
-    pub cell_to_pb: &'a [usize],
-}
-
-/// The finest collapse's per-batch gene fold δ.
-pub struct BatchDelta<'a> {
-    /// `[n_features × collapse batches]` on the fit's feature axis.
-    pub delta: &'a DMatrix<f32>,
-    /// The collapse's batch names, in `delta`'s column order.
-    pub collapse_batch_names: &'a [Box<str>],
-}
-
-/// The finest level's observed counts `[n_features × n_pb]` and each
-/// pseudobulk's size, built only when a module partition needs them.
-pub type FinestCounts<'a> = &'a dyn Fn() -> anyhow::Result<(DMatrix<f32>, Vec<f32>)>;
+use legume_cell_pseudobulk::{CellCountStream, PseudobulkLevels};
 
 /// Everything [`super::fit`] reads besides its [`super::FitConfig`].
 pub struct FitInput<'a> {
@@ -37,23 +15,18 @@ pub struct FitInput<'a> {
     pub batch_names: &'a [Box<str>],
     /// Modality id per feature on a multiome axis; `None` for one panel.
     pub feature_modality: Option<std::sync::Arc<[u32]>>,
-    /// The collapse levels, coarsest → finest (at least one).
-    pub levels: Vec<PbLevel<'a>>,
-    pub finest_counts: FinestCounts<'a>,
-    /// `None` when the collapse fit no δ.
-    pub batch_delta: Option<BatchDelta<'a>>,
-    /// The features the pseudobulks were sketched on (`None`: all). Must be
-    /// [`super::TrackSpec::base_track_rows`] of the fit's tracks: on a
-    /// multi-track axis the sketch reads the base track alone.
-    pub sketched_rows: Option<&'a [bool]>,
+    /// The cells' pseudobulk levels on the same feature axis. On a multi-track
+    /// axis they should be sketched on [`super::TrackSpec::base_track_rows`].
+    pub pseudobulks: &'a dyn PseudobulkLevels,
 }
 
 impl FitInput<'_> {
-    /// Every level must map each cell, and the counts, batches and rates must
-    /// share one cell axis and one feature axis.
+    /// The counts, batches and pseudobulks must share one cell axis and one
+    /// feature axis.
     pub(super) fn validate(&self) -> anyhow::Result<()> {
         let (n_cells, n_features) = (self.cells.n_cells(), self.cells.n_features());
-        anyhow::ensure!(!self.levels.is_empty(), "fit: no pseudobulk level");
+        let n_batches = self.batch_names.len();
+        anyhow::ensure!(self.pseudobulks.n_levels() > 0, "fit: no pseudobulk level");
         anyhow::ensure!(
             self.batch_membership.len() == n_cells,
             "fit: {} batch ids for {n_cells} cells",
@@ -62,30 +35,25 @@ impl FitInput<'_> {
         if let Some(&b) = self
             .batch_membership
             .iter()
-            .find(|&&b| b as usize >= self.batch_names.len())
+            .find(|&&b| b as usize >= n_batches)
         {
-            anyhow::bail!(
-                "fit: batch id {b} past the {} batch names",
-                self.batch_names.len()
+            anyhow::bail!("fit: batch id {b} past the {n_batches} batch names");
+        }
+        for l in 0..self.pseudobulks.n_levels() {
+            let cell_to_pb = self.pseudobulks.cell_to_pb(l);
+            anyhow::ensure!(
+                cell_to_pb.len() == n_cells,
+                "fit: level {l} maps {} cells; the counts have {n_cells}",
+                cell_to_pb.len()
             );
         }
-        for (l, level) in self.levels.iter().enumerate() {
+        if let Some(d) = self.pseudobulks.finest_delta() {
             anyhow::ensure!(
-                level.rates.nrows() == n_features && level.cell_to_pb.len() == n_cells,
-                "fit: level {l} has {} rate rows and {} cells; the counts have {n_features} \
-                 features and {n_cells} cells",
-                level.rates.nrows(),
-                level.cell_to_pb.len()
-            );
-        }
-        if let Some(d) = &self.batch_delta {
-            anyhow::ensure!(
-                d.delta.nrows() == n_features && d.delta.ncols() == d.collapse_batch_names.len(),
-                "fit: the batch δ is {} × {}; the counts have {n_features} features and the \
-                 collapse {} batch names",
-                d.delta.nrows(),
-                d.delta.ncols(),
-                d.collapse_batch_names.len()
+                d.nrows() == n_features && d.ncols() == n_batches,
+                "fit: the batch δ is {} × {}; expected {n_features} features × {n_batches} \
+                 batches",
+                d.nrows(),
+                d.ncols()
             );
         }
         if let Some(m) = &self.feature_modality {
@@ -102,36 +70,47 @@ impl FitInput<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nalgebra::DMatrix;
     use nalgebra_sparse::{CooMatrix, CscMatrix};
+    use std::borrow::Cow;
+
+    /// One level of one pseudobulk over three features, with a δ of `rows`.
+    struct OneLevel {
+        delta_rows: usize,
+    }
+
+    impl PseudobulkLevels for OneLevel {
+        fn n_levels(&self) -> usize {
+            1
+        }
+        fn rates(&self, _: usize) -> Cow<'_, DMatrix<f32>> {
+            Cow::Owned(DMatrix::zeros(3, 1))
+        }
+        fn cell_to_pb(&self, _: usize) -> &[usize] {
+            &[0, 0]
+        }
+        fn finest_counts(&self) -> anyhow::Result<(DMatrix<f32>, Vec<f32>)> {
+            Ok((DMatrix::zeros(3, 1), vec![1.0]))
+        }
+        fn finest_delta(&self) -> Option<Cow<'_, DMatrix<f32>>> {
+            Some(Cow::Owned(DMatrix::from_element(self.delta_rows, 2, 1.0)))
+        }
+    }
 
     /// A δ on another feature axis (the backend's rows, say) is refused, not
     /// read as if its rows were the fit's features.
     #[test]
     fn a_delta_off_the_feature_axis_is_refused() {
         let cells = CscMatrix::from(&CooMatrix::<f32>::new(3, 2));
-        let rates = DMatrix::<f32>::zeros(3, 1);
-        let cell_to_pb = [0usize, 0];
         let names: Vec<Box<str>> = vec!["a".into(), "b".into()];
-        let finest = || Ok((DMatrix::<f32>::zeros(3, 1), vec![1.0]));
-        let input = |delta| FitInput {
+        let input = |pseudobulks| FitInput {
             cells: &cells,
             batch_membership: &[0, 1],
             batch_names: &names,
             feature_modality: None,
-            levels: vec![PbLevel {
-                rates: &rates,
-                cell_to_pb: &cell_to_pb,
-            }],
-            finest_counts: &finest,
-            batch_delta: Some(BatchDelta {
-                delta,
-                collapse_batch_names: &names,
-            }),
-            sketched_rows: None,
+            pseudobulks,
         };
-        let on_axis = DMatrix::<f32>::from_element(3, 2, 1.0);
-        let backend_rows = DMatrix::<f32>::from_element(5, 2, 1.0);
-        assert!(input(&on_axis).validate().is_ok());
-        assert!(input(&backend_rows).validate().is_err());
+        assert!(input(&OneLevel { delta_rows: 3 }).validate().is_ok());
+        assert!(input(&OneLevel { delta_rows: 5 }).validate().is_err());
     }
 }

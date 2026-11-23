@@ -47,8 +47,8 @@ pub use eval::{
 pub use feature_qc::{hvg_feature_qc, FeatureQcConfig, FeatureQcResult};
 pub use fit::{
     fit, partition_modules, validate_offset_rank, CellEncoders, CisCoupling, CisGateReadout,
-    CisGates, FeatureModuleArgs, FeatureModuleConfig, FitConfig, FitOutput, MultiomeOptions,
-    ParentModulesOwned, TrackEncoder, TrackInfo, TrackSpec,
+    CisGates, FeatureModuleArgs, FeatureModuleConfig, FitConfig, FitInput, FitOutput,
+    MultiomeOptions, ParentModulesOwned, TrackEncoder, TrackInfo, TrackSpec,
 };
 pub use model::JointEmbedModel;
 pub use postprocess::{

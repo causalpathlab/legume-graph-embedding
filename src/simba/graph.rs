@@ -1,10 +1,10 @@
 //! `si.tl.gen_graph`: the cell–gene edge list with one relation per level.
 //!
-//! Entities are the cells (every column of the backend) and the HVGs (the
+//! Entities are the cells (every cell of the count stream) and the HVGs (the
 //! caller's `hvg_rows`, in that order). Every nonzero HVG entry is one edge
 //! `(cell, gene, level)`. The level comes from [`super::discretize`], which
 //! sees the log-normalized nonzero values of ALL genes — SIMBA discretizes
-//! before it subsets to the HVGs — so the build streams the backend twice:
+//! before it subsets to the HVGs — so the build streams the counts twice:
 //! pass 1 takes library sizes, the global value range and the HVG entries;
 //! pass 2 fills the histogram over every gene. Peak memory is one column slab
 //! plus the HVG stash (`cell u32 + gene u32 + value f32` per edge, the value
@@ -13,7 +13,7 @@
 use super::discretize::{log_norm, Discretization, Histogram};
 use super::HIST_BINS;
 use crate::progress::new_progress_bar;
-use legume_numeric::matrix::cell_count_stream::CellCountStream;
+use legume_cell_pseudobulk::CellCountStream;
 
 /// PBG's `weight` per relation (bin level): `round(linspace(1, 5, n), 2)`
 /// over the levels PRESENT in the graph, ascending. Rust's `round` is
@@ -113,9 +113,10 @@ impl EdgeList {
     }
 }
 
-/// Column-slab width targeting ~8M nonzeros per slab (as the composite
-/// trainer's sampler does), so the streaming memory bound holds.
-fn slab_width(data: &dyn CellCountStream) -> usize {
+/// Cells per slab when streaming counts: ~8M nonzeros per slab, or a fixed
+/// count when the stream cannot say how many it holds, so the streaming
+/// memory bound always holds. Shared by simba and the fit's samplers.
+pub(crate) fn slab_width(data: &dyn CellCountStream) -> usize {
     let n_cells = data.n_cells().max(1);
     match data.nnz_hint() {
         Some(nnz) if nnz > 0 => {
@@ -135,6 +136,9 @@ fn slab_columns(
     let mut cols: Vec<Vec<(u32, f32)>> = vec![Vec::new(); cells.len()];
     data.for_each_count(cells, &mut |row, lc, x| cols[lc as usize].push((row, x)))?;
     for col in &mut cols {
+        if col.windows(2).all(|w| w[0].0 < w[1].0) {
+            continue;
+        }
         col.sort_unstable_by_key(|&(row, _)| row);
         col.dedup_by(|next, kept| {
             let same = next.0 == kept.0;
