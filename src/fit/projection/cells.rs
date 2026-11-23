@@ -104,12 +104,11 @@ pub(crate) fn project_cells_phase2(
     let cells = collect_sampler_cells(cell_samplers);
 
     info!(
-        "Phase 2 — {} over {n_cells} cells ({} with edges) on {dev:?}, \
-         full log-partition, ridge λ={lambda}{}",
+        "Phase 2 — {} over {n_cells} cells ({} with edges) on {dev:?}{}",
         if distill.is_some() {
-            "distilled pooled-gene encoder"
+            std::borrow::Cow::Borrowed("distilled pooled-gene encoder")
         } else {
-            "cell-block Poisson SGD"
+            format!("cell-block Poisson SGD, full log-partition, ridge λ={lambda}").into()
         },
         cells.len(),
         match &batch_fold {

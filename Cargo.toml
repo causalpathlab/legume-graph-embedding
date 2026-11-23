@@ -1,13 +1,12 @@
 [package]
 name = "legume-graph-embedding"
-version = "0.14.0"
+version = "0.14.3"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
 authors = ["Yongjin Park <ypp@stat.ubc.ca> <yongjin.park@ubc.ca>"]
 description = "Count-NCE bipartite graph embedding over (cell, feature) edges"
 repository = "https://github.com/causalpathlab/legume-graph-embedding"
-homepage = "https://github.com/causalpathlab/legume-graph-embedding"
 readme = "README.md"
 keywords = ["genomics", "single-cell", "embedding", "graph"]
 categories = ["science"]

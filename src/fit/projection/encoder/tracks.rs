@@ -13,12 +13,12 @@
 //! so an absent track falls back to the others instead of dragging the cell
 //! toward the origin.
 //!
-//! # The one-track case is the previous code
+//! # The one-track short cut
 //!
 //! `senna bge` has one count track over the whole axis. Every entry point here
 //! short-circuits on that: [`split_rows_by_track`] borrows the folded rows
-//! untouched, and [`CellEncoders::theta_block`] / [`CellEncoders::encode_edges`]
-//! call the single trunk's forward with no mask, no mean and no extra tensor.
+//! untouched, and [`CellEncoders::encode_edges`] calls the single trunk's own
+//! `encode` with no mask, no mean and no extra tensor.
 
 use super::{block_sgd, densify_mapped, null_intercept, CellEncoder, FoldedRow};
 use crate::fit::config::TrackSpec;
@@ -132,8 +132,8 @@ pub struct TrackEncoder {
 }
 
 /// The maps a fit placed its cells by: one [`TrackEncoder`] per COUNT track,
-/// ascending. A non-count track has no encoder (it contributes to the
-/// likelihood but carries no read).
+/// ascending. A non-count track has no encoder: it gets an exact intercept at
+/// the cell's `θ` but does not move `θ`.
 ///
 /// A one-track fit holds exactly one, which is what `senna bge` persists and
 /// what [`Self::single`] hands back.
@@ -269,25 +269,12 @@ impl CellEncoders {
     /// `xs[i]` / `totals[i]` are the dense block and row totals of
     /// `self.iter()[i]`'s track.
     ///
-    /// With one encoder that spans the whole axis this is its forward and
-    /// nothing else — no mask, no division, no extra tensor — which is what
-    /// keeps the `senna bge` graph exactly what it was. One encoder over PART
-    /// of the axis still goes through the mask: a node with no counts on its
-    /// track has nothing to average and belongs at the origin.
-    pub(super) fn theta_block(
-        &self,
-        xs: &[Tensor],
-        totals: &[&[f32]],
-        train: bool,
-    ) -> anyhow::Result<Tensor> {
-        // The `senna bge` shape only: one encoder over the WHOLE axis, where
-        // the combine is the identity and a node can have counts nowhere else.
-        if self.spans_axis() {
-            let enc = &self.encoders[0].encoder;
-            return Ok(enc
-                .encoder
-                .forward(&xs[0], None, Some(&enc.mean_1d), None, train)?);
-        }
+    /// Only a multi-track axis comes here: one encoder over the whole axis
+    /// (`senna bge`) is the trunk's own `encode`. One encoder over PART of the
+    /// axis still goes through the mask: a node with no counts on its track has
+    /// nothing to average and belongs at the origin.
+    pub(super) fn theta_block(&self, xs: &[Tensor], totals: &[&[f32]]) -> anyhow::Result<Tensor> {
+        debug_assert!(!self.spans_axis(), "one whole-axis encoder takes `encode`");
         anyhow::ensure!(!self.encoders.is_empty(), "no count track to encode with");
         let dev = xs[0].device();
         let n = xs[0].dim(0)?;
@@ -297,7 +284,7 @@ impl CellEncoders {
             let enc = &te.encoder;
             let theta = enc
                 .encoder
-                .forward(&xs[i], None, Some(&enc.mean_1d), None, train)?;
+                .forward(&xs[i], None, Some(&enc.mean_1d), None, false)?;
             let has: Vec<f32> = totals[i]
                 .iter()
                 .map(|&v| if v > 0.0 { 1.0 } else { 0.0 })
@@ -360,7 +347,7 @@ impl CellEncoders {
                 totals.push(tot);
             }
             let refs: Vec<&[f32]> = totals.iter().map(Vec::as_slice).collect();
-            let theta = self.theta_block(&xs, &refs, false)?;
+            let theta = self.theta_block(&xs, &refs)?;
             let c = null_intercept(&first.encoder.dict, &theta, &totals[0])?;
             latent[start * h..(start + block.len()) * h]
                 .copy_from_slice(&theta.flatten_all()?.to_vec1::<f32>()?);

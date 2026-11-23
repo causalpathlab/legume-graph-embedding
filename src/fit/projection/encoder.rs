@@ -5,8 +5,9 @@
 //!
 //! One encoder per COUNT track of the feature axis ([`tracks`]), each pooling
 //! only its own track's rows; a cell's placement is the mean over the tracks it
-//! has counts on. A one-track axis — `senna bge` — has exactly one, and that
-//! path is the previous single-dictionary code op for op.
+//! has counts on. A one-track axis — `senna bge` — has exactly one and takes
+//! the single-dictionary short cut. A non-count track has no encoder and does
+//! not move `θ`; it gets its own exact intercept at the cell's `θ`.
 //!
 //! # Why this is the right object
 //!
@@ -29,28 +30,20 @@
 //!
 //! # Then the cells themselves
 //!
-//! The tables are a few hundred anchors, so a trunk distilled on them places
-//! twenty thousand cells as a smooth function of those anchors: one sheet per
-//! lineage where a per-cell fit resolves states. The distilled trunk is
-//! therefore only the warm start. [`refine`] then trains it on the cells'
-//! own likelihood — the phase-2 objective itself, the full log-partition over
-//! every gene with the intercept profiled out, `N_c·lse_f(s_cf) − Σ_f n_cf·s_cf`
-//! plus the ridge, SUMMED over every track present (a track with no encoder
-//! still constrains the placement) — one `[B,H]·[H,D]` matmul per track per
-//! step, so no negatives are sampled and nothing is approximated. The block
-//! SGD solved that objective per cell from a cold start and never converged;
-//! here every cell's gradient improves one small map shared by every cell like
-//! it.
+//! Every cell is placed by one forward pass of the distilled trunk on its
+//! batch-folded counts; nothing trains on the cells afterwards. The trunk
+//! learned the phase-1 embedding itself, so the cells land in phase 1's
+//! geometry, beside the pseudobulks and the gene modules. A likelihood
+//! refinement on the cells used to follow, but its flat softmax over the
+//! composed dictionary is not the two-level softmax phase 1 trained, so it
+//! pulled the cells off that geometry; and the batch adjustment it appeared to
+//! add belongs to the fold before the encoder, not to a fit after it.
 //!
 //! # What the cell gets
 //!
-//! `θ_c` is the refined encoder's output, with no per-cell solve after it: the
-//! refinement already trains the map on every cell's exact likelihood, and a
-//! per-cell finish buys a negligible share of it for a full sweep of block
-//! solves. Each track's intercept is its exact conditional MLE given `θ_c`
-//! (`ln total − logsumexp` of the track's scores), so nothing about the cell
-//! is approximated beyond the map itself. The gauge fold is the shared tail in
-//! [`super::cells`].
+//! `θ_c` is the distilled encoder's output. Each track's intercept is its
+//! exact conditional MLE given `θ_c` (`ln total − logsumexp` of the track's
+//! scores). The gauge fold is the shared tail in [`super::cells`].
 //!
 //! # One estimator, both halves
 //!
@@ -100,14 +93,6 @@ const WEIGHT_DECAY: f64 = 1e-4;
 const GRAD_CLIP: f64 = 5.0;
 /// Pseudobulks per optimizer step.
 const ROWS_PER_STEP: usize = 128;
-/// Passes over every cell in the likelihood refinement.
-const REFINE_EPOCHS: usize = 10;
-/// Cells per refinement step on an ordinary axis: the dense block is
-/// `step × D`. A wide axis shrinks it; see [`refine_cells_per_step`].
-const REFINE_CELLS_PER_STEP: usize = 256;
-/// A warm start, so a fraction of the distillation rate.
-const REFINE_LEARNING_RATE: f64 = 3e-4;
-const REFINE_REPORT_EVERY: usize = 2;
 /// Share of each level's pseudobulks held out of training and scored on their
 /// full membership.
 const HOLDOUT_FRACTION: f64 = 0.1;
@@ -171,8 +156,8 @@ pub(crate) struct DistillSpec<'a> {
 ///
 /// `Clone` is a refcount bump on both tensors and on the shared
 /// [`FeatureEmbedding`] (candle's `Tensor` is `Arc` inside), so a track's
-/// dictionary can be handed to its encoder and still be scored against by the
-/// refinement without a second upload.
+/// dictionary can be handed to its encoder and still be scored against for the
+/// intercepts without a second upload.
 #[derive(Clone)]
 pub(crate) struct FrozenDict {
     features: std::sync::Arc<FeatureEmbedding>,
@@ -796,31 +781,12 @@ pub(crate) fn distill(
     Ok((cell_encoder, stats))
 }
 
-////////////////
-// Refinement //
-////////////////
-
-/// What the refinement reports back: the per-count negative log-likelihood
-/// over every cell before the first step and after the last.
-pub(crate) struct RefineStats {
-    pub nll_per_count_before: f32,
-    pub nll_per_count_after: f32,
-    pub n_cells: usize,
-}
-
-/// The multinomial NLL with the intercept profiled out, per row.
-fn multinomial_nll(x: &Tensor, s: &Tensor, totals: &Tensor) -> anyhow::Result<Tensor> {
-    Ok(legume_numeric::candle::loss::multinomial_nll_profiled(
-        x, s, totals,
-    )?)
-}
-
 /// Each listed track's dense block for the cells at `idx` (positions into the
 /// folded rows), with that block's row totals. `which` selects the tracks and
 /// fixes the order of the result.
 ///
 /// A track the cell has no counts on comes back as an all-zero block with a
-/// zero total, which is exactly what makes its likelihood term vanish.
+/// zero total, which leaves it out of the combine's mean.
 fn track_blocks(
     by_track: &[Cow<'_, [FoldedRow]>],
     dicts: &[FrozenDict],
@@ -839,164 +805,6 @@ fn track_blocks(
         totals.push(tot);
     }
     Ok((xs, totals))
-}
-
-/// `Σ_t multinomial_nll(x^t, θ·E^tᵀ + b^t, N^t)` over EVERY track, `[n]`.
-///
-/// An absent track contributes exactly `0`: its block is all zeros and its
-/// total is zero, so `N·lse − Σ n·s` is `0 − 0`. A track with no encoder still
-/// enters here — it has a dictionary and counts, so it constrains `θ` even
-/// though nothing reads it.
-fn summed_nll(
-    theta: &Tensor,
-    dicts: &[FrozenDict],
-    xs: &[Tensor],
-    totals: &[Vec<f32>],
-    dev: &Device,
-) -> anyhow::Result<Tensor> {
-    let mut acc: Option<Tensor> = None;
-    for (t, dict) in dicts.iter().enumerate() {
-        let s = theta.matmul(&dict.e_hd)?.broadcast_add(&dict.b_1d)?;
-        let n_t = Tensor::from_slice(&totals[t], totals[t].len(), dev)?;
-        let nll = multinomial_nll(&xs[t], &s, &n_t)?;
-        acc = Some(match acc {
-            None => nll,
-            Some(a) => (a + nll)?,
-        });
-    }
-    acc.ok_or_else(|| anyhow::anyhow!("no track to score"))
-}
-
-/// Cells per refinement step over `n_features` rows: the full step, capped by the
-/// activation budget every other phase-2 dense block answers to. The step holds
-/// the dense counts, the encoder's activations, the scores and their backward
-/// all at once, so a fixed count is what ran a wide axis out of device memory.
-fn refine_cells_per_step(n_features: usize) -> usize {
-    REFINE_CELLS_PER_STEP.min(block_sgd::block_cells(n_features))
-}
-
-/// Train the trunks on the cells' own likelihood, starting from the distilled
-/// maps. Every cell is visited once per pass in a seeded order; the ridge is
-/// the phase-2 prior `(λ/2)‖θ‖²`, the same one the block SGD carries.
-///
-/// The loss sums the multinomial NLL over **every** track present — including a
-/// track with no encoder — against the one combined `θ`, so the gradient flows
-/// back into every count track's trunk through one optimizer over the
-/// concatenated var lists.
-///
-/// With ONE track this is the previous single-dictionary refinement, op for op:
-/// the sum over tracks is the one term, and [`CellEncoders::theta_block`]
-/// short-circuits to that trunk's forward.
-pub(crate) fn refine(
-    encs: &CellEncoders,
-    dicts: &[FrozenDict],
-    by_track: &[Cow<'_, [FoldedRow]>],
-    lambda: f64,
-    seed: u64,
-    dev: &Device,
-) -> anyhow::Result<RefineStats> {
-    anyhow::ensure!(
-        !dicts.is_empty() && dicts.len() == by_track.len(),
-        "refine: {} dictionaries for {} track(s) of folded rows",
-        dicts.len(),
-        by_track.len()
-    );
-    let n_cells = by_track[0].len();
-    anyhow::ensure!(
-        by_track.iter().all(|t| t.len() == n_cells),
-        "refine: the tracks disagree on the cell count"
-    );
-    let all_tracks: Vec<usize> = (0..dicts.len()).collect();
-    // Where each encoder's track sits in `dicts` / `by_track`.
-    let enc_track: Vec<usize> = encs.iter().iter().map(|te| te.track as usize).collect();
-    anyhow::ensure!(
-        enc_track.iter().all(|&t| t < dicts.len()),
-        "refine: an encoder names a track this axis does not have"
-    );
-    let group = encs.group_nodes();
-    let step = refine_cells_per_step(dicts.iter().map(|d| d.d).sum());
-    let order_all: Vec<usize> = (0..n_cells).collect();
-
-    // The whole-population per-count NLL, in evaluation mode; the block size is
-    // the encode block so the dense buffers are bounded the same way.
-    let score_all = || -> anyhow::Result<f32> {
-        let (mut nll, mut total) = (0f64, 0f64);
-        for block in order_all.chunks(group) {
-            let (xs, totals) = track_blocks(by_track, dicts, &all_tracks, block, dev)?;
-            let enc_xs: Vec<Tensor> = enc_track.iter().map(|&t| xs[t].clone()).collect();
-            let enc_tot: Vec<&[f32]> = enc_track.iter().map(|&t| totals[t].as_slice()).collect();
-            let theta = encs.theta_block(&enc_xs, &enc_tot, false)?;
-            let s = summed_nll(&theta, dicts, &xs, &totals, dev)?;
-            nll += f64::from(s.sum_all()?.to_scalar::<f32>()?);
-            total += totals
-                .iter()
-                .flat_map(|t| t.iter())
-                .map(|&v| f64::from(v))
-                .sum::<f64>();
-        }
-        Ok((nll / total.max(1.0)) as f32)
-    };
-    let nll_per_count_before = score_all()?;
-    info!(
-        "Phase 2 (encoder) — refining {} trunk(s) on {n_cells} cells' likelihood over {} track(s): \
-         {REFINE_EPOCHS} epochs of {step}-cell steps, lr {REFINE_LEARNING_RATE}, \
-         ridge λ={lambda}; NLL/count before {nll_per_count_before:.4}",
-        enc_track.len(),
-        dicts.len(),
-    );
-
-    // One optimizer over every trunk's vars: the combined θ is one object and a
-    // cell's gradient has to reach each track that placed it.
-    let mut vars = Vec::new();
-    for te in encs.iter() {
-        vars.extend(te.encoder.varmap.all_vars());
-    }
-    let mut adam = AdamW::new(
-        vars,
-        ParamsAdamW {
-            lr: REFINE_LEARNING_RATE,
-            weight_decay: WEIGHT_DECAY,
-            ..Default::default()
-        },
-    )?;
-    let mut order: Vec<usize> = (0..n_cells).collect();
-    let mut rng = StdRng::seed_from_u64(mix_seed(seed, 0x5245_4649_4e45));
-    let half_lambda = lambda / 2.0;
-    let bar = new_progress_bar(REFINE_EPOCHS as u64);
-    for epoch in 0..REFINE_EPOCHS {
-        order.shuffle(&mut rng);
-        let mut loss_sum = Tensor::zeros((), DType::F32, dev)?;
-        let mut n_steps = 0usize;
-        for chunk in order.chunks(step) {
-            let (xs, totals) = track_blocks(by_track, dicts, &all_tracks, chunk, dev)?;
-            let enc_xs: Vec<Tensor> = enc_track.iter().map(|&t| xs[t].clone()).collect();
-            let enc_tot: Vec<&[f32]> = enc_track.iter().map(|&t| totals[t].as_slice()).collect();
-            let theta = encs.theta_block(&enc_xs, &enc_tot, true)?;
-            let nll = summed_nll(&theta, dicts, &xs, &totals, dev)?;
-            let ridge = theta.sqr()?.sum(1)?.affine(half_lambda, 0.0)?;
-            let loss = (nll + ridge)?.mean_all()?;
-            legume_numeric::candle::grad_clip::clipped_backward_step(&mut adam, &loss, GRAD_CLIP)?;
-            loss_sum = (loss_sum + loss.detach())?;
-            n_steps += 1;
-        }
-        bar.inc(1);
-        // The running training loss is the checkpoint reading; the whole-set
-        // NLL is scored once before and once after, not every other epoch.
-        if (epoch + 1).is_multiple_of(REFINE_REPORT_EVERY) && epoch + 1 < REFINE_EPOCHS {
-            info!(
-                "Phase 2 (encoder) — refine epoch {}: mean per-cell loss {:.2}",
-                epoch + 1,
-                loss_sum.to_scalar::<f32>()? / n_steps.max(1) as f32,
-            );
-        }
-    }
-    bar.finish_and_clear();
-    let nll_per_count_after = score_all()?;
-    Ok(RefineStats {
-        nll_per_count_before,
-        nll_per_count_after,
-        n_cells,
-    })
 }
 
 ///////////////
@@ -1035,17 +843,15 @@ pub(crate) fn null_intercept(
 /// [`block_sgd::project_cells`], plus the trained maps.
 ///
 /// One encoder per COUNT track, each pooling only its own track's rows; the
-/// cell's warm start is the mean over the tracks it has counts on, refined on
-/// the summed likelihood of EVERY track; each track's intercept is then exact
-/// at the cell's `θ`.
+/// cell's `θ` is the mean over the tracks it has counts on, and each track's
+/// intercept is then exact at that `θ`.
 ///
 /// # The one-track path
 ///
-/// `senna bge` has a single count track over the whole axis, and that path is
-/// the previous code op for op: `FrozenDict::new` (no gather),
+/// `senna bge` has a single count track over the whole axis, and that path
+/// takes the short cut: `FrozenDict::new` (no gather),
 /// [`split_rows_by_track`] borrowing the folded rows, `spec.seed` itself as the
-/// distillation seed, a single `encoder.forward` inside the refinement, and the
-/// single trunk's own `encode` for the warm start.
+/// distillation seed, and the single trunk's own `encode` for the placement.
 pub(crate) fn project_cells(
     input: &Phase2Input,
     cells: &[(u32, &[u32], &[f32])],
@@ -1055,7 +861,7 @@ pub(crate) fn project_cells(
     collapse: Option<&RowCollapse>,
 ) -> anyhow::Result<(Phase2Out, CellEncoders)> {
     // A collapsed axis (see [`super::collapse`]): every module-only module is
-    // one row. Distillation, refinement, encoding and the intercepts all run
+    // one row. Distillation, encoding and the intercepts all run
     // on it; the likelihood there is the full axis', so nothing is lost. The
     // caller's gauge fold stays on the full axis.
     let reduced = match collapse {
@@ -1177,30 +983,27 @@ pub(crate) fn project_cells(
     }
     let mut encs = CellEncoders::new(encoders, d);
 
-    let refined = refine(&encs, &dicts, &by_track, input.lambda, spec.seed, dev)?;
-    info!(
-        "Phase 2 (encoder) — refined on {} cells; NLL/count {:.4} → {:.4}",
-        refined.n_cells, refined.nll_per_count_before, refined.nll_per_count_after
-    );
-
     // ONE TRACK, not one encoder: an axis with a single count track beside
     // non-count ones also has a single encoder, but that encoder's dictionary
     // is narrower than the axis, so its input must be the SPLIT rows.
-    let latent = if one_track {
+    // The encoders' θ is the placement; each track's intercept is its exact
+    // conditional MLE at that θ. `predict` places a query the same way. The
+    // one-track trunk's `encode` already returns the intercept beside θ.
+    let (latent, intercept, other_intercepts) = if one_track {
         let enc = encs
             .single()
             .ok_or_else(|| anyhow::anyhow!("a one-track axis must have exactly one encoder"))?;
         let slices: Vec<(&[u32], &[f32])> = rows.iter().map(FoldedRow::as_slices).collect();
-        enc.encode(&slices)?.0
+        let (latent, intercept) = enc.encode(&slices)?;
+        (latent, intercept, Vec::new())
     } else {
-        encode_combined(&encs, &dicts, &by_track, h, dev)?
+        let latent = encode_combined(&encs, &dicts, &by_track, h, dev)?;
+        let mut intercepts = track_intercepts(&dicts, &by_track, &latent, h, dev)?.into_iter();
+        let intercept = intercepts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no track to take an intercept on"))?;
+        (latent, intercept, intercepts.collect())
     };
-    // The encoders' θ is the placement; each track's intercept is its exact
-    // conditional MLE at that θ. `predict` places a query the same way.
-    let mut intercepts = track_intercepts(&dicts, &by_track, &latent, h, dev)?.into_iter();
-    let intercept = intercepts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no track to take an intercept on"))?;
     info!(
         "Phase 2 (encoder) — {} cell(s) encoded in blocks of {}",
         rows.len(),
@@ -1209,7 +1012,7 @@ pub(crate) fn project_cells(
     let pass = PassOut {
         latent,
         intercept,
-        other_intercepts: intercepts.collect(),
+        other_intercepts,
     };
     let out = block_sgd::finish(input, cells, pass);
     // Only now: the cells above were encoded already collapsed.
@@ -1267,7 +1070,7 @@ fn encode_combined(
         let start = b * group;
         let (xs, totals) = track_blocks(by_track, dicts, &enc_track, block, dev)?;
         let refs: Vec<&[f32]> = totals.iter().map(Vec::as_slice).collect();
-        let theta = encs.theta_block(&xs, &refs, false)?;
+        let theta = encs.theta_block(&xs, &refs)?;
         latent[start * h..(start + block.len()) * h]
             .copy_from_slice(&theta.flatten_all()?.to_vec1::<f32>()?);
     }
