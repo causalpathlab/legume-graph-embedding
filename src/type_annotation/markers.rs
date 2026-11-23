@@ -213,7 +213,7 @@ fn drop_thin_types<W>(
 /// `data_beans::aux`'s gene-set reconciliation, which asks the same question of GAF/GMT term
 /// sets — a marker panel is just another term→genes map, and a thin overlap means the same
 /// thing in both.
-use data_beans::aux::gene_sets::COVERAGE_WARN_FRAC as WARN_COVERAGE;
+use genomic_data::name_matching::COVERAGE_WARN_FRAC as WARN_COVERAGE;
 
 /// How many under-covered types to name before truncating the warning.
 const MAX_LISTED: usize = 10;
@@ -382,33 +382,6 @@ pub(super) fn read_marker_tsv(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
         .collect();
     anyhow::ensure!(!out.is_empty(), "no marker pairs parsed from {path}");
     Ok(out)
-}
-
-/// Read the curated `label<TAB>CL:id` map ([`read_two_field_rows`], rows whose id is not a
-/// `CL:` id skipped as a header), keyed by [`type_key`] like the panel's type names. Two ids
-/// for one key is an error.
-pub(super) fn read_label_map(path: &str) -> Result<FxHashMap<Box<str>, Box<str>>> {
-    use std::collections::hash_map::Entry;
-    let mut map: FxHashMap<Box<str>, Box<str>> = FxHashMap::default();
-    for (label, id) in read_two_field_rows(path)
-        .with_context(|| format!("reading label→id map {path}"))?
-        .into_iter()
-        .filter(|(_, id)| id.starts_with("CL:"))
-    {
-        match map.entry(type_key(&label)) {
-            Entry::Vacant(e) => {
-                e.insert(id);
-            }
-            Entry::Occupied(e) => anyhow::ensure!(
-                *e.get() == id,
-                "label {label:?} (as {:?}) has two ids in {path}: {} and {id}",
-                e.key(),
-                e.get()
-            ),
-        }
-    }
-    anyhow::ensure!(!map.is_empty(), "no `label<TAB>id` rows parsed from {path}");
-    Ok(map)
 }
 
 /// Union of every type's marker gene indices (sorted, unique, in range) — the

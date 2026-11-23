@@ -1,5 +1,4 @@
 use crate::model::JointEmbedModel;
-use data_beans::alg::refine_multilevel::RefineParams;
 use legume_numeric::candle::candle_core::Device;
 use legume_numeric::candle::candle_nn::VarMap;
 
@@ -107,6 +106,15 @@ impl TrackSpec {
             .collect()
     }
 
+    /// The rows the pseudobulk projection should sketch on: the base track's
+    /// on a multi-track axis (the other tracks are offsets from the base
+    /// model, not independent measurements); `None` on a one-track axis,
+    /// where every row is read.
+    #[must_use]
+    pub fn base_track_rows(&self) -> Option<Vec<bool>> {
+        (self.n_tracks() > 1).then(|| self.track_of_row.iter().map(|&t| t == 0).collect())
+    }
+
     /// Track ids carrying counts, ascending. Always contains `0` on a
     /// validated spec.
     #[must_use]
@@ -180,50 +188,6 @@ impl TrackSpec {
 /// `clap`.
 pub struct FitConfig {
     pub embedding_dim: usize,
-    /// Batch labels to anchor the cross-batch counterfactual on — a prior
-    /// run's carried pseudobulks. Maps to [`MultilevelParams::anchor_batches`]
-    /// (greedy batch correction: new batches corrected toward the anchor
-    /// frame, the frame never re-adjusted).
-    pub anchor_batches: Option<Vec<Box<str>>>,
-    /// Batch labels whose columns are mixtures over cell states — maps to
-    /// [`MultilevelParams::bulk_batches`]. Greedy: they are corrected toward
-    /// the non-bulk (cell) frame and never serve as its counterfactual.
-    pub bulk_batches: Option<Vec<Box<str>>>,
-    /// Carry the finest collapse level (posterior + cell → pb membership) out
-    /// on [`FitOutput::finest_collapse`], retaining its sufficient statistics
-    /// even under the memory-lean calibration. `senna bge --emit-pb-reference`
-    /// serializes it as the next round's carried reference.
-    pub emit_finest_collapse: bool,
-    /// Number of multilevel-collapse levels (coarse → fine). Maps
-    /// directly to [`MultilevelParams::num_levels`].
-    pub num_levels: usize,
-    /// Binary-tree partition depth at the finest level — at most
-    /// `2^sort_dim + 1` pseudobulk leaves. Maps to
-    /// [`MultilevelParams::sort_dim`].
-    pub sort_dim: usize,
-    /// In-batch k-NN used when merging cells into pseudobulk samples.
-    /// Maps to [`MultilevelParams::knn_pb_samples`].
-    pub knn_pb_samples: usize,
-    /// A given cell → pseudobulk partition to collapse on instead of building
-    /// one: every cell's pseudobulk at every level, FINEST FIRST (the order
-    /// [`MultilevelCollapseOut::cell_to_pb_per_level`] comes in), one inner
-    /// `Vec` per level, each indexed by the columns of the count backend the
-    /// fit collapses (`unified.count_backend()`). Its length sets the number of
-    /// levels, overriding [`Self::num_levels`]; keep [`Self::sort_dim`] at the
-    /// source fit's, since the collapse spreads the levels over it and refuses
-    /// a count it cannot spread. The hash partition and the refinement are
-    /// skipped; the projection still seeds the cross-batch matching. This lets
-    /// a later fit collapse on another fit's partition. `None` = build the
-    /// partition as before.
-    ///
-    /// [`MultilevelCollapseOut::cell_to_pb_per_level`]: data_beans::alg::collapse_data::MultilevelCollapseOut::cell_to_pb_per_level
-    pub partition: Option<Vec<Vec<usize>>>,
-    /// Coordinate-descent iterations for the per-batch δ correction
-    /// inside the collapse. Maps to [`MultilevelParams::num_opt_iter`].
-    pub num_opt_iter: usize,
-    /// Target rank of the random-projection sketch that seeds batch
-    /// correction and the multilevel collapse.
-    pub proj_dim: usize,
     pub epochs: usize,
     /// `None` = auto: one weighted pass per epoch over the largest axis.
     /// `Some(n)` = fixed step budget.
@@ -232,23 +196,6 @@ pub struct FitConfig {
     pub learning_rate: f64,
     pub seed: u64,
     pub device: Device,
-    /// Streaming block size for column-block I/O. `None` falls back to
-    /// `legume_numeric::matrix::utils::default_block_size(n_features)` which
-    /// clamps to 100 for large feature counts — that's tiny on
-    /// rotational disks. Pass `Some(1024)` or higher when you have
-    /// the RAM, especially without `--preload-data`.
-    pub block_size: Option<usize>,
-    /// Optional per-row HVG weights for the random projection (length =
-    /// full feature axis). When `Some(w)`, the RP uses
-    /// `project_columns_weighted` with these weights — uninformative
-    /// genes are down-weighted but still contribute to the sketch and
-    /// every downstream pass. When `None`, falls back to plain batch-
-    /// corrected RP (every gene weight = 1).
-    pub hvg_weights: Option<Vec<f32>>,
-    /// BBKNN + DC-Poisson refinement on the multi-level pseudobulk
-    /// partition (parity with senna topic / svd / postprocess).
-    /// `num_gibbs == 0 && num_greedy == 0` keeps the raw hash partition.
-    pub refine: RefineParams,
     /// `AdamW` decoupled weight decay applied uniformly to every parameter
     /// (the shared `E_feat`, `b_feat`, and every per-axis head). Post-
     /// step shrinkage; doesn't enter the backward graph. `0.0` disables.
@@ -305,9 +252,6 @@ pub struct FitConfig {
     /// Given offsets on non-base tracks, by gene (see [`crate::PresetOffsets`]);
     /// empty for none. Requires `preset_features` under a pinning mode.
     pub preset_offsets: Vec<crate::PresetOffsets>,
-    /// Per-cell CNV stratum (`0` = mixable). Maps to
-    /// [`MultilevelParams::strata`]. `None` is the pre-strata collapse path.
-    pub strata: Option<Vec<usize>>,
     /// Optional cis peak→gene coupling: pairs, mixture share and alignment
     /// weight. `None` keeps the plain fit (bge / gem).
     pub cis_gates: Option<crate::fit::hier::CisCoupling>,
@@ -332,7 +276,7 @@ pub struct MultiomeOptions {
     /// On a module-only modality, flag its background of flat and near-empty
     /// features (no cis candidate): `Some(k)` also sets aside modules of fewer
     /// than `k` features as scattered, their freed slots splitting the largest
-    /// modules (see [`data_beans::alg::feature_coarsening::partition_features`]);
+    /// modules (see [`legume_numeric::matrix::feature_coarsening::partition_features`]);
     /// `Some(0)` sets nothing aside by size, so an active single feature keeps
     /// its module. `None` keeps the plain partition with nothing flagged.
     pub module_only_min_size: Option<usize>,
@@ -423,10 +367,6 @@ impl FeatureModuleConfig {
 /// gbe`) only consumes `model`, so it sits unused but kept alive.
 pub struct FitOutput {
     pub model: JointEmbedModel,
-    /// The finest collapse level and its cell → pb membership, present iff
-    /// [`FitConfig::emit_finest_collapse`] was set. The membership indexes
-    /// the global cell ids of the `UnifiedData` the fit ran on.
-    pub finest_collapse: Option<(data_beans::alg::collapse_data::CollapsedOut, Vec<usize>)>,
     pub varmap: VarMap,
     /// Un-normalized baseline MAP per-cell projection norm from phase 2 (`0`
     /// for cells with no observed features / when phase 2 was skipped). The

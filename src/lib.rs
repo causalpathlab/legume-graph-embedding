@@ -25,7 +25,6 @@
 )]
 
 pub mod cell_projection;
-pub mod data;
 pub mod embedding_dim;
 pub mod eval;
 pub mod feature_qc;
@@ -33,7 +32,6 @@ pub mod fit;
 pub mod fne;
 pub mod loss;
 pub mod model;
-pub mod multiome_plan;
 pub mod postprocess;
 pub mod preset_mode;
 pub mod progress;
@@ -41,9 +39,6 @@ pub mod simba;
 pub mod transfer;
 pub mod type_annotation;
 
-pub use data::{load_unified_data, validate_multiome_groups, LoadUnifiedArgs, UnifiedData};
-pub use data_beans::alg::refine_multilevel::RefineParams;
-pub use data_beans::aux::feature_names::FeatureNameKind;
 pub use embedding_dim::EmbeddingDim;
 pub use eval::{
     embedding_col_names, save_embedding, save_outputs, save_outputs_named,
@@ -56,9 +51,6 @@ pub use fit::{
     ParentModulesOwned, TrackEncoder, TrackInfo, TrackSpec,
 };
 pub use model::JointEmbedModel;
-pub use multiome_plan::{
-    detect_multiome_plan, plan_from_axes, read_file_axes, FileAxes, MultiomePlan,
-};
 pub use postprocess::{
     cell_clusters, coembed_placement, feature_coembedding, feature_coembedding_fixed_t,
     CoembedPlacement, NearestCells, PlacementViolation,

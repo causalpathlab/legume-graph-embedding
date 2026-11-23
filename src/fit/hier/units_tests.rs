@@ -1,7 +1,7 @@
 use super::*;
-use crate::data::Triplet;
 use crate::fit::batch_fold::BatchGeneFold;
 use crate::fit::config::{TrackInfo, TrackSpec};
+use crate::fit::hier::units::Triplet;
 
 fn t(cell: u32, feature: u32, count: f32) -> Triplet {
     Triplet {

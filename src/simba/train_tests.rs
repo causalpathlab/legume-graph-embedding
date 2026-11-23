@@ -1,8 +1,7 @@
 use super::*;
 use crate::simba::graph::EdgeList;
 use crate::simba::{run_simba, SimbaConfig};
-use data_beans::sparse_io::{create_sparse_from_triplets, SparseIoBackend};
-use data_beans::sparse_io_vector::SparseIoVec;
+use nalgebra_sparse::{CooMatrix, CscMatrix};
 
 fn approx(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol
@@ -105,7 +104,7 @@ fn eval_edges_are_held_out_from_training_and_an_eval_loss_is_reported_every_epoc
 
 /// Two planted cell groups: cells 0..20 express genes 0..10, cells 20..40
 /// express genes 10..20; the other block is sparse and low.
-fn planted_backend() -> SparseIoVec {
+fn planted_backend() -> CscMatrix<f32> {
     let (n_cells, n_genes) = (40usize, 20usize);
     let mut triplets: Vec<(u64, u64, f32)> = Vec::new();
     for c in 0..n_cells {
@@ -124,22 +123,12 @@ fn planted_backend() -> SparseIoVec {
             }
         }
     }
-    let shape = (n_genes, n_cells, triplets.len());
-    let mut b = create_sparse_from_triplets(&triplets, shape, None, Some(&SparseIoBackend::Zarr))
-        .expect("backend");
-    b.register_row_names_vec(
-        &(0..n_genes)
-            .map(|g| format!("g{g}").into_boxed_str())
-            .collect::<Vec<_>>(),
-    );
-    b.register_column_names_vec(
-        &(0..n_cells)
-            .map(|c| format!("c{c}").into_boxed_str())
-            .collect::<Vec<_>>(),
-    );
-    let mut v = SparseIoVec::new();
-    v.push(std::sync::Arc::from(b), None).expect("push");
-    v
+    let (n_rows, n_cols) = (n_genes, n_cells);
+    let mut coo = CooMatrix::new(n_rows, n_cols);
+    for (r, c, v) in triplets {
+        coo.push(r as usize, c as usize, v);
+    }
+    CscMatrix::from(&coo)
 }
 
 #[test]

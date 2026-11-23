@@ -1,8 +1,8 @@
 use super::*;
-use crate::data::Triplet;
 use crate::fit::config::{TrackInfo, TrackSpec};
 use crate::fit::hier::params::{HostOffset, PresetGenes, PresetMode, PresetOffsets};
 use crate::fit::hier::partition::{Partition, TrackSupport, UnitModules};
+use crate::fit::hier::units::Triplet;
 use crate::fit::hier::units::UnitTable;
 use crate::LoraSpec;
 use legume_numeric::candle::candle_core::Device;

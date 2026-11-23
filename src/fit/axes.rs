@@ -6,8 +6,8 @@
 //! inline in a 1000-line function.
 
 use super::config::{FitConfig, DEFAULT_STRATIFY_ALPHA_CELL};
+use super::input::FitInput;
 use super::samplers::{build_active_samplers, subsample_cell_samplers_multilevel};
-use crate::data::UnifiedData;
 use crate::loss::PerBatchStratifiedCellSampler;
 use log::info;
 
@@ -48,14 +48,14 @@ impl AxisData {
 /// * `k ≥ n_cells` — no pb-sample can exceed `k`, so subsampling is a no-op and the
 ///   full set is used.
 pub(super) fn build_axis_data(
-    unified: &UnifiedData,
-    cell_to_pb_per_level: &[Vec<usize>],
+    input: &FitInput<'_>,
+    cell_to_pb_per_level: &[&[usize]],
     config: &FitConfig,
 ) -> anyhow::Result<AxisData> {
-    let (n_cells, n_features) = (unified.n_cells(), unified.n_features());
+    let (n_cells, n_features) = (input.cells.n_cells(), input.cells.n_features());
     let num_levels = cell_to_pb_per_level.len();
 
-    let cell_samplers = build_active_samplers(unified, DEFAULT_STRATIFY_ALPHA_CELL)?;
+    let cell_samplers = build_active_samplers(input, DEFAULT_STRATIFY_ALPHA_CELL)?;
     info!(
         "Phase-1 cell axis ({} cells × {} features, strat-cell α={}, {} active batch(es))",
         n_cells,

@@ -1,6 +1,6 @@
 use super::*;
-use crate::data::Triplet;
 use crate::fit::config::{TrackInfo, TrackSpec};
+use crate::fit::hier::units::Triplet;
 use crate::fit::hier::units::UnitTable;
 use crate::fit::projection::RowCollapse;
 use crate::{LoraSpec, PresetMode, PresetOffsets};

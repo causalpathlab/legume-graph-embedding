@@ -40,8 +40,8 @@ pub use graph::{EdgeList, RelationTable};
 pub use metrics::{compare_entities, EntityMetrics};
 pub use train::{train, TrainOutput};
 
-use data_beans::sparse_io_vector::SparseIoVec;
 use legume_numeric::candle::candle_core::{Device, Tensor};
+use legume_numeric::matrix::cell_count_stream::CellCountStream;
 
 /// `si.pp.normalize(method='lib_size')` scale factor.
 pub const SCALE_FACTOR: f64 = 1e4;
@@ -122,12 +122,12 @@ pub struct SimbaOutput {
     pub n_eval_edges: usize,
 }
 
-/// Build the graph over `hvg_rows` (backend row indices) and train it.
+/// Build the graph over `hvg_rows` (feature rows of `data`) and train it.
 /// Co-embedding and marker metrics are the caller's (see
 /// [`crate::postprocess::feature_coembedding_fixed_t`] and
 /// [`compare_entities`]).
 pub fn run_simba(
-    data: &SparseIoVec,
+    data: &dyn CellCountStream,
     hvg_rows: &[usize],
     cfg: &SimbaConfig,
 ) -> anyhow::Result<SimbaOutput> {

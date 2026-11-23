@@ -1,11 +1,13 @@
 //! Public entry point for `graph-embedding`. Callers translate their
-//! own CLI args into a [`FitConfig`] and pass already-loaded
-//! [`UnifiedData`] (so this crate stays free of file/path concerns).
+//! own CLI args into a [`FitConfig`] and pass a [`FitInput`]: the counts as a
+//! stream and the pseudobulks built from them (so this crate stays free of
+//! file/path and storage concerns).
 
 mod axes;
 pub mod batch_fold;
 mod config;
 pub mod hier;
+mod input;
 mod models;
 pub mod module_args;
 pub mod module_partition;
@@ -13,7 +15,6 @@ pub mod pb_readout;
 pub mod projection;
 pub mod resolve_embedding;
 mod samplers;
-mod setup;
 
 pub use batch_fold::BatchGeneFold;
 pub use config::{
@@ -21,17 +22,17 @@ pub use config::{
     ParentModulesOwned, TrackInfo, TrackSpec,
 };
 pub use hier::{CisCoupling, CisGateReadout, CisGates};
+pub use input::{BatchDelta, FinestCounts, FitInput, PbLevel};
 pub use module_args::FeatureModuleArgs;
 pub use module_partition::{parent_module_logits, partition_modules};
 pub use pb_readout::{majority_batch_per_pb, PbLevelEmbedding};
 pub use projection::{CellEncoder, CellEncoders, TrackEncoder};
 pub use resolve_embedding::{train_rest, RestConfig, RestTrainInputs, TrainedRest};
 
-use crate::data::{Triplet, UnifiedData};
 use anyhow::Context;
+use hier::units::Triplet;
 use legume_numeric::candle::candle_core::Tensor;
 use legume_numeric::candle::candle_nn::VarMap;
-use legume_numeric::param::traits::Inference;
 use log::info;
 use nalgebra::DMatrix;
 
@@ -66,20 +67,15 @@ pub use projection::{
 /// starved: the per-epoch budget was sized by the pseudobulk count, so
 /// `E_cell` received ~1 step/epoch across all cells and never left random
 /// init (all useful training happened at the pb level).
-pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOutput> {
-    let n_cells = unified.n_cells();
+pub fn fit(input: FitInput<'_>, config: FitConfig) -> anyhow::Result<FitOutput> {
+    input.validate()?;
+    let n_cells = input.cells.n_cells();
     let h = config.embedding_dim;
     let stop = crate::stop::stop_flag();
-
-    ///////////////////////////////////////////////
-    // Shared upstream: projection → pseudobulks //
-    ///////////////////////////////////////////////
-    let n_features = unified.n_features();
-    let feature_to_backend = unified.feature_to_backend_row.clone();
+    let n_features = input.cells.n_features();
     // Row structure of the feature axis: plain genes (every row its own gene)
-    // unless the caller named tracks. Validated HERE, before anything reads it:
-    // the projection below sketches on the base track's rows, so an unchecked
-    // spec would reach the collapse before the error did.
+    // unless the caller named tracks. (The caller sketched its pseudobulks on
+    // `TrackSpec::base_track_rows`.)
     let tracks = config
         .tracks
         .clone()
@@ -88,44 +84,18 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         .validate(n_features)
         .context("the fit's track spec does not describe this feature axis")?;
     let n_tracks = tracks.n_tracks();
-    let pb = setup::build_pseudobulks(unified, &config, &tracks)?;
-    let setup::Pseudobulks {
-        collapsed_levels,
-        cell_to_pb_per_level,
-        blobs: pb_blobs,
-    } = pb;
-    // Per-batch gene fold for phase 2, from the finest collapse's `δ`. The count
-    // backend numbers batches by sorted name; the unified data by first appearance
+    let cell_to_pb_per_level: Vec<&[usize]> = input.levels.iter().map(|l| l.cell_to_pb).collect();
+    // Per-batch gene fold for phase 2, from the finest collapse's `δ`. The
+    // collapse numbers batches by its own order; the input by first appearance
     // — matched by name inside.
-    let batch_gene_fold: Option<BatchGeneFold> =
-        match collapsed_levels.last().and_then(|c| c.delta.as_ref()) {
-            Some(delta) => {
-                let collapse_batch_names =
-                    unified.count_backend().batch_names().ok_or_else(|| {
-                        anyhow::anyhow!("collapse fit a δ but the backend has no batch names")
-                    })?;
-                batch_fold::batch_gene_fold(batch_fold::FoldSource {
-                    delta: delta.posterior_mean(),
-                    collapse_batch_names: &collapse_batch_names,
-                    unified_batch_names: &unified.batch_names,
-                    n_features,
-                    feature_to_backend: &feature_to_backend,
-                })?
-            }
-            None => None,
-        };
-    // Levels run coarsest..finest here, so the finest is `.last()`. Cloned
-    // rather than moved: the level list feeds training below. The clone is
-    // cheap relative to the fit and only happens when a reference is emitted.
-    let finest_collapse = config.emit_finest_collapse.then(|| {
-        (
-            collapsed_levels.last().expect("at least one level").clone(),
-            cell_to_pb_per_level
-                .last()
-                .expect("membership per level")
-                .clone(),
-        )
-    });
+    let batch_gene_fold: Option<BatchGeneFold> = match &input.batch_delta {
+        Some(d) => batch_fold::batch_gene_fold(batch_fold::FoldSource {
+            delta: d.delta,
+            collapse_batch_names: d.collapse_batch_names,
+            unified_batch_names: input.batch_names,
+        })?,
+        None => None,
+    };
 
     ////////////////////////////////
     // VarMap and embedding heads //
@@ -133,26 +103,20 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     let varmap = VarMap::new();
     // Phase 1 trains by the exact hierarchical softmax (see `hier`), which owns
     // its own module warm start and composes the dictionary itself.
-    // The finest collapse's feature profile (batch-corrected pseudobulk rates,
-    // gathered onto the unified feature axis) — seeds the hier engine's module
-    // partition.
-    let finest_profile = || -> DMatrix<f32> {
-        let finest = collapsed_levels.last().expect("at least one level");
-        let pb_full = match &finest.mu_adjusted {
-            Some(adj) => adj.posterior_mean(),
-            None => finest.mu_observed.posterior_mean(),
-        };
-        setup::gather_to_unified_axis(pb_full, n_features, &feature_to_backend)
-    };
+    // The finest level's feature profile (batch-corrected pseudobulk rates) —
+    // seeds the hier engine's module partition.
+    let finest_profile =
+        || -> &DMatrix<f32> { input.levels.last().expect("at least one level").rates };
+    let n_pb_per_level: Vec<usize> = input.levels.iter().map(|l| l.rates.ncols()).collect();
     let models::Heads {
         mut cell_model,
         mut level_models,
-    } = models::build_heads(unified, &pb_blobs, &config, &varmap)?;
+    } = models::build_heads(n_features, n_cells, &n_pb_per_level, &config, &varmap)?;
 
     /////////////////
     // Axis data   //
     /////////////////
-    let ax = axes::build_axis_data(unified, &cell_to_pb_per_level, &config)?;
+    let ax = axes::build_axis_data(&input, &cell_to_pb_per_level, &config)?;
     let (use_cell_axis, cell_samplers) = (ax.use_cell_axis, &ax.cell_samplers);
 
     /////////////////////////////
@@ -163,9 +127,13 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     // batch-folded like phase 2 folds them.
     let cell_fold = batch_gene_fold
         .as_ref()
-        .map(|fold| fold.cell_fold(&unified.batch_membership));
-    let blobs: Vec<&[Triplet]> = pb_blobs.iter().map(|b| b.triplets.as_slice()).collect();
-    let n_pb_per_level: Vec<usize> = pb_blobs.iter().map(|b| b.n_cells()).collect();
+        .map(|fold| fold.cell_fold(input.batch_membership));
+    let pb_triplets: Vec<Vec<Triplet>> = input
+        .levels
+        .iter()
+        .map(|l| hier::units::pb_triplets(l.rates))
+        .collect();
+    let blobs: Vec<&[Triplet]> = pb_triplets.iter().map(Vec::as_slice).collect();
     // `--phase1-cells-per-pb 0` ⇒ `use_cell_axis == false` (pure-pb phase 1,
     // logged above as "cell axis SUPPRESSED"); `phase1_cell_samplers()` would
     // otherwise fall back to the FULL cell samplers, silently making every
@@ -200,15 +168,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     // Build only the dense matrix each branch needs. Both are `[n_features ×
     // n_pb]`; on a wide ATAC axis that is hundreds of MiB each, and leaving
     // both live through hier::train and phase 2 roughly doubles peak memory.
-    let finest_counts = || -> anyhow::Result<(DMatrix<f32>, Vec<f32>)> {
-        let finest = collapsed_levels.last().expect("at least one level");
-        let cell_to_pb = cell_to_pb_per_level.last().expect("at least one level");
-        let (counts, sizes) = finest.observed_counts(cell_to_pb)?;
-        Ok((
-            setup::gather_to_unified_axis(&counts, n_features, &feature_to_backend),
-            sizes,
-        ))
-    };
+    let finest_counts = input.finest_counts;
     let n_per_modality = config
         .feature_modules
         .as_ref()
@@ -220,7 +180,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         .and_then(|g| g.parent.as_ref());
     // Module-only modalities: a multiome axis, one track, no parent partition,
     // and a modality at least `module_only_min_rows` rows wide.
-    let module_only_plan = match (unified.feature_modality.as_deref(), parent) {
+    let module_only_plan = match (input.feature_modality.as_deref(), parent) {
         (Some(modality), None) if tracks.is_base() => {
             module_partition::module_only_modalities(modality, config.module_only_min_rows)
                 .map(|flags| (modality, flags))
@@ -313,8 +273,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
                     "parent modules are {}-dimensional but this fit uses H={h}",
                     parent.mu.ncols()
                 );
-                let profile = finest_profile();
-                let logits = module_partition::parent_module_logits(parent, &profile);
+                let logits = module_partition::parent_module_logits(parent, finest_profile());
                 info!(
                     "Phase 1 (hier) — module partition seeded from the parent's membership ({} \
                  modules)",
@@ -433,12 +392,12 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         .iter()
         .zip(&cell_to_pb_per_level)
         .map(
-            |(m, c2pb)| -> anyhow::Result<pb_readout::PbLevelEmbedding> {
+            |(m, &c2pb)| -> anyhow::Result<pb_readout::PbLevelEmbedding> {
                 let e_pb = DMatrix::<f32>::from_tensor(&m.e_cell)?;
                 let n_pb = e_pb.nrows();
                 Ok(pb_readout::PbLevelEmbedding {
                     e_pb,
-                    batch: pb_readout::majority_batch_per_pb(c2pb, &unified.batch_membership, n_pb),
+                    batch: pb_readout::majority_batch_per_pb(c2pb, input.batch_membership, n_pb),
                 })
             },
         )
@@ -483,7 +442,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         // on single-batch data.
         let batch_fold: Option<CellBatchFold> = batch_gene_fold
             .as_ref()
-            .map(|f| f.cell_fold(&unified.batch_membership));
+            .map(|f| f.cell_fold(input.batch_membership));
 
         // The phase-1 pseudobulk tables are the distillation targets of the
         // encoder that replaces the per-cell solve.
@@ -496,7 +455,7 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
         let distill_levels: Vec<DistillLevel> = pb_embeddings
             .iter()
             .zip(&cell_to_pb_per_level)
-            .map(|(pb, c2pb)| DistillLevel {
+            .map(|(pb, &c2pb)| DistillLevel {
                 e_pb: &pb.e_pb,
                 cell_to_pb: c2pb,
             })
@@ -538,7 +497,6 @@ pub fn fit(unified: &mut UnifiedData, config: FitConfig) -> anyhow::Result<FitOu
     Ok(FitOutput {
         batch_gene_fold,
         model: cell_model,
-        finest_collapse,
         varmap,
         cell_nrms: phase2.cell_nrms,
         pb_embeddings,

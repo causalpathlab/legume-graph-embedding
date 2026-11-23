@@ -46,7 +46,7 @@
 //! floor. We report the continuous `z`; downstream takes the normal tail.
 
 use anyhow::{Context, Result};
-use data_beans::utilities::name_matching::{idf_weight, GeneIndex};
+use genomic_data::name_matching::{idf_weight, GeneIndex};
 use legume_numeric::matrix::common_io::write_lines;
 use legume_numeric::matrix::dmatrix_io::DMatrix;
 use legume_numeric::matrix::knn_graph::{KnnGraph, KnnGraphArgs};
@@ -66,7 +66,6 @@ mod hub_call;
 mod layout;
 mod marker_bootstrap;
 mod markers;
-mod ontology_obo;
 mod output;
 mod panel_null;
 mod score;
@@ -128,7 +127,7 @@ pub(super) fn live_row(rows: &[f32], i: usize, h: usize) -> Option<&[f32]> {
 
 /// Firm projection annotation by term over-representation within cell clusters
 /// (Euclidean nearest-centroid → QC → cluster → hypergeometric + permutation
-/// calibration → optional TreeBH ontology). The statistically-firm successor to
+/// calibration). The statistically-firm successor to
 /// [`annotate_embeddings`]; `senna gem-annotate` drives it.
 pub use term_ora::{
     annotate_embeddings_ora, annotate_with_communities, CommunityCalls, Regroup, TermOraConfig,
@@ -158,11 +157,6 @@ pub use panel_null::{run_panel_null, PanelNull};
 /// FDR rather than the arbitrary (and not scale-free) `--min-support`. Shuffles the gene → type
 /// assignment within norm strata and re-runs the whole bootstrap, reusing the cached partitions.
 pub use support_null::{run_support_null, SupportNull};
-
-/// Bind the generic `enrichment` TreeBH ontology core to the concrete OBO
-/// loader (load OBO + `label→CL`, inject access closures, run). Shared by the
-/// term-ORA path and by `senna annotate-ontology` / `-by-enrichment`.
-pub use ontology_obo::annotate_ontology_from_obo;
 
 /// Tunables for the annotation routines.
 pub struct AnnotateProjConfig {

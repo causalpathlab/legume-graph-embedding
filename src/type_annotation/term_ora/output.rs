@@ -1,13 +1,13 @@
 //! Everything the run leaves behind: the `{out_prefix}.*` artifacts, the console reports
-//! that name what went wrong, and step 7's ontology hand-off.
+//! that name what went wrong.
 //!
 //! Writers and reports live together because they answer the same question from two ends —
 //! the parquet/TSV carries the per-cell and per-cluster numbers, while the `warn!`s beside
 //! them say which of those numbers should not be believed (a panel no better than random
 //! genes, a type assigned by noise, a permutation null with no spread).
 
+use super::label_of;
 use super::ora::OraResult;
-use super::{label_of, TermOraConfig};
 use crate::type_annotation::marker_bootstrap::{BootstrapResult, CoarseConsensus};
 use crate::type_annotation::UNASSIGNED;
 use anyhow::{Context, Result};
@@ -505,36 +505,4 @@ pub(super) fn log_cluster_calls(cluster_label: &[usize], type_names: &[Box<str>]
     if let Some(rest) = n_comm.checked_sub(MAX_CLUSTERS_LISTED).filter(|&r| r > 0) {
         info!("  … and {rest} smaller cluster(s)");
     }
-}
-
-/////////////////
-// 7. ontology //
-/////////////////
-
-pub(super) fn run_ontology(
-    out_prefix: &str,
-    obo: &str,
-    label_cl: &str,
-    comm_names: &[Box<str>],
-    type_names: &[Box<str>],
-    ora: &OraResult,
-    cfg: &TermOraConfig,
-) -> Result<()> {
-    let n_comm = comm_names.len();
-    let c = type_names.len();
-    // cluster × term permutation p as the ontology leaf evidence; Q as node mass.
-    let p_mat = DMatrix::<f32>::from_row_iterator(n_comm, c, ora.p_perm.iter().copied());
-    let q_mat = DMatrix::<f32>::from_row_iterator(n_comm, c, ora.q_soft.iter().copied());
-    crate::type_annotation::ontology_obo::annotate_ontology_from_obo(
-        out_prefix,
-        label_cl,
-        obo,
-        cfg.ontology_fdr_q,
-        cfg.ontology_by,
-        enrichment::OntologyScore::Pvalue(&p_mat),
-        Some(&q_mat),
-        comm_names,
-        type_names,
-    )?;
-    Ok(())
 }

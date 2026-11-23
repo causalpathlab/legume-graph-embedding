@@ -10,7 +10,9 @@
 //! so the partition comes from the data and does not move during training.
 
 use super::config::{ParentModulesOwned, TrackSpec};
-use data_beans::alg::feature_coarsening::{coarsen_features, partition_features, PartitionOptions};
+use legume_numeric::matrix::feature_coarsening::{
+    coarsen_features, partition_features, PartitionOptions,
+};
 use legume_numeric::matrix::rand_util::mix_seed;
 use log::info;
 use nalgebra::DMatrix;
@@ -125,7 +127,7 @@ pub fn module_only_modalities(modality: &[u32], min_rows: usize) -> Option<Vec<b
 
 /// Per feature row, `true` for a FLAT row: one rate explains its counts over
 /// the finest pseudobulks, by the Poisson homogeneity test of
-/// [`data_beans::alg::feature_coarsening::informative_features`]
+/// [`legume_numeric::matrix::feature_coarsening::informative_features`]
 /// (`z = (D − df)/√(2·df) ≤ 5` on the deviance `D`, `df = S − 1`; an
 /// all-zero row is flat). Flat rows form the coarsener's background group and
 /// can go module-only, so the gene-level softmax never scores them.
@@ -146,7 +148,8 @@ pub fn flat_module_only(
     if !enabled || !tracks.is_base() {
         return None;
     }
-    let informative = data_beans::alg::feature_coarsening::informative_features(counts, sizes);
+    let informative =
+        legume_numeric::matrix::feature_coarsening::informative_features(counts, sizes);
     Some(informative.into_iter().map(|inf| !inf).collect())
 }
 
