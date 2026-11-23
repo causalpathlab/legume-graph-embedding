@@ -13,7 +13,7 @@
 use super::discretize::{log_norm, Discretization, Histogram};
 use super::HIST_BINS;
 use crate::progress::new_progress_bar;
-use legume_cell_pseudobulk::CellCountStream;
+use crate::training_data::CellCountStream;
 
 /// PBG's `weight` per relation (bin level): `round(linspace(1, 5, n), 2)`
 /// over the levels PRESENT in the graph, ascending. Rust's `round` is

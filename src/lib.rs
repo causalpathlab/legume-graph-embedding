@@ -36,6 +36,7 @@ pub mod postprocess;
 pub mod preset_mode;
 pub mod progress;
 pub mod simba;
+pub mod training_data;
 pub mod transfer;
 pub mod type_annotation;
 
@@ -56,6 +57,7 @@ pub use postprocess::{
     CoembedPlacement, NearestCells, PlacementViolation,
 };
 pub use preset_mode::{LoraArgs, LoraSpec, PresetMode, PresetOffsets, PresetRows};
+pub use training_data::{CellCountStream, PseudobulkLevels};
 
 /// Graceful-stop on Ctrl+C. Lives in `legume_numeric::matrix` so the annotation crates *below* this one
 /// (`enrichment`, which owns the raw-count marker bootstrap) can share the same flag and the same

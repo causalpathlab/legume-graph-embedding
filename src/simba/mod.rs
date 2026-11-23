@@ -40,7 +40,7 @@ pub use graph::{EdgeList, RelationTable};
 pub use metrics::{compare_entities, EntityMetrics};
 pub use train::{train, TrainOutput};
 
-use legume_cell_pseudobulk::CellCountStream;
+use crate::training_data::CellCountStream;
 use legume_numeric::candle::candle_core::{Device, Tensor};
 
 /// `si.pp.normalize(method='lib_size')` scale factor.

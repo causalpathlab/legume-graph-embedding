@@ -1,9 +1,9 @@
 //! What [`super::fit`] trains on: the cells' counts, their batches, and the
 //! pseudobulks collapsed from them, read through the cell and pseudobulk
-//! contracts of `legume-cell-pseudobulk` so this crate depends on no storage
-//! crate (data-beans implements them).
+//! interfaces of [`crate::training_data`] so this crate depends on no storage
+//! crate (apps adapt data-beans' types to them).
 
-use legume_cell_pseudobulk::{CellCountStream, PseudobulkLevels};
+use crate::training_data::{CellCountStream, PseudobulkLevels};
 
 /// Everything [`super::fit`] reads besides its [`super::FitConfig`].
 pub struct FitInput<'a> {

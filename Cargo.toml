@@ -33,7 +33,6 @@ metal = [
 legume-numeric = { version = "0.10.11", features = ["matrix", "param", "candle", "mcmc"] }
 enrichment = { version = "0.5", package = "legume-enrichment" }
 genomic-data = { version = "0.6.2", package = "legume-genomic-types" }
-legume-cell-pseudobulk = "0.1"
 
 anyhow = "1.0"
 clap = { version = "4.5.20", features = ["derive"] }
